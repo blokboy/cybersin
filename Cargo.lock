@@ -436,9 +436,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "async-trait",
  "clap",
  "cybersin-adapter",
  "cybersin-frontend",
+ "cybersin-gateway",
  "cybersin-ir",
  "cybersin-runtime",
  "cybersin-trace",
@@ -465,6 +467,15 @@ dependencies = [
 [[package]]
 name = "cybersin-gateway"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cybersin-adapter",
+ "cybersin-runtime",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
 
 [[package]]
 name = "cybersin-ir"
