@@ -2,3 +2,18 @@
 name = "cybersin-trace"
 version.workspace = true
 edition.workspace = true
+description = "Span store + cost core (spec §8.5): OTel-compatible spans (LLM/tool/sandbox/cache), SQLite-backed via sqlx (no ORM), cost rollups by session/agent/model/tool/day."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = [
+    "sqlite",
+    "runtime-tokio",
+    "macros",
+] }
+thiserror = "1"
+tokio = { version = "1", features = ["rt", "macros", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
