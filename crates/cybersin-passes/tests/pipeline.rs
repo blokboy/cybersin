@@ -1,7 +1,7 @@
 //! Pipeline-composition + end-to-end pipeline tests (spec §6.2's
-//! acceptance criteria for issue #4): the pass plan is data per build
-//! profile, and running the real (non-`compress`, non-`budget`) passes
-//! together over one IR produces the composed result of all four.
+//! acceptance criteria for issues #4 and #6): the pass plan is data per
+//! build profile, and running the real (non-`compress`) passes
+//! together over one IR produces their composed result.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -41,6 +41,7 @@ fn dev_profile_plan_never_lists_compress() {
             PassSlot::LintFast,
             PassSlot::Dedupe,
             PassSlot::Reorder,
+            PassSlot::Budget,
             PassSlot::Lint,
         ]
     );
@@ -57,10 +58,13 @@ fn release_profile_plan_lists_compress() {
 }
 
 #[test]
-fn build_pipeline_for_dev_runs_exactly_the_four_structural_passes_in_spec_order() {
+fn build_pipeline_for_dev_runs_structural_and_budget_passes_in_spec_order() {
     let pipeline = build_pipeline(Profile::Dev);
     let names: Vec<&str> = pipeline.iter().map(|p| p.name()).collect();
-    assert_eq!(names, vec!["lint-fast", "dedupe", "reorder", "lint"]);
+    assert_eq!(
+        names,
+        vec!["lint-fast", "dedupe", "reorder", "budget", "lint"]
+    );
 }
 
 #[test]
@@ -70,7 +74,10 @@ fn structural_only_pipeline_skips_stateful_compress() {
     // `build_pipeline_with_compress`.
     let pipeline = build_pipeline(Profile::Release);
     let names: Vec<&str> = pipeline.iter().map(|p| p.name()).collect();
-    assert_eq!(names, vec!["lint-fast", "dedupe", "reorder", "lint"]);
+    assert_eq!(
+        names,
+        vec!["lint-fast", "dedupe", "reorder", "budget", "lint"]
+    );
     assert!(!names.contains(&"compress"));
 }
 

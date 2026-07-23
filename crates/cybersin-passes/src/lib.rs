@@ -5,17 +5,17 @@
 //! [`build_pipeline`]) rather than a branch inside any one pass — that's
 //! what lets `--profile dev` skip the model-assisted
 //! `compress` pass *by construction*: [`profile_plan`] simply never lists
-//! it for [`Profile::Dev`]. `budget` (issue #6) isn't implemented here;
-//! [`PassContext::budget`] is the seam `lint`
-//! needs to consume `budget`'s output once it exists, without this crate
-//! depending on it existing yet.
+//! it for [`Profile::Dev`]. [`Budget`] populates [`PassContext::budget`]
+//! before [`Lint`] consumes its per-target plans.
 
+mod budget;
 mod compress;
 mod dedupe;
 mod lint;
 mod lint_fast;
 mod reorder;
 
+pub use budget::{write_budget_artifact, Budget, TargetBudget};
 pub use compress::{
     input_hash, Compress, CompressError, CompressMode, CompressionLock, CompressionProvider,
     LockedCompression,
@@ -69,11 +69,9 @@ impl Diagnostic {
 /// and (for `dedupe`/`reorder`) rewrites, plus whatever a pass wants to
 /// report.
 ///
-/// `budget` is `None` until the `budget` pass (issue #6) has populated
-/// it for this build. `lint`'s dead-section check is the only consumer
-/// today; it treats absence as "nothing to check yet" rather than an
-/// error, since `lint` runs in every profile (spec §6.2) including ones
-/// where `budget` hasn't run.
+/// `budget` is `None` until the `budget` pass has populated it for this
+/// build. `lint`'s dead-section check is the only consumer today; it
+/// treats absence as "nothing to check yet" rather than an error.
 pub struct PassContext {
     pub ir: PromptIr,
     pub budget: Option<BudgetArtifact>,
@@ -121,6 +119,7 @@ pub trait Pass {
 /// Result of running a pipeline to completion (or to its first `Error`).
 pub struct PipelineOutcome {
     pub ir: PromptIr,
+    pub budget: Option<BudgetArtifact>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -154,6 +153,7 @@ pub fn run_pipeline(
     }
     PipelineOutcome {
         ir: ctx.ir,
+        budget: ctx.budget,
         diagnostics: ctx.diagnostics,
     }
 }
@@ -177,12 +177,12 @@ pub enum PassSlot {
     Dedupe,
     Compress,
     Reorder,
+    Budget,
     Lint,
 }
 
 /// The ordered pass plan for `profile` (spec §6.2's pass order:
-/// lint-fast, dedupe, compress, reorder, lint — `budget` runs between
-/// `reorder` and `lint` once issue #6 lands, outside this crate). This
+/// lint-fast, dedupe, compress, reorder, budget, lint). This
 /// is the "pipeline is data" seam itself: `Profile::Dev`'s plan simply
 /// never contains `PassSlot::Compress`, so `--profile dev` skips
 /// compression by construction, not by a pass or caller checking the
@@ -193,6 +193,7 @@ pub fn profile_plan(profile: Profile) -> Vec<PassSlot> {
             PassSlot::LintFast,
             PassSlot::Dedupe,
             PassSlot::Reorder,
+            PassSlot::Budget,
             PassSlot::Lint,
         ],
         Profile::Release => vec![
@@ -200,6 +201,7 @@ pub fn profile_plan(profile: Profile) -> Vec<PassSlot> {
             PassSlot::Dedupe,
             PassSlot::Compress,
             PassSlot::Reorder,
+            PassSlot::Budget,
             PassSlot::Lint,
         ],
     }
@@ -209,6 +211,14 @@ pub fn profile_plan(profile: Profile) -> Vec<PassSlot> {
 /// orchestration that supports model assistance should call
 /// [`build_pipeline_with_compress`] instead.
 pub fn build_pipeline(profile: Profile) -> Vec<Box<dyn Pass>> {
+    build_pipeline_with_targets(profile, vec![TargetBudget::new("generic", 128_000, 4_096)])
+}
+
+/// Resolve a profile to runnable passes using the build's render targets.
+pub fn build_pipeline_with_targets(
+    profile: Profile,
+    targets: Vec<TargetBudget>,
+) -> Vec<Box<dyn Pass>> {
     profile_plan(profile)
         .into_iter()
         .filter_map(|slot| -> Option<Box<dyn Pass>> {
@@ -216,6 +226,7 @@ pub fn build_pipeline(profile: Profile) -> Vec<Box<dyn Pass>> {
                 PassSlot::LintFast => Some(Box::new(LintFast)),
                 PassSlot::Dedupe => Some(Box::new(Dedupe)),
                 PassSlot::Reorder => Some(Box::new(Reorder)),
+                PassSlot::Budget => Some(Box::new(Budget::new(targets.clone()))),
                 PassSlot::Lint => Some(Box::new(Lint)),
                 PassSlot::Compress => None,
             }
@@ -226,6 +237,20 @@ pub fn build_pipeline(profile: Profile) -> Vec<Box<dyn Pass>> {
 /// Resolve a profile to a runnable pipeline, including stateful
 /// compression for release builds. Dev omits it by composition.
 pub fn build_pipeline_with_compress(profile: Profile, compress: Compress) -> Vec<Box<dyn Pass>> {
+    build_pipeline_with_compress_and_targets(
+        profile,
+        compress,
+        vec![TargetBudget::new("generic", 128_000, 4_096)],
+    )
+}
+
+/// Resolve a profile to a runnable pipeline with stateful compression and
+/// build-specific render-target budgets.
+pub fn build_pipeline_with_compress_and_targets(
+    profile: Profile,
+    compress: Compress,
+    targets: Vec<TargetBudget>,
+) -> Vec<Box<dyn Pass>> {
     profile_plan(profile)
         .into_iter()
         .map(|slot| -> Box<dyn Pass> {
@@ -234,6 +259,7 @@ pub fn build_pipeline_with_compress(profile: Profile, compress: Compress) -> Vec
                 PassSlot::Dedupe => Box::new(Dedupe),
                 PassSlot::Compress => Box::new(compress.clone()),
                 PassSlot::Reorder => Box::new(Reorder),
+                PassSlot::Budget => Box::new(Budget::new(targets.clone())),
                 PassSlot::Lint => Box::new(Lint),
             }
         })
