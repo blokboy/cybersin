@@ -19,6 +19,7 @@ cost_model:
   # them later from real trace data.
   cache_similarity_threshold: 0.97
   judge_trigger_band: [0.90, 0.97]
+  judge_model: cache-judge
 storage:
   backend: sqlite
 sandbox:
