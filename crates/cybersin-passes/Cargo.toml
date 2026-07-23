@@ -2,3 +2,8 @@
 name = "cybersin-passes"
 version.workspace = true
 edition.workspace = true
+description = "Cybersin optimizer (spec §6.2): structural IR→IR passes (lint-fast, dedupe, reorder, lint) plus the per-profile pass pipeline, itself data. May depend on cybersin-ir; never the reverse (spec §13)."
+
+[dependencies]
+cybersin-ir = { path = "../cybersin-ir" }
+regex = "1"

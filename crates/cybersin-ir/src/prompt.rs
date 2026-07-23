@@ -111,8 +111,20 @@ pub struct Section {
     /// ordered earlier for prefix-cache alignment.
     pub priority: u32,
     /// Fully-resolved body text — `!include` targets already inlined by
-    /// the frontend.
+    /// the frontend. Once the `dedupe` pass (§6.2) has collapsed this
+    /// section onto an identical earlier one, this is left empty and
+    /// [`Section::dedup_ref`] carries the canonical section's id instead
+    /// — the token cost of a shared fragment is paid once, not once per
+    /// section that includes it.
     pub body: String,
+    /// Set by `dedupe` (§6.2) when this section's original `body` was a
+    /// byte-for-byte duplicate of an earlier section's: the id of that
+    /// earlier, canonical section. `None` for ordinary sections and for
+    /// the canonical copy itself. `#[serde(default)]` so IR emitted
+    /// before this field existed (e.g. hand-written fixtures) still
+    /// deserializes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedup_ref: Option<String>,
 }
 
 /// Structured-output contract (spec §5.1: `{ type: json_schema, schema:
@@ -157,16 +169,19 @@ mod tests {
                     id: "role".to_string(),
                     priority: 100,
                     body: "You are a research analyst...".to_string(),
+                    dedup_ref: None,
                 },
                 Section {
                     id: "instructions".to_string(),
                     priority: 90,
                     body: "Resolved fragment body.".to_string(),
+                    dedup_ref: None,
                 },
                 Section {
                     id: "documents".to_string(),
                     priority: 50,
                     body: "{{#each documents}}...{{/each}}".to_string(),
+                    dedup_ref: None,
                 },
             ],
             Some(OutputContract {
@@ -231,6 +246,30 @@ mod tests {
             id: "role".to_string(),
             priority: 100,
             body: "You are a research analyst...".to_string(),
+            dedup_ref: None,
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: Section = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn section_without_dedup_ref_deserializes_from_pre_field_json() {
+        // Fixtures/dist written before `dedup_ref` existed (e.g.
+        // cybersin-runtime's hand-authored dist fixture) must keep
+        // deserializing (spec §6.6's shared-shape contract).
+        let json = r#"{"id":"role","priority":100,"body":"hi"}"#;
+        let restored: Section = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(restored.dedup_ref, None);
+    }
+
+    #[test]
+    fn section_with_dedup_ref_round_trips() {
+        let original = Section {
+            id: "documents2".to_string(),
+            priority: 50,
+            body: String::new(),
+            dedup_ref: Some("documents".to_string()),
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: Section = serde_json::from_str(&json).expect("deserialize");

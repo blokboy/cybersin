@@ -452,11 +452,13 @@ mod tests {
                     id: "role".to_string(),
                     priority: 100,
                     body: "one two three four five".to_string(), // 5 tokens
+                    dedup_ref: None,
                 },
                 Section {
                     id: "documents".to_string(),
                     priority: 50,
                     body: "a b c d e f g h i j".to_string(), // 10 tokens
+                    dedup_ref: None,
                 },
             ],
             None,

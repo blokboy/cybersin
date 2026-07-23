@@ -477,6 +477,10 @@ dependencies = [
 [[package]]
 name = "cybersin-passes"
 version = "0.1.0"
+dependencies = [
+ "cybersin-ir",
+ "regex",
+]
 
 [[package]]
 name = "cybersin-router"
