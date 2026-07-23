@@ -7,3 +7,8 @@ description = "Cybersin optimizer (spec §6.2): structural IR→IR passes (lint-
 [dependencies]
 cybersin-ir = { path = "../cybersin-ir" }
 regex = "1"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"

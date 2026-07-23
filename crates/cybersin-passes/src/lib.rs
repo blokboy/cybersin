@@ -3,18 +3,23 @@
 //! Each pass is a [`Pass`] impl over [`PromptIr`]; the pipeline itself is
 //! data (`Vec<Box<dyn Pass>>` per build [`Profile`], built by
 //! [`build_pipeline`]) rather than a branch inside any one pass — that's
-//! what lets `--profile dev` skip the (not-yet-implemented, issue #5)
+//! what lets `--profile dev` skip the model-assisted
 //! `compress` pass *by construction*: [`profile_plan`] simply never lists
-//! it for [`Profile::Dev`]. `budget` (issue #6) and `compress` (issue #5)
-//! aren't implemented here; [`PassContext::budget`] is the seam `lint`
+//! it for [`Profile::Dev`]. `budget` (issue #6) isn't implemented here;
+//! [`PassContext::budget`] is the seam `lint`
 //! needs to consume `budget`'s output once it exists, without this crate
 //! depending on it existing yet.
 
+mod compress;
 mod dedupe;
 mod lint;
 mod lint_fast;
 mod reorder;
 
+pub use compress::{
+    input_hash, Compress, CompressError, CompressMode, CompressionLock, CompressionProvider,
+    LockedCompression,
+};
 pub use dedupe::Dedupe;
 pub use lint::Lint;
 pub use lint_fast::LintFast;
@@ -165,11 +170,7 @@ pub enum Profile {
     Release,
 }
 
-/// One slot in a profile's pass plan. `Compress` (issue #5, opt-in
-/// model-assisted compression) has no [`Pass`] impl in this crate yet —
-/// it's listed here so a profile's *intent* is expressed as data now,
-/// and wiring in the real pass later is additive to [`build_pipeline`]
-/// rather than a rewrite of this decision.
+/// One slot in a profile's pass plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassSlot {
     LintFast,
@@ -204,10 +205,9 @@ pub fn profile_plan(profile: Profile) -> Vec<PassSlot> {
     }
 }
 
-/// Resolve `profile`'s plan ([`profile_plan`]) to runnable [`Pass`]
-/// impls. Slots without an impl yet (`Compress`) are skipped rather than
-/// failing the build: `profile_plan` stays the source of truth for what
-/// a profile *wants*, this is just what's runnable today.
+/// Build only the stateless structural passes for `profile`. Build
+/// orchestration that supports model assistance should call
+/// [`build_pipeline_with_compress`] instead.
 pub fn build_pipeline(profile: Profile) -> Vec<Box<dyn Pass>> {
     profile_plan(profile)
         .into_iter()
@@ -218,6 +218,23 @@ pub fn build_pipeline(profile: Profile) -> Vec<Box<dyn Pass>> {
                 PassSlot::Reorder => Some(Box::new(Reorder)),
                 PassSlot::Lint => Some(Box::new(Lint)),
                 PassSlot::Compress => None,
+            }
+        })
+        .collect()
+}
+
+/// Resolve a profile to a runnable pipeline, including stateful
+/// compression for release builds. Dev omits it by composition.
+pub fn build_pipeline_with_compress(profile: Profile, compress: Compress) -> Vec<Box<dyn Pass>> {
+    profile_plan(profile)
+        .into_iter()
+        .map(|slot| -> Box<dyn Pass> {
+            match slot {
+                PassSlot::LintFast => Box::new(LintFast),
+                PassSlot::Dedupe => Box::new(Dedupe),
+                PassSlot::Compress => Box::new(compress.clone()),
+                PassSlot::Reorder => Box::new(Reorder),
+                PassSlot::Lint => Box::new(Lint),
             }
         })
         .collect()

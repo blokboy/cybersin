@@ -176,3 +176,35 @@ name: unsorted
         .success()
         .stdout(predicate::str::contains("already formatted"));
 }
+
+#[test]
+fn build_frozen_fails_when_release_compression_is_not_pinned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    cybersin().arg("init").arg(&project).assert().success();
+
+    cybersin()
+        .arg("build")
+        .arg(&project)
+        .arg("--frozen")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("would require a network call"));
+}
+
+#[test]
+fn dev_build_excludes_compression_and_succeeds_frozen_without_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    cybersin().arg("init").arg(&project).assert().success();
+
+    cybersin()
+        .arg("build")
+        .arg(&project)
+        .arg("--profile")
+        .arg("dev")
+        .arg("--frozen")
+        .assert()
+        .success();
+    assert!(project.join("dist/prompts/hello.json").exists());
+}

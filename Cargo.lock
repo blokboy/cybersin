@@ -442,10 +442,13 @@ dependencies = [
  "cybersin-frontend",
  "cybersin-gateway",
  "cybersin-ir",
+ "cybersin-passes",
  "cybersin-runtime",
  "cybersin-trace",
  "predicates",
+ "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
 ]
@@ -491,6 +494,9 @@ version = "0.1.0"
 dependencies = [
  "cybersin-ir",
  "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

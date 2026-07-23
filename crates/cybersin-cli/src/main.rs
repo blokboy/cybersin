@@ -45,6 +45,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Compile and optimize a project.
+    Build {
+        /// Project directory containing prompts/ and cybersin.lock.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Build profile. `dev` excludes model-assisted compression.
+        #[arg(long, value_enum, default_value = "release")]
+        profile: commands::build::BuildProfile,
+        /// Refuse any pass that would need a network call.
+        #[arg(long)]
+        frozen: bool,
+    },
     /// Run a prompt source (or every source in a project) through the
     /// compiler frontend: parse, resolve `!include`s, typecheck inputs,
     /// emit IR. Exits nonzero with a clear error on any failure.
@@ -104,6 +116,11 @@ enum Command {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Command::Build {
+            path,
+            profile,
+            frozen,
+        } => from_sync(commands::build::run(&path, profile, frozen)),
         Command::Check { path } => from_sync(commands::check::run(&path)),
         Command::Init { dir } => from_sync(commands::init::run(&dir)),
         Command::Fmt { path, check } => from_sync(commands::fmt::run(&path, check)),

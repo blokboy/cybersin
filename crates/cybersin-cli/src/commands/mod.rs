@@ -4,6 +4,7 @@
 //! module plus the `Command` enum in `main.rs`.
 
 pub mod approval;
+pub mod build;
 pub mod check;
 pub mod cost;
 pub mod dlq;

@@ -4,9 +4,14 @@
 //! together over one IR produces the composed result of all four.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use cybersin_ir::{PromptIr, QualityTier, Section};
-use cybersin_passes::{build_pipeline, profile_plan, run_pipeline, PassSlot, Profile};
+use cybersin_passes::{
+    build_pipeline, build_pipeline_with_compress, input_hash, profile_plan, run_pipeline, Compress,
+    CompressError, CompressMode, CompressionLock, CompressionProvider, PassSlot, Profile,
+};
 
 fn section(id: &str, priority: u32, body: &str) -> Section {
     Section {
@@ -42,7 +47,7 @@ fn dev_profile_plan_never_lists_compress() {
 }
 
 #[test]
-fn release_profile_plan_does_list_compress_as_data_even_though_unimplemented() {
+fn release_profile_plan_lists_compress() {
     // Release's *intent* includes compression (it's opt-in per spec
     // §6.2, but a release build wants it): the plan says so as data,
     // which is exactly the contrast that makes dev's omission meaningful
@@ -59,16 +64,128 @@ fn build_pipeline_for_dev_runs_exactly_the_four_structural_passes_in_spec_order(
 }
 
 #[test]
-fn build_pipeline_for_release_skips_compress_since_no_impl_exists_yet_but_keeps_the_rest() {
-    // `profile_plan(Release)` wants `compress`; `build_pipeline` can
-    // only resolve slots it has a `Pass` impl for, so the *runnable*
-    // pipeline for release today is identical to dev's. Once issue #5
-    // lands, only `build_pipeline`'s match arm changes — `profile_plan`
-    // already asked for it.
+fn structural_only_pipeline_skips_stateful_compress() {
+    // Callers without provider/lockfile state can explicitly request the
+    // structural-only pipeline. Real release builds use
+    // `build_pipeline_with_compress`.
     let pipeline = build_pipeline(Profile::Release);
     let names: Vec<&str> = pipeline.iter().map(|p| p.name()).collect();
     assert_eq!(names, vec!["lint-fast", "dedupe", "reorder", "lint"]);
     assert!(!names.contains(&"compress"));
+}
+
+struct FixtureProvider {
+    calls: AtomicUsize,
+}
+
+impl CompressionProvider for FixtureProvider {
+    fn model(&self) -> &str {
+        "recorded/fixture-v1"
+    }
+
+    fn compress(&self, input: &str) -> Result<String, CompressError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/compress.json")).unwrap();
+        assert_eq!(fixture["input"], input);
+        Ok(fixture["output"].as_str().unwrap().to_string())
+    }
+}
+
+#[test]
+fn compress_reduces_tokens_preserves_fixture_behavior_and_pins_by_input_hash() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/compress.json")).unwrap();
+    let input = fixture["input"].as_str().unwrap();
+    let expected_behavior = fixture["behavior"].as_array().unwrap();
+    let provider = Arc::new(FixtureProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let lock = Arc::new(Mutex::new(CompressionLock::default()));
+    let pass = Compress::new(provider.clone(), lock.clone(), CompressMode::Update);
+    let ir = PromptIr::new(
+        "support",
+        QualityTier::High,
+        BTreeMap::new(),
+        vec![],
+        vec![section("instructions", 100, input)],
+        None,
+    );
+
+    let outcome = run_pipeline(&[Box::new(pass)], ir, None);
+    assert!(!outcome.has_error(), "{:?}", outcome.diagnostics);
+    let output = &outcome.ir.sections[0].body;
+    assert!(output.split_whitespace().count() < input.split_whitespace().count());
+    for behavior in expected_behavior {
+        assert!(
+            output.contains(behavior.as_str().unwrap()),
+            "compressed output lost fixture behavior `{behavior}`"
+        );
+    }
+    let key = input_hash(input);
+    let pinned = lock.lock().unwrap().compress.get(&key).cloned().unwrap();
+    assert_eq!(pinned.output, *output);
+    assert_eq!(pinned.model, "recorded/fixture-v1");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn frozen_compress_uses_pin_without_provider_and_fails_on_cache_miss() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/compress.json")).unwrap();
+    let input = fixture["input"].as_str().unwrap();
+    let provider = Arc::new(FixtureProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let lock = Arc::new(Mutex::new(CompressionLock::default()));
+    let ir = PromptIr::new(
+        "support",
+        QualityTier::High,
+        BTreeMap::new(),
+        vec![],
+        vec![section("instructions", 100, input)],
+        None,
+    );
+    let pass = Compress::new(provider.clone(), lock.clone(), CompressMode::Frozen);
+    let miss = run_pipeline(&[Box::new(pass.clone())], ir.clone(), None);
+    assert!(miss.has_error());
+    assert!(miss.diagnostics[0]
+        .message
+        .contains("would require a network call"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+    lock.lock().unwrap().compress.insert(
+        input_hash(input),
+        cybersin_passes::LockedCompression {
+            model: "recorded/fixture-v1".into(),
+            output: fixture["output"].as_str().unwrap().into(),
+        },
+    );
+    let hit = run_pipeline(&[Box::new(pass)], ir, None);
+    assert!(!hit.has_error());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn release_pipeline_runs_compress_while_dev_omits_it() {
+    let provider = Arc::new(FixtureProvider {
+        calls: AtomicUsize::new(0),
+    });
+    let compress = Compress::new(
+        provider,
+        Arc::new(Mutex::new(CompressionLock::default())),
+        CompressMode::Update,
+    );
+    let release_names: Vec<_> = build_pipeline_with_compress(Profile::Release, compress.clone())
+        .iter()
+        .map(|pass| pass.name())
+        .collect();
+    let dev_names: Vec<_> = build_pipeline_with_compress(Profile::Dev, compress)
+        .iter()
+        .map(|pass| pass.name())
+        .collect();
+    assert!(release_names.contains(&"compress"));
+    assert!(!dev_names.contains(&"compress"));
 }
 
 // ---------------------------------------------------------------------
