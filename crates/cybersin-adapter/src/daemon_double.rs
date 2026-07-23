@@ -209,10 +209,10 @@ impl<C: DaemonChannel> DaemonDouble<C> {
             tokio::select! {
                 biased;
                 ctrl = self.control_rx.recv() => {
-                    match ctrl {
-                        Some(c) => self.handle_control(c).await,
-                        None => {} // no control handles left; keep serving the channel
+                    if let Some(c) = ctrl {
+                        self.handle_control(c).await;
                     }
+                    // With no control handles left, keep serving the channel.
                 }
                 msg = self.channel.recv() => {
                     match msg {

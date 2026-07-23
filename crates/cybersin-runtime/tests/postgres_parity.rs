@@ -5,11 +5,23 @@ use cybersin_runtime::{bundled_stub_dist_dir, DistFixture, PgStorage, SqliteStor
 use cybersin_trace::SpanStore;
 use serde_json::json;
 
-async fn exercise(storage: &dyn Storage, suffix: &str) -> (Vec<String>, String, i64, bool) {
+#[derive(Debug, PartialEq)]
+struct ParityResult {
+    event_kinds: Vec<String>,
+    status: String,
+    config_hash: String,
+    state_value: serde_json::Value,
+    checkpoint_state: serde_json::Value,
+    signal: Option<serde_json::Value>,
+    attempts: i64,
+    tool_succeeded: bool,
+}
+
+async fn exercise(storage: &dyn Storage, suffix: &str) -> ParityResult {
     let session = format!("parity-session-{suffix}");
     let call = format!("parity-tool:{suffix}");
     storage
-        .create_session(&session, "parity-agent")
+        .create_session_pinned(&session, "parity-agent", "config-v1")
         .await
         .unwrap();
     storage
@@ -22,6 +34,28 @@ async fn exercise(storage: &dyn Storage, suffix: &str) -> (Vec<String>, String, 
         .unwrap();
     storage
         .set_session_status(&session, "completed")
+        .await
+        .unwrap();
+    storage
+        .set_state(&session, "agent", "progress", &json!({"step": 2}))
+        .await
+        .unwrap();
+    let checkpoint = storage
+        .create_checkpoint(&session, Some("parity"))
+        .await
+        .unwrap();
+    storage
+        .enqueue_signal(&session, "continue", &json!({"approved": true}))
+        .await
+        .unwrap();
+    let signal = storage.take_signal(&session, "continue").await.unwrap();
+    assert!(storage
+        .take_signal(&session, "continue")
+        .await
+        .unwrap()
+        .is_none());
+    storage
+        .migrate_session(&session, "config-v2")
         .await
         .unwrap();
     let (_, won) = storage
@@ -42,14 +76,25 @@ async fn exercise(storage: &dyn Storage, suffix: &str) -> (Vec<String>, String, 
         .unwrap();
 
     let events = storage.load_events(&session).await.unwrap();
-    let status = storage.get_session(&session).await.unwrap().unwrap().status;
+    let session_record = storage.get_session(&session).await.unwrap().unwrap();
+    let state = storage
+        .get_state(&session, "agent", "progress")
+        .await
+        .unwrap()
+        .unwrap();
     let tool = storage.get_tool_call(&call).await.unwrap().unwrap();
-    (
-        events.into_iter().map(|event| event.kind).collect(),
-        status,
-        tool.attempts,
-        won && tool.status == "succeeded" && tool.result == Some(json!({"ok": true})),
-    )
+    ParityResult {
+        event_kinds: events.into_iter().map(|event| event.kind).collect(),
+        status: session_record.status,
+        config_hash: session_record.config_hash,
+        state_value: state.value,
+        checkpoint_state: checkpoint.state,
+        signal,
+        attempts: tool.attempts,
+        tool_succeeded: won
+            && tool.status == "succeeded"
+            && tool.result == Some(json!({"ok": true})),
+    }
 }
 
 /// Requires an isolated Postgres database supplied by TEST_POSTGRES_URL.

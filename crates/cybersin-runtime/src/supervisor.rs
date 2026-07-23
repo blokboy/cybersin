@@ -10,51 +10,6 @@ pub struct SessionSupervisor {
     storage: Arc<dyn Storage>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::SqliteStorage;
-
-    #[tokio::test]
-    async fn resume_requires_pinned_hash_until_explicit_migration() {
-        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
-        storage
-            .create_session_pinned("s", "a", "old")
-            .await
-            .unwrap();
-        let supervisor = SessionSupervisor::new(storage.clone());
-        assert!(supervisor
-            .resume("s", "new")
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("sessions migrate"));
-        storage.migrate_session("s", "new").await.unwrap();
-        storage
-            .set_state("s", "memory", "answer", &serde_json::json!(42))
-            .await
-            .unwrap();
-        let state = supervisor.resume("s", "new").await.unwrap();
-        assert_eq!(state["memory"]["answer"], 42);
-    }
-
-    #[tokio::test]
-    async fn nondeterministic_values_are_recorded_then_replayed() {
-        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
-        storage.create_session("s", "a").await.unwrap();
-        let supervisor = SessionSupervisor::new(storage);
-        let first = supervisor
-            .recorded_value("s", "random", || serde_json::json!(42))
-            .await
-            .unwrap();
-        let replay = supervisor
-            .recorded_value("s", "random", || serde_json::json!(99))
-            .await
-            .unwrap();
-        assert_eq!(first, replay);
-    }
-}
-
 impl SessionSupervisor {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
         Self { storage }
@@ -143,5 +98,50 @@ impl SessionSupervisor {
             .append_event(session_id, &kind, serde_json::json!({"value": value}))
             .await?;
         Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SqliteStorage;
+
+    #[tokio::test]
+    async fn resume_requires_pinned_hash_until_explicit_migration() {
+        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        storage
+            .create_session_pinned("s", "a", "old")
+            .await
+            .unwrap();
+        let supervisor = SessionSupervisor::new(storage.clone());
+        assert!(supervisor
+            .resume("s", "new")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("sessions migrate"));
+        storage.migrate_session("s", "new").await.unwrap();
+        storage
+            .set_state("s", "memory", "answer", &serde_json::json!(42))
+            .await
+            .unwrap();
+        let state = supervisor.resume("s", "new").await.unwrap();
+        assert_eq!(state["memory"]["answer"], 42);
+    }
+
+    #[tokio::test]
+    async fn nondeterministic_values_are_recorded_then_replayed() {
+        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        storage.create_session("s", "a").await.unwrap();
+        let supervisor = SessionSupervisor::new(storage);
+        let first = supervisor
+            .recorded_value("s", "random", || serde_json::json!(42))
+            .await
+            .unwrap();
+        let replay = supervisor
+            .recorded_value("s", "random", || serde_json::json!(99))
+            .await
+            .unwrap();
+        assert_eq!(first, replay);
     }
 }
