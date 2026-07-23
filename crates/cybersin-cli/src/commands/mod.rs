@@ -10,5 +10,7 @@ pub mod cost;
 pub mod dlq;
 pub mod fmt;
 pub mod init;
+pub mod notify;
 pub mod run;
+pub mod sessions;
 pub mod trace;

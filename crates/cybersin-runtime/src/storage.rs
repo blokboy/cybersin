@@ -21,6 +21,34 @@ pub enum StorageError {
     Sqlx(#[from] sqlx::Error),
     #[error("(de)serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("state {namespace}.{key} has type {expected}, cannot set {actual}")]
+    StateType {
+        namespace: String,
+        key: String,
+        expected: String,
+        actual: String,
+    },
+}
+
+fn json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn row_to_state(row: SqliteRow) -> Result<StateRecord> {
+    Ok(StateRecord {
+        namespace: row.get("namespace"),
+        key: row.get("key"),
+        value_type: row.get("value_type"),
+        value: serde_json::from_str(&row.get::<String, _>("value"))?,
+        updated_seq: row.get("updated_seq"),
+    })
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -37,6 +65,7 @@ pub struct SessionRecord {
     /// enum for now — the real state machine (parked/awaiting_approval/
     /// etc., spec §8.1-§8.2) is a later issue's concern.
     pub status: String,
+    pub config_hash: String,
     pub created_unix_ms: i64,
 }
 
@@ -53,6 +82,25 @@ pub struct EventRecord {
     pub unix_ms: i64,
     pub kind: String,
     pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateRecord {
+    pub namespace: String,
+    pub key: String,
+    pub value_type: String,
+    pub value: Value,
+    pub updated_seq: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointRecord {
+    pub checkpoint_id: i64,
+    pub session_id: String,
+    pub event_seq: i64,
+    pub label: Option<String>,
+    pub state: Value,
+    pub created_unix_ms: i64,
 }
 
 /// One row of the idempotency ledger `tool_calls` (spec §8.2: "All tool
@@ -99,6 +147,12 @@ pub struct ToolCallRecord {
 #[async_trait]
 pub trait Storage: Send + Sync {
     async fn create_session(&self, session_id: &str, agent_name: &str) -> Result<()>;
+    async fn create_session_pinned(
+        &self,
+        session_id: &str,
+        agent_name: &str,
+        config_hash: &str,
+    ) -> Result<()>;
     async fn set_session_status(&self, session_id: &str, status: &str) -> Result<()>;
     async fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>>;
     async fn list_sessions(&self) -> Result<Vec<SessionRecord>>;
@@ -106,6 +160,29 @@ pub trait Storage: Send + Sync {
     /// assigned sequence number.
     async fn append_event(&self, session_id: &str, kind: &str, payload: Value) -> Result<i64>;
     async fn load_events(&self, session_id: &str) -> Result<Vec<EventRecord>>;
+    async fn set_state(
+        &self,
+        session_id: &str,
+        namespace: &str,
+        key: &str,
+        value: &Value,
+    ) -> Result<()>;
+    async fn get_state(
+        &self,
+        session_id: &str,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<StateRecord>>;
+    async fn list_state(&self, session_id: &str) -> Result<Vec<StateRecord>>;
+    async fn create_checkpoint(
+        &self,
+        session_id: &str,
+        label: Option<&str>,
+    ) -> Result<CheckpointRecord>;
+    async fn latest_checkpoint(&self, session_id: &str) -> Result<Option<CheckpointRecord>>;
+    async fn enqueue_signal(&self, session_id: &str, signal: &str, payload: &Value) -> Result<()>;
+    async fn take_signal(&self, session_id: &str, signal: &str) -> Result<Option<Value>>;
+    async fn migrate_session(&self, session_id: &str, config_hash: &str) -> Result<()>;
 
     /// Admit `(tool, idem_key)` into the ledger as a fresh `pending` row —
     /// or, if that pair is already there, return the existing row instead
@@ -217,12 +294,24 @@ impl SqliteStorage {
                 session_id TEXT PRIMARY KEY,
                 agent_name TEXT NOT NULL,
                 status TEXT NOT NULL,
-                created_unix_ms INTEGER NOT NULL
+                created_unix_ms INTEGER NOT NULL,
+                config_hash TEXT NOT NULL DEFAULT ''
             )
             "#,
         )
         .execute(&self.pool)
         .await?;
+        let columns = sqlx::query("PRAGMA table_info(sessions)")
+            .fetch_all(&self.pool)
+            .await?;
+        if !columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "config_hash")
+        {
+            sqlx::query("ALTER TABLE sessions ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''")
+                .execute(&self.pool)
+                .await?;
+        }
 
         sqlx::query(
             r#"
@@ -235,6 +324,33 @@ impl SqliteStorage {
                 PRIMARY KEY (session_id, seq)
             )
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS session_state (
+                session_id TEXT NOT NULL, namespace TEXT NOT NULL, key TEXT NOT NULL,
+                value_type TEXT NOT NULL, value TEXT NOT NULL, updated_seq INTEGER NOT NULL,
+                PRIMARY KEY (session_id, namespace, key)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS checkpoints (
+                checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                event_seq INTEGER NOT NULL, label TEXT, state TEXT NOT NULL,
+                created_unix_ms INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS signals (
+                signal_id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                signal TEXT NOT NULL, payload TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0
+            )",
         )
         .execute(&self.pool)
         .await?;
@@ -299,14 +415,25 @@ impl SqliteStorage {
 #[async_trait]
 impl Storage for SqliteStorage {
     async fn create_session(&self, session_id: &str, agent_name: &str) -> Result<()> {
+        self.create_session_pinned(session_id, agent_name, "").await
+    }
+
+    async fn create_session_pinned(
+        &self,
+        session_id: &str,
+        agent_name: &str,
+        config_hash: &str,
+    ) -> Result<()> {
         let now = now_unix_ms();
         sqlx::query(
-            "INSERT OR IGNORE INTO sessions (session_id, agent_name, status, created_unix_ms) \
-             VALUES (?, ?, 'running', ?)",
+            "INSERT OR IGNORE INTO sessions \
+             (session_id, agent_name, status, created_unix_ms, config_hash) \
+             VALUES (?, ?, 'running', ?, ?)",
         )
         .bind(session_id)
         .bind(agent_name)
         .bind(now)
+        .bind(config_hash)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -323,7 +450,7 @@ impl Storage for SqliteStorage {
 
     async fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let row = sqlx::query(
-            "SELECT session_id, agent_name, status, created_unix_ms FROM sessions WHERE session_id = ?",
+            "SELECT session_id, agent_name, status, created_unix_ms, config_hash FROM sessions WHERE session_id = ?",
         )
         .bind(session_id)
         .fetch_optional(&self.pool)
@@ -332,13 +459,14 @@ impl Storage for SqliteStorage {
             session_id: r.get("session_id"),
             agent_name: r.get("agent_name"),
             status: r.get("status"),
+            config_hash: r.get("config_hash"),
             created_unix_ms: r.get("created_unix_ms"),
         }))
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let rows = sqlx::query(
-            "SELECT session_id, agent_name, status, created_unix_ms FROM sessions \
+            "SELECT session_id, agent_name, status, created_unix_ms, config_hash FROM sessions \
              ORDER BY created_unix_ms DESC",
         )
         .fetch_all(&self.pool)
@@ -349,6 +477,7 @@ impl Storage for SqliteStorage {
                 session_id: r.get("session_id"),
                 agent_name: r.get("agent_name"),
                 status: r.get("status"),
+                config_hash: r.get("config_hash"),
                 created_unix_ms: r.get("created_unix_ms"),
             })
             .collect())
@@ -399,6 +528,190 @@ impl Storage for SqliteStorage {
             });
         }
         Ok(out)
+    }
+
+    async fn set_state(
+        &self,
+        session_id: &str,
+        namespace: &str,
+        key: &str,
+        value: &Value,
+    ) -> Result<()> {
+        let value_type = json_type(value);
+        if let Some(existing) = self.get_state(session_id, namespace, key).await? {
+            if existing.value_type != value_type {
+                return Err(StorageError::StateType {
+                    namespace: namespace.into(),
+                    key: key.into(),
+                    expected: existing.value_type,
+                    actual: value_type.into(),
+                });
+            }
+        }
+        let seq = self
+            .append_event(
+                session_id,
+                "state.set",
+                serde_json::json!({
+                    "namespace": namespace, "key": key, "value_type": value_type, "value": value
+                }),
+            )
+            .await?;
+        sqlx::query(
+            "INSERT INTO session_state (session_id, namespace, key, value_type, value, updated_seq)
+            VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(session_id, namespace, key) DO UPDATE SET
+            value = excluded.value, updated_seq = excluded.updated_seq",
+        )
+        .bind(session_id)
+        .bind(namespace)
+        .bind(key)
+        .bind(value_type)
+        .bind(serde_json::to_string(value)?)
+        .bind(seq)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_state(
+        &self,
+        session_id: &str,
+        namespace: &str,
+        key: &str,
+    ) -> Result<Option<StateRecord>> {
+        let row = sqlx::query(
+            "SELECT namespace, key, value_type, value, updated_seq FROM session_state
+            WHERE session_id = ? AND namespace = ? AND key = ?",
+        )
+        .bind(session_id)
+        .bind(namespace)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(row_to_state).transpose()
+    }
+
+    async fn list_state(&self, session_id: &str) -> Result<Vec<StateRecord>> {
+        sqlx::query(
+            "SELECT namespace, key, value_type, value, updated_seq FROM session_state
+            WHERE session_id = ? ORDER BY namespace, key",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(row_to_state)
+        .collect()
+    }
+
+    async fn create_checkpoint(
+        &self,
+        session_id: &str,
+        label: Option<&str>,
+    ) -> Result<CheckpointRecord> {
+        let state = serde_json::to_value(self.list_state(session_id).await?)?;
+        let event_seq = self
+            .append_event(
+                session_id,
+                "checkpoint",
+                serde_json::json!({
+                    "label": label, "state": state
+                }),
+            )
+            .await?;
+        let now = now_unix_ms();
+        let result = sqlx::query(
+            "INSERT INTO checkpoints
+            (session_id, event_seq, label, state, created_unix_ms) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(session_id)
+        .bind(event_seq)
+        .bind(label)
+        .bind(serde_json::to_string(&state)?)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(CheckpointRecord {
+            checkpoint_id: result.last_insert_rowid(),
+            session_id: session_id.into(),
+            event_seq,
+            label: label.map(str::to_owned),
+            state,
+            created_unix_ms: now,
+        })
+    }
+
+    async fn latest_checkpoint(&self, session_id: &str) -> Result<Option<CheckpointRecord>> {
+        let row = sqlx::query("SELECT checkpoint_id, session_id, event_seq, label, state,
+            created_unix_ms FROM checkpoints WHERE session_id = ? ORDER BY checkpoint_id DESC LIMIT 1")
+            .bind(session_id).fetch_optional(&self.pool).await?;
+        row.map(|r| {
+            Ok(CheckpointRecord {
+                checkpoint_id: r.get("checkpoint_id"),
+                session_id: r.get("session_id"),
+                event_seq: r.get("event_seq"),
+                label: r.get("label"),
+                state: serde_json::from_str(&r.get::<String, _>("state"))?,
+                created_unix_ms: r.get("created_unix_ms"),
+            })
+        })
+        .transpose()
+    }
+
+    async fn enqueue_signal(&self, session_id: &str, signal: &str, payload: &Value) -> Result<()> {
+        sqlx::query("INSERT INTO signals (session_id, signal, payload) VALUES (?, ?, ?)")
+            .bind(session_id)
+            .bind(signal)
+            .bind(serde_json::to_string(payload)?)
+            .execute(&self.pool)
+            .await?;
+        self.append_event(
+            session_id,
+            "signal.notified",
+            serde_json::json!({"signal": signal, "payload": payload}),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn take_signal(&self, session_id: &str, signal: &str) -> Result<Option<Value>> {
+        let row = sqlx::query(
+            "SELECT signal_id, payload FROM signals WHERE session_id = ?
+            AND signal = ? AND delivered = 0 ORDER BY signal_id LIMIT 1",
+        )
+        .bind(session_id)
+        .bind(signal)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let id: i64 = row.get("signal_id");
+        let value: Value = serde_json::from_str(&row.get::<String, _>("payload"))?;
+        sqlx::query("UPDATE signals SET delivered = 1 WHERE signal_id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        self.append_event(
+            session_id,
+            "signal.delivered",
+            serde_json::json!({"signal": signal, "payload": value}),
+        )
+        .await?;
+        Ok(Some(value))
+    }
+
+    async fn migrate_session(&self, session_id: &str, config_hash: &str) -> Result<()> {
+        sqlx::query("UPDATE sessions SET config_hash = ? WHERE session_id = ?")
+            .bind(config_hash)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        self.append_event(
+            session_id,
+            "session.migrated",
+            serde_json::json!({"config_hash": config_hash}),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn begin_tool_call(
@@ -835,5 +1148,52 @@ mod tests {
             .unwrap();
         let row = storage.get_tool_call("t:k1").await.unwrap().unwrap();
         assert!(!row.awaiting_approval);
+    }
+
+    #[tokio::test]
+    async fn typed_state_rejects_type_changes_and_checkpoint_snapshots_it() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        storage
+            .create_session_pinned("s", "a", "hash-1")
+            .await
+            .unwrap();
+        storage
+            .set_state("s", "memory", "count", &serde_json::json!(1))
+            .await
+            .unwrap();
+        storage
+            .set_state("s", "memory", "count", &serde_json::json!(2))
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage
+                .set_state("s", "memory", "count", &serde_json::json!("two"))
+                .await,
+            Err(StorageError::StateType { .. })
+        ));
+        let checkpoint = storage
+            .create_checkpoint("s", Some("manual"))
+            .await
+            .unwrap();
+        assert_eq!(checkpoint.state[0]["value"], 2);
+        assert_eq!(
+            storage.latest_checkpoint("s").await.unwrap(),
+            Some(checkpoint)
+        );
+    }
+
+    #[tokio::test]
+    async fn signals_are_durable_and_delivered_once() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        storage.create_session("s", "a").await.unwrap();
+        storage
+            .enqueue_signal("s", "notify", &serde_json::json!({"go": true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.take_signal("s", "notify").await.unwrap(),
+            Some(serde_json::json!({"go": true}))
+        );
+        assert_eq!(storage.take_signal("s", "notify").await.unwrap(), None);
     }
 }

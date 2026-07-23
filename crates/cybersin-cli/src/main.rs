@@ -110,6 +110,17 @@ enum Command {
         /// message (`"{tool}:{idem_key}"`).
         call_id: String,
     },
+    /// Inspect and control durable sessions.
+    Sessions {
+        #[command(subcommand)]
+        command: commands::sessions::SessionsCommand,
+    },
+    /// Deliver a durable steering signal to a session.
+    Notify {
+        session: String,
+        /// JSON payload; use `{"signal":"name",...}` to target a named wait.
+        payload: String,
+    },
 }
 
 #[tokio::main]
@@ -132,6 +143,12 @@ async fn main() -> ExitCode {
             from_async(commands::approval::approve(cli.db, call_id).await)
         }
         Command::Deny { call_id } => from_async(commands::approval::deny(cli.db, call_id).await),
+        Command::Sessions { command } => {
+            from_async(commands::sessions::execute(cli.db, command).await)
+        }
+        Command::Notify { session, payload } => {
+            from_async(commands::notify::execute(cli.db, session, payload).await)
+        }
     }
 }
 

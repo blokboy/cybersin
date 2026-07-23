@@ -159,7 +159,11 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
     /// (spec §10).
     pub async fn start_session(&mut self, inputs: Value) -> Result<(), RuntimeError> {
         self.storage
-            .create_session(&self.session_id, &self.agent_name)
+            .create_session_pinned(
+                &self.session_id,
+                &self.agent_name,
+                &self.dist.manifest.build_hash,
+            )
             .await?;
         self.storage
             .append_event(
@@ -229,15 +233,72 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 self.completed = true;
                 Ok(0)
             }
-            // state.*/checkpoint/sleep aren't exercised by this issue's
-            // stub agent script, but are answered generically (rather
-            // than left to hang) so a richer future stub script — or a
-            // real harness driving this same RuntimeDaemon directly —
-            // isn't blocked on them.
-            HarnessMessage::StateGet { call_id, .. }
-            | HarnessMessage::StateSet { call_id, .. }
-            | HarnessMessage::Checkpoint { call_id, .. }
-            | HarnessMessage::Sleep { call_id, .. } => {
+            HarnessMessage::StateGet {
+                call_id,
+                namespace,
+                key,
+            } => {
+                let value = self
+                    .storage
+                    .get_state(&self.session_id, &namespace, &key)
+                    .await?
+                    .map(|r| r.value)
+                    .unwrap_or(Value::Null);
+                self.channel
+                    .send(DaemonMessage::CallResult {
+                        call_id,
+                        outcome: CallOutcome::Ok { value },
+                    })
+                    .await?;
+                Ok(0)
+            }
+            HarnessMessage::StateSet {
+                call_id,
+                namespace,
+                key,
+                value,
+            } => {
+                self.storage
+                    .set_state(&self.session_id, &namespace, &key, &value)
+                    .await?;
+                self.channel
+                    .send(DaemonMessage::CallResult {
+                        call_id,
+                        outcome: CallOutcome::Ok { value },
+                    })
+                    .await?;
+                Ok(0)
+            }
+            HarnessMessage::Checkpoint { call_id, label } => {
+                let checkpoint = self
+                    .storage
+                    .create_checkpoint(&self.session_id, label.as_deref())
+                    .await?;
+                self.channel.send(DaemonMessage::CallResult { call_id,
+                    outcome: CallOutcome::Ok { value: serde_json::json!({
+                        "checkpoint_id": checkpoint.checkpoint_id, "event_seq": checkpoint.event_seq
+                    }) } }).await?;
+                Ok(0)
+            }
+            HarnessMessage::Sleep {
+                call_id,
+                duration_ms,
+            } => {
+                self.storage
+                    .append_event(
+                        &self.session_id,
+                        "sleep.requested",
+                        serde_json::json!({"duration_ms": duration_ms}),
+                    )
+                    .await?;
+                tokio::time::sleep(std::time::Duration::from_millis(duration_ms)).await;
+                self.storage
+                    .append_event(
+                        &self.session_id,
+                        "sleep.completed",
+                        serde_json::json!({"duration_ms": duration_ms}),
+                    )
+                    .await?;
                 self.channel
                     .send(DaemonMessage::CallResult {
                         call_id,
@@ -247,11 +308,22 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 Ok(0)
             }
             HarnessMessage::SignalWait { signal, .. } => {
+                self.storage
+                    .set_session_status(&self.session_id, "waiting")
+                    .await?;
+                let payload = loop {
+                    if let Some(payload) =
+                        self.storage.take_signal(&self.session_id, &signal).await?
+                    {
+                        break payload;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                };
+                self.storage
+                    .set_session_status(&self.session_id, "running")
+                    .await?;
                 self.channel
-                    .send(DaemonMessage::SignalDelivered {
-                        signal,
-                        payload: Value::Null,
-                    })
+                    .send(DaemonMessage::SignalDelivered { signal, payload })
                     .await?;
                 Ok(0)
             }
@@ -264,6 +336,9 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         prompt_name: String,
         inputs: Value,
     ) -> Result<u32, RuntimeError> {
+        self.storage
+            .create_checkpoint(&self.session_id, Some("pre-llm"))
+            .await?;
         let prompt = self.dist.prompt(&prompt_name)?.clone();
         let routing = self.dist.routing(&prompt_name)?.clone();
         let budget = self.dist.budget(&prompt_name).cloned();
@@ -337,8 +412,12 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                     "tokens_prompt": prompt_tokens,
                     "tokens_completion": completion_tokens,
                     "evicted_sections": evicted,
+                    "response": response_value,
                 }),
             )
+            .await?;
+        self.storage
+            .create_checkpoint(&self.session_id, Some("periodic"))
             .await?;
 
         self.channel
@@ -358,6 +437,9 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         tool: String,
         args: Value,
     ) -> Result<u32, RuntimeError> {
+        self.storage
+            .create_checkpoint(&self.session_id, Some("pre-tool"))
+            .await?;
         // The retry-class engine (spec §8.2) is a later issue (#11); this
         // stub hardcodes one simulated transient-then-succeed retry so
         // the `retries` span attribute carries a real nonzero value in
@@ -385,6 +467,9 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 "tool.call",
                 serde_json::json!({ "tool": tool, "retries": retries, "usd_cost": usd_cost }),
             )
+            .await?;
+        self.storage
+            .create_checkpoint(&self.session_id, Some("periodic"))
             .await?;
 
         self.channel

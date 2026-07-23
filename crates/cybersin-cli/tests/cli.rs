@@ -208,3 +208,72 @@ fn dev_build_excludes_compression_and_succeeds_frozen_without_pins() {
         .success();
     assert!(project.join("dist/prompts/hello.json").exists());
 }
+
+#[test]
+fn durable_session_cli_lists_shows_notifies_migrates_and_resumes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("state.db");
+
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "run",
+            "--stub",
+            "--session-id",
+            "durable-1",
+        ])
+        .assert()
+        .success();
+    cybersin()
+        .args(["--db", db.to_str().unwrap(), "sessions", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("durable-1"));
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "sessions",
+            "show",
+            "durable-1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"checkpoint\""));
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "notify",
+            "durable-1",
+            "{\"go\":true}",
+        ])
+        .assert()
+        .success();
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "sessions",
+            "migrate",
+            "durable-1",
+            "--config-hash",
+            "next",
+        ])
+        .assert()
+        .success();
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "sessions",
+            "resume",
+            "durable-1",
+            "--config-hash",
+            "next",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("resumed durable-1"));
+}

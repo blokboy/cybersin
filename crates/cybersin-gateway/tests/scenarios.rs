@@ -13,7 +13,7 @@ use cybersin_adapter::messages::CallOutcome;
 use cybersin_gateway::{
     ApprovalGate, EchoExecutor, GatewayOutcome, RetryClass, ToolExecutor, ToolGateway,
 };
-use cybersin_runtime::DaemonHandle;
+use cybersin_runtime::{DaemonHandle, SessionSupervisor};
 use serde_json::json;
 
 /// Always fails with `reason`. Used to seed a deliberately failed call.
@@ -371,6 +371,59 @@ async fn chaos_double_firing_the_same_call_produces_zero_duplicate_side_effects(
         .unwrap()
         .unwrap();
     assert_eq!(row.status, "succeeded");
+}
+
+#[tokio::test]
+async fn kill_then_resume_memoizes_succeeded_call_without_reexecution() {
+    let daemon = daemon().await;
+    let storage = daemon.storage();
+    storage
+        .create_session_pinned("sess-resume", "agent-a", "build-1")
+        .await
+        .unwrap();
+    let executor = Arc::new(CountingExecutor::default());
+
+    let first_gateway = ToolGateway::new(storage.clone(), executor.clone());
+    let first = first_gateway
+        .call(
+            "sess-resume",
+            "charge_card",
+            json!({"order": "42"}),
+            Some("order-42".into()),
+            RetryClass::Write,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        first,
+        GatewayOutcome::Resolved(CallOutcome::Ok { .. })
+    ));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+
+    // Dropping the first gateway models the killed worker process. A
+    // fresh gateway after durable resume must read the succeeded ledger
+    // row and return its result without touching the executor.
+    drop(first_gateway);
+    let supervisor = SessionSupervisor::new(storage.clone());
+    supervisor.kill("sess-resume").await.unwrap();
+    supervisor.resume("sess-resume", "build-1").await.unwrap();
+    let resumed_gateway = ToolGateway::new(storage, executor.clone());
+    let replay = resumed_gateway
+        .call(
+            "sess-resume",
+            "charge_card",
+            json!({"order": "42"}),
+            Some("order-42".into()),
+            RetryClass::Write,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first, replay);
+    assert_eq!(
+        executor.calls.load(Ordering::SeqCst),
+        1,
+        "resume repeated a succeeded side effect"
+    );
 }
 
 #[tokio::test]

@@ -27,11 +27,14 @@ pub mod error;
 pub mod session;
 pub mod storage;
 pub mod stub_agent;
+pub mod supervisor;
 
 pub use daemon::DaemonHandle;
 pub use dist::{bundled_stub_dist_dir, DistError, DistFixture, DistManifest, RoutingEntry};
 pub use error::RuntimeError;
 pub use session::{estimate_tokens, RuntimeDaemon, RuntimeSessionSummary};
 pub use storage::{
-    EventRecord, SessionRecord, SqliteStorage, Storage, StorageError, ToolCallRecord,
+    CheckpointRecord, EventRecord, SessionRecord, SqliteStorage, StateRecord, Storage,
+    StorageError, ToolCallRecord,
 };
+pub use supervisor::SessionSupervisor;

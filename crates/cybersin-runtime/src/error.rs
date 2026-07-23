@@ -5,6 +5,8 @@
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
+    #[error("{0}")]
+    Session(String),
     #[error(transparent)]
     Storage(#[from] crate::storage::StorageError),
     #[error(transparent)]
