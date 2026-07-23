@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package cybersin.adapter.v0;
+
+// Adapter protocol v0 (spec §10), gRPC fast-path transport.
+//
+// The wire-level message vocabulary (llm.request, tool.request, state.*,
+// checkpoint, sleep, signal.wait, session.complete, session.start,
+// signal.delivered, session.abort, ...) is defined once, in Rust, as the
+// serde-tagged enums `HarnessMessage` / `DaemonMessage` in
+// `cybersin-adapter::messages`. Both transports (stdio newline-JSON and
+// this gRPC service) carry that same JSON envelope verbatim rather than
+// re-modeling the protocol twice in two schema languages: stdio writes it
+// as a newline-delimited JSON line, gRPC wraps it as the `json` field of
+// an Envelope on a bidirectional stream. This keeps the protocol's single
+// source of truth in Rust types (matching cybersin-ir's serde-on-both-sides
+// philosophy, §13) while still giving the gRPC fast path a real typed
+// service definition and HTTP/2 framing/multiplexing.
+message HarnessEnvelope {
+  // JSON-encoded `cybersin_adapter::messages::HarnessMessage`.
+  string json = 1;
+}
+
+message DaemonEnvelope {
+  // JSON-encoded `cybersin_adapter::messages::DaemonMessage`.
+  string json = 1;
+}
+
+service Adapter {
+  // One bidirectional stream per session: the harness sends
+  // HarnessEnvelope messages, the daemon sends DaemonEnvelope messages,
+  // interleaved freely in both directions for the lifetime of the session.
+  rpc Session(stream HarnessEnvelope) returns (stream DaemonEnvelope);
+}
