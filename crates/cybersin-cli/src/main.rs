@@ -1,12 +1,13 @@
 //! `cybersin` — the CLI binary (spec §1, §11).
 //!
-//! Merges two issues' worth of subcommands onto one `Command` enum:
-//! compile-side `check`/`init`/`fmt` (issue #3, spec §6.1) and
-//! runtime-side `run --stub`/`trace`/`cost` (issue #10, spec §8.5). Each
-//! variant dispatches immediately to its own `commands::*` module, so
-//! later issues adding more subcommands (`build`, `sessions`,
-//! `approve`/`deny`, `dlq`, `sandbox`, `eval`, `optimize`, `explain`, ...)
-//! only touch this enum, not the bodies below it.
+//! Merges three issues' worth of subcommands onto one `Command` enum:
+//! compile-side `check`/`init`/`fmt` (issue #3, spec §6.1), runtime-side
+//! `run --stub`/`trace`/`cost` (issue #10, spec §8.5), and the tool
+//! gateway's `dlq`/`approve`/`deny` (issue #11, spec §8.2). Each variant
+//! dispatches immediately to its own `commands::*` module, so later
+//! issues adding more subcommands (`build`, `sessions`, `sandbox`, `eval`,
+//! `optimize`, `explain`, ...) only touch this enum, not the bodies below
+//! it.
 //!
 //! Compile commands (`check`/`init`/`fmt`) are synchronous, pure
 //! functions returning `Result<Option<String>, String>` — they never
@@ -77,6 +78,26 @@ enum Command {
     },
     /// Cost rollups (spec §8.5: `cybersin cost --by <dim>`).
     Cost(commands::cost::CostArgs),
+    /// Dead-letter queue over the tool-call ledger (spec §8.2: `cybersin
+    /// dlq ls|show|retry|drop`).
+    Dlq {
+        #[command(subcommand)]
+        command: commands::dlq::DlqCommand,
+    },
+    /// Resume a call parked by an approval-gate policy hook (spec §8.2):
+    /// resumes the session and runs the call.
+    Approve {
+        /// Call id, as printed by `cybersin dlq ls`/the parked-call
+        /// message (`"{tool}:{idem_key}"`).
+        call_id: String,
+    },
+    /// Resolve a parked call to `failed(reason: "denied")` (spec §8.2)
+    /// without killing the session.
+    Deny {
+        /// Call id, as printed by `cybersin dlq ls`/the parked-call
+        /// message (`"{tool}:{idem_key}"`).
+        call_id: String,
+    },
 }
 
 #[tokio::main]
@@ -89,6 +110,11 @@ async fn main() -> ExitCode {
         Command::Run(args) => from_async(commands::run::execute(cli.db, args).await),
         Command::Trace { command } => from_async(commands::trace::execute(cli.db, command).await),
         Command::Cost(args) => from_async(commands::cost::execute(cli.db, args).await),
+        Command::Dlq { command } => from_async(commands::dlq::execute(cli.db, command).await),
+        Command::Approve { call_id } => {
+            from_async(commands::approval::approve(cli.db, call_id).await)
+        }
+        Command::Deny { call_id } => from_async(commands::approval::deny(cli.db, call_id).await),
     }
 }
 
