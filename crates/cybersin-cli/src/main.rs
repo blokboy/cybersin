@@ -1,11 +1,20 @@
-//! `cybersin` — the compiler CLI (spec §11).
+//! `cybersin` — the CLI binary (spec §1, §11).
 //!
-//! This issue implements `check`, `init`, and `fmt` (spec §6.1's frontend
-//! surface). Every other subcommand in the full §11 surface (`build`,
-//! `run`, `sessions`, `trace`, ...) belongs to later issues; the
-//! [`Command`] enum below is meant to grow one variant per issue, each
-//! dispatching to its own `commands::<name>` module, so adding a command
-//! elsewhere doesn't need to touch the arms already here.
+//! Merges two issues' worth of subcommands onto one `Command` enum:
+//! compile-side `check`/`init`/`fmt` (issue #3, spec §6.1) and
+//! runtime-side `run --stub`/`trace`/`cost` (issue #10, spec §8.5). Each
+//! variant dispatches immediately to its own `commands::*` module, so
+//! later issues adding more subcommands (`build`, `sessions`,
+//! `approve`/`deny`, `dlq`, `sandbox`, `eval`, `optimize`, `explain`, ...)
+//! only touch this enum, not the bodies below it.
+//!
+//! Compile commands (`check`/`init`/`fmt`) are synchronous, pure
+//! functions returning `Result<Option<String>, String>` — they never
+//! touch the daemon. Runtime commands (`run`/`trace`/`cost`) are async
+//! and return `anyhow::Result<()>`, since they auto-start `cybersind`
+//! against a shared SQLite state file. `main` stays `ExitCode`-based
+//! (rather than propagating `?` straight out of `main`) so both
+//! conventions map to the same clean 0/1 exit-code contract.
 
 mod commands;
 
@@ -14,6 +23,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+/// Cybersin: a prompt compiler and agent runtime in one binary (spec §1).
 #[derive(Parser)]
 #[command(
     name = "cybersin",
@@ -21,6 +31,13 @@ use clap::{Parser, Subcommand};
     about = "Cybersin prompt compiler + agent runtime CLI"
 )]
 struct Cli {
+    /// Path to `cybersind`'s SQLite state file (spec §8: Storage trait,
+    /// SQLite in dev). Shared by every runtime subcommand, so `run --stub`
+    /// followed by `trace`/`cost` in the same working directory sees the
+    /// same recorded data. Ignored by compile commands.
+    #[arg(long, global = true, default_value = ".cybersin/cybersin.db")]
+    db: PathBuf,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -50,15 +67,33 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Run an agent session (spec §11: `cybersin run <agent.yaml>`; for
+    /// now: `cybersin run --stub`).
+    Run(commands::run::RunArgs),
+    /// Inspect recorded spans (spec §8.5: `cybersin trace ls|show`).
+    Trace {
+        #[command(subcommand)]
+        command: commands::trace::TraceCommand,
+    },
+    /// Cost rollups (spec §8.5: `cybersin cost --by <dim>`).
+    Cost(commands::cost::CostArgs),
 }
 
-fn main() -> ExitCode {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Check { path } => commands::check::run(&path),
-        Command::Init { dir } => commands::init::run(&dir),
-        Command::Fmt { path, check } => commands::fmt::run(&path, check),
-    };
+    match cli.command {
+        Command::Check { path } => from_sync(commands::check::run(&path)),
+        Command::Init { dir } => from_sync(commands::init::run(&dir)),
+        Command::Fmt { path, check } => from_sync(commands::fmt::run(&path, check)),
+        Command::Run(args) => from_async(commands::run::execute(cli.db, args).await),
+        Command::Trace { command } => from_async(commands::trace::execute(cli.db, command).await),
+        Command::Cost(args) => from_async(commands::cost::execute(cli.db, args).await),
+    }
+}
+
+/// Exit-code mapping for the synchronous compile commands.
+fn from_sync(result: Result<Option<String>, String>) -> ExitCode {
     match result {
         Ok(message) => {
             if let Some(message) = message {
@@ -68,6 +103,17 @@ fn main() -> ExitCode {
         }
         Err(message) => {
             eprintln!("{message}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Exit-code mapping for the async runtime commands.
+fn from_async(result: anyhow::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
             ExitCode::FAILURE
         }
     }

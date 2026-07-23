@@ -1,0 +1,13 @@
+{
+  "prompt_name": "researcher",
+  "plans": [
+    {
+      "target": "generic",
+      "context_window_tokens": 40,
+      "reserved_output_tokens": 10,
+      "eviction_order": [
+        { "section_id": "documents", "evict_at_tokens": 30 }
+      ]
+    }
+  ]
+}

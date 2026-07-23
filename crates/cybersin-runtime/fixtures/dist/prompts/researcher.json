@@ -1,0 +1,29 @@
+{
+  "ir_version": 1,
+  "name": "researcher",
+  "quality": "high",
+  "inputs": {
+    "depth": { "kind": "enum", "variants": ["quick", "thorough"] },
+    "documents": { "kind": "list", "of": { "kind": "document" } },
+    "topic": { "kind": "string" }
+  },
+  "tools": ["web_search"],
+  "sections": [
+    {
+      "id": "role",
+      "priority": 100,
+      "body": "You are a concise research analyst who summarizes findings crisply."
+    },
+    {
+      "id": "instructions",
+      "priority": 90,
+      "body": "Answer the user's question using the provided documents and cite sources inline."
+    },
+    {
+      "id": "documents",
+      "priority": 50,
+      "body": "Document excerpts: cybernetics originated with Norbert Wiener and describes control and communication in animals and machines across feedback loops."
+    }
+  ],
+  "output_contract": null
+}

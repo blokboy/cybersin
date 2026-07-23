@@ -2,6 +2,7 @@
 name = "cybersin-cli"
 version.workspace = true
 edition.workspace = true
+description = "The `cybersin` binary: clap commands (this issue: run --stub, trace ls|show, cost --by) + ratatui views (later issue)."
 
 [[bin]]
 name = "cybersin"
@@ -9,7 +10,15 @@ path = "src/main.rs"
 
 [dependencies]
 cybersin-frontend = { path = "../cybersin-frontend" }
+cybersin-adapter = { path = "../cybersin-adapter" }
+cybersin-ir = { path = "../cybersin-ir" }
+cybersin-runtime = { path = "../cybersin-runtime" }
+cybersin-trace = { path = "../cybersin-trace" }
+
+anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 tempfile = "3"
