@@ -29,6 +29,7 @@ pub(crate) fn build_ir(raw: RawSource) -> Result<PromptIr, FrontendError> {
             id: s.id.clone(),
             priority: s.priority,
             body: translated,
+            dedup_ref: None,
         });
     }
 
