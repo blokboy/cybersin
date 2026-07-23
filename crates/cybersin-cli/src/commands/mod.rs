@@ -7,6 +7,7 @@ pub mod approval;
 pub mod build;
 pub mod check;
 pub mod cost;
+pub mod daemon;
 pub mod dlq;
 pub mod fmt;
 pub mod init;

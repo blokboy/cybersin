@@ -18,11 +18,11 @@ cybersin-runtime = { path = "../cybersin-runtime" }
 cybersin-trace = { path = "../cybersin-trace" }
 
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 
 [dev-dependencies]
 async-trait = "0.1"

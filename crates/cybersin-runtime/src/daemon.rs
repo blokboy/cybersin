@@ -37,12 +37,21 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::{fs::File, io::BufReader, net::SocketAddr};
 
 use cybersin_trace::SpanStore;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
 use sqlx::sqlite::SqlitePoolOptions;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio_rustls::TlsAcceptor;
 
 use crate::error::RuntimeError;
 use crate::storage::{SqliteStorage, Storage};
+use crate::PgStorage;
 
 /// A handle to the (in-process, for now) `cybersind` daemon: shared
 /// ownership of the `Storage` trait object and the trace span store.
@@ -50,6 +59,107 @@ use crate::storage::{SqliteStorage, Storage};
 pub struct DaemonHandle {
     storage: Arc<dyn Storage>,
     spans: SpanStore,
+}
+
+/// Configuration for the Postgres-backed TCP+mTLS daemon.
+pub struct ServerConfig {
+    pub listen: SocketAddr,
+    pub database_url: String,
+    pub tls_cert: std::path::PathBuf,
+    pub tls_key: std::path::PathBuf,
+    pub client_ca: std::path::PathBuf,
+    pub workers: usize,
+}
+
+/// Run server mode until the supplied shutdown future completes.
+pub async fn serve_server<F>(config: ServerConfig, shutdown: F) -> Result<(), RuntimeError>
+where
+    F: std::future::Future<Output = ()>,
+{
+    if config.workers == 0 {
+        return Err(RuntimeError::Tls(
+            "workers must be greater than zero".into(),
+        ));
+    }
+    let storage: Arc<dyn Storage> =
+        Arc::new(PgStorage::connect(&config.database_url, config.workers as u32).await?);
+    let acceptor = TlsAcceptor::from(Arc::new(load_tls_config(
+        &config.tls_cert,
+        &config.tls_key,
+        &config.client_ca,
+    )?));
+    let listener = TcpListener::bind(config.listen).await?;
+    let permits = Arc::new(Semaphore::new(config.workers));
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return Ok(()),
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let acceptor = acceptor.clone();
+                let storage = storage.clone();
+                let permits = permits.clone();
+                tokio::spawn(async move {
+                    let Ok(permit) = permits.acquire_owned().await else {
+                        return;
+                    };
+                    let _permit = permit;
+                    if let Ok(tls) = acceptor.accept(stream).await {
+                        let _ = serve_connection(tls, storage).await;
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn serve_connection<S>(stream: S, storage: Arc<dyn Storage>) -> Result<(), RuntimeError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut lines = AsyncBufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        let response = match line.as_str() {
+            "ping" => serde_json::json!({"ok": true, "reply": "pong"}),
+            "sessions.count" => {
+                serde_json::json!({"ok": true, "count": storage.list_sessions().await?.len()})
+            }
+            _ => serde_json::json!({"ok": false, "error": "unknown request"}),
+        };
+        writer.write_all(response.to_string().as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+    }
+    Ok(())
+}
+
+fn load_tls_config(
+    cert_path: &Path,
+    key_path: &Path,
+    ca_path: &Path,
+) -> Result<RustlsServerConfig, RuntimeError> {
+    let certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(File::open(cert_path)?))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| RuntimeError::Tls(e.to_string()))?;
+    let key: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut BufReader::new(File::open(key_path)?))
+            .map_err(|e| RuntimeError::Tls(e.to_string()))?
+            .ok_or_else(|| RuntimeError::Tls("TLS key file contained no private key".into()))?;
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut BufReader::new(File::open(ca_path)?)) {
+        roots
+            .add(cert.map_err(|e| RuntimeError::Tls(e.to_string()))?)
+            .map_err(|e| RuntimeError::Tls(e.to_string()))?;
+    }
+    let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|e| RuntimeError::Tls(e.to_string()))?;
+    RustlsServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .map_err(|e| RuntimeError::Tls(e.to_string()))
 }
 
 impl DaemonHandle {

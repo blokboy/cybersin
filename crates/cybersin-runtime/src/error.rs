@@ -21,4 +21,6 @@ pub enum RuntimeError {
     Io(#[from] std::io::Error),
     #[error("session task panicked: {0}")]
     Join(String),
+    #[error("TLS configuration error: {0}")]
+    Tls(String),
 }

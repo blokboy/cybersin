@@ -2,12 +2,10 @@
 //! (dev) and Postgres (server) via sqlx, no ORM") and the event-sourced
 //! session loop's durable log (spec §8.1: "append-only `events`").
 //!
-//! This issue builds only the SQLite half of that trait boundary — a
-//! `PgStorage` implementing the same [`Storage`] trait against Postgres is
-//! issue #24 (`cybersind --server`). The trait is what matters here: every
-//! caller in this crate (the [`crate::session::RuntimeDaemon`] session
-//! loop, the CLI's `trace`/`sessions` views once they exist) depends on
-//! `dyn Storage`, never on `SqliteStorage` directly.
+//! Both SQLite and Postgres implement this trait boundary. Every caller
+//! in this crate (the [`crate::session::RuntimeDaemon`] session loop, the
+//! CLI's trace/session views) depends on `dyn Storage`, never on a
+//! concrete backend.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -142,8 +140,8 @@ pub struct ToolCallRecord {
     pub updated_unix_ms: i64,
 }
 
-/// Storage trait boundary (spec §8). SQLite today; Postgres (`cybersind
-/// --server`) is issue #24, implementing this same trait.
+/// Storage trait boundary (spec §8), implemented by SQLite for local
+/// development and Postgres for server mode.
 #[async_trait]
 pub trait Storage: Send + Sync {
     async fn create_session(&self, session_id: &str, agent_name: &str) -> Result<()>;
@@ -877,7 +875,7 @@ impl Storage for SqliteStorage {
     }
 }
 
-fn now_unix_ms() -> i64 {
+pub(crate) fn now_unix_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
