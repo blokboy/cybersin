@@ -2,3 +2,16 @@
 name = "cybersin-frontend"
 version.workspace = true
 edition.workspace = true
+description = "Cybersin compiler frontend (spec §6.1): parses *.prompt.yaml sources, resolves the !include graph with cycle detection, typechecks inputs against template usage, and emits cybersin-ir::PromptIr. May depend on cybersin-ir; never the reverse (spec §13)."
+
+[dependencies]
+cybersin-ir = { path = "../cybersin-ir" }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+minijinja = "2"
+regex = "1"
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
