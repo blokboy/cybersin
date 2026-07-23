@@ -1,0 +1,11 @@
+[package]
+name = "cybersin-ir"
+version.workspace = true
+edition.workspace = true
+description = "Cybersin IR types: prompt IR, sections, budget plans. Serde on both sides of the compiler/runtime boundary. Zero heavy deps."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

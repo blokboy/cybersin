@@ -1,0 +1,4 @@
+[package]
+name = "cybersin-frontend"
+version.workspace = true
+edition.workspace = true

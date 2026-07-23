@@ -1,0 +1,4 @@
+[package]
+name = "cybersin-backends"
+version.workspace = true
+edition.workspace = true

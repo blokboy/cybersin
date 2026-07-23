@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cybersin-ir",
+    "crates/cybersin-frontend",
+    "crates/cybersin-passes",
+    "crates/cybersin-router",
+    "crates/cybersin-backends",
+    "crates/cybersin-runtime",
+    "crates/cybersin-gateway",
+    "crates/cybersin-sandbox",
+    "crates/cybersin-trace",
+    "crates/cybersin-adapter",
+    "crates/cybersin-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"

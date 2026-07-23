@@ -1,0 +1,4 @@
+[package]
+name = "cybersin-passes"
+version.workspace = true
+edition.workspace = true

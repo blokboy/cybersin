@@ -1,0 +1,4 @@
+[package]
+name = "cybersin-runtime"
+version.workspace = true
+edition.workspace = true

@@ -1,0 +1,4 @@
+[package]
+name = "cybersin-sandbox"
+version.workspace = true
+edition.workspace = true

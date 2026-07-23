@@ -1,0 +1,4 @@
+[package]
+name = "cybersin-trace"
+version.workspace = true
+edition.workspace = true

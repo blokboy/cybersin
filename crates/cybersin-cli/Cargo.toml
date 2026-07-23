@@ -1,0 +1,8 @@
+[package]
+name = "cybersin-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "cybersin"
+path = "src/main.rs"

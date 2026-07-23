@@ -1,0 +1,4 @@
+[package]
+name = "cybersin-gateway"
+version.workspace = true
+edition.workspace = true
