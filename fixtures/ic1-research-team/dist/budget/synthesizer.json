@@ -1,0 +1,43 @@
+{
+  "prompt_name": "synthesizer",
+  "plans": [
+    {
+      "target": "generic",
+      "context_window_tokens": 128000,
+      "reserved_output_tokens": 4096,
+      "eviction_order": [
+        {
+          "section_id": "findings",
+          "evict_at_tokens": 123904
+        },
+        {
+          "section_id": "assignment",
+          "evict_at_tokens": 123904
+        },
+        {
+          "section_id": "role",
+          "evict_at_tokens": 123904
+        }
+      ]
+    },
+    {
+      "target": "openai",
+      "context_window_tokens": 128000,
+      "reserved_output_tokens": 4096,
+      "eviction_order": [
+        {
+          "section_id": "findings",
+          "evict_at_tokens": 123904
+        },
+        {
+          "section_id": "assignment",
+          "evict_at_tokens": 123904
+        },
+        {
+          "section_id": "role",
+          "evict_at_tokens": 123904
+        }
+      ]
+    }
+  ]
+}

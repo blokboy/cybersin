@@ -1,0 +1,47 @@
+{
+  "ir_version": 1,
+  "name": "synthesizer",
+  "quality": "medium",
+  "inputs": {
+    "audience": {
+      "kind": "enum",
+      "variants": [
+        "technical",
+        "executive"
+      ]
+    },
+    "findings": {
+      "kind": "list",
+      "of": {
+        "kind": "document"
+      }
+    },
+    "topic": {
+      "kind": "string"
+    }
+  },
+  "tools": [
+    "citation_lookup"
+  ],
+  "sections": [
+    {
+      "id": "role",
+      "priority": 100,
+      "body": "Cite evidence; separate fact from inference; preserve uncertainty."
+    },
+    {
+      "id": "assignment",
+      "priority": 90,
+      "body": "Synthesize {{ topic }} for {{ audience }} readers; expose contradictions."
+    },
+    {
+      "id": "findings",
+      "priority": 60,
+      "body": "{% for item in findings %}{{ item.title }}{% endfor %}"
+    }
+  ],
+  "output_contract": {
+    "type": "json_schema",
+    "schema": "{\n  \"type\": \"object\",\n  \"required\": [\"summary\", \"findings\", \"confidence\"],\n  \"properties\": {\n    \"summary\": { \"type\": \"string\" },\n    \"findings\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"required\": [\"claim\", \"source\"],\n        \"properties\": {\n          \"claim\": { \"type\": \"string\" },\n          \"source\": { \"type\": \"string\" }\n        }\n      }\n    },\n    \"confidence\": {\n      \"type\": \"string\",\n      \"enum\": [\"low\", \"medium\", \"high\"]\n    }\n  }\n}\n"
+  }
+}

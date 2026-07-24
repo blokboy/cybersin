@@ -1,0 +1,12 @@
+name: ic1-research-team
+targets:
+  - generic
+  - openai
+cost_model:
+  cache_similarity_threshold: 0.97
+  judge_trigger_band: [0.90, 0.97]
+  judge_model: cache-judge
+storage:
+  backend: sqlite
+sandbox:
+  backend: docker+gvisor

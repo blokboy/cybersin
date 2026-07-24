@@ -1,0 +1,220 @@
+{
+  "schema_version": 1,
+  "prompts": {
+    "researcher": {
+      "quality": "high",
+      "decisions": [
+        {
+          "kind": "cache",
+          "similarity_threshold": 0.97,
+          "judge_trigger_band": [
+            0.9,
+            0.97
+          ],
+          "judge": {
+            "name": "cache-judge",
+            "provider": "internal",
+            "quality": "high",
+            "estimated_cost_usd": 1e-9,
+            "model_kind": "judge"
+          }
+        },
+        {
+          "kind": "cascade",
+          "steps": [
+            {
+              "model": {
+                "name": "fast-low",
+                "provider": "recorded",
+                "quality": "low",
+                "estimated_cost_usd": 0.2,
+                "model_kind": "provider"
+              },
+              "confidence": {
+                "minimum_score": 0.9,
+                "instruction": "Score 0..1 whether the response satisfies the High quality contract; accept at or above 0.90."
+              }
+            },
+            {
+              "model": {
+                "name": "balanced-medium",
+                "provider": "recorded",
+                "quality": "medium",
+                "estimated_cost_usd": 1.0,
+                "model_kind": "provider"
+              },
+              "confidence": {
+                "minimum_score": 0.9,
+                "instruction": "Score 0..1 whether the response satisfies the High quality contract; accept at or above 0.90."
+              }
+            },
+            {
+              "model": {
+                "name": "premium-high",
+                "provider": "recorded",
+                "quality": "high",
+                "estimated_cost_usd": 4.0,
+                "model_kind": "provider"
+              },
+              "confidence": {
+                "minimum_score": 0.82,
+                "instruction": "Score 0..1 whether the response satisfies the High quality contract; accept at or above 0.82."
+              }
+            }
+          ]
+        },
+        {
+          "kind": "fallbacks",
+          "providers": []
+        }
+      ],
+      "optimization_candidates": [
+        {
+          "name": "cache-judge",
+          "provider": "internal",
+          "quality": "high",
+          "estimated_cost_usd": 1e-9,
+          "model_kind": "judge",
+          "selected_for_cascade": false
+        },
+        {
+          "name": "semantic-cache",
+          "provider": "internal",
+          "quality": "low",
+          "estimated_cost_usd": 1e-9,
+          "model_kind": "cache",
+          "selected_for_cascade": false
+        },
+        {
+          "name": "fast-low",
+          "provider": "recorded",
+          "quality": "low",
+          "estimated_cost_usd": 0.2,
+          "model_kind": "provider",
+          "selected_for_cascade": true
+        },
+        {
+          "name": "balanced-medium",
+          "provider": "recorded",
+          "quality": "medium",
+          "estimated_cost_usd": 1.0,
+          "model_kind": "provider",
+          "selected_for_cascade": true
+        },
+        {
+          "name": "premium-high",
+          "provider": "recorded",
+          "quality": "high",
+          "estimated_cost_usd": 4.0,
+          "model_kind": "provider",
+          "selected_for_cascade": true
+        }
+      ]
+    },
+    "synthesizer": {
+      "quality": "medium",
+      "decisions": [
+        {
+          "kind": "cache",
+          "similarity_threshold": 0.97,
+          "judge_trigger_band": [
+            0.9,
+            0.97
+          ],
+          "judge": {
+            "name": "cache-judge",
+            "provider": "internal",
+            "quality": "medium",
+            "estimated_cost_usd": 1e-9,
+            "model_kind": "judge"
+          }
+        },
+        {
+          "kind": "cascade",
+          "steps": [
+            {
+              "model": {
+                "name": "fast-low",
+                "provider": "recorded",
+                "quality": "low",
+                "estimated_cost_usd": 0.2,
+                "model_kind": "provider"
+              },
+              "confidence": {
+                "minimum_score": 0.9,
+                "instruction": "Score 0..1 whether the response satisfies the Medium quality contract; accept at or above 0.90."
+              }
+            },
+            {
+              "model": {
+                "name": "balanced-medium",
+                "provider": "recorded",
+                "quality": "medium",
+                "estimated_cost_usd": 1.0,
+                "model_kind": "provider"
+              },
+              "confidence": {
+                "minimum_score": 0.78,
+                "instruction": "Score 0..1 whether the response satisfies the Medium quality contract; accept at or above 0.78."
+              }
+            }
+          ]
+        },
+        {
+          "kind": "fallbacks",
+          "providers": [
+            {
+              "name": "premium-high",
+              "provider": "recorded",
+              "quality": "high",
+              "estimated_cost_usd": 4.0,
+              "model_kind": "provider"
+            }
+          ]
+        }
+      ],
+      "optimization_candidates": [
+        {
+          "name": "cache-judge",
+          "provider": "internal",
+          "quality": "medium",
+          "estimated_cost_usd": 1e-9,
+          "model_kind": "judge",
+          "selected_for_cascade": false
+        },
+        {
+          "name": "semantic-cache",
+          "provider": "internal",
+          "quality": "low",
+          "estimated_cost_usd": 1e-9,
+          "model_kind": "cache",
+          "selected_for_cascade": false
+        },
+        {
+          "name": "fast-low",
+          "provider": "recorded",
+          "quality": "low",
+          "estimated_cost_usd": 0.2,
+          "model_kind": "provider",
+          "selected_for_cascade": true
+        },
+        {
+          "name": "balanced-medium",
+          "provider": "recorded",
+          "quality": "medium",
+          "estimated_cost_usd": 1.0,
+          "model_kind": "provider",
+          "selected_for_cascade": true
+        },
+        {
+          "name": "premium-high",
+          "provider": "recorded",
+          "quality": "high",
+          "estimated_cost_usd": 4.0,
+          "model_kind": "provider",
+          "selected_for_cascade": false
+        }
+      ]
+    }
+  }
+}

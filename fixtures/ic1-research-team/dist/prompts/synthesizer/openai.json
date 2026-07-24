@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "target": "openai",
+  "name": "synthesizer",
+  "messages": [
+    {
+      "role": "system",
+      "content": "<section name=\"role\">\nCite evidence; separate fact from inference; preserve uncertainty.\n</section>"
+    },
+    {
+      "role": "user",
+      "content": "<section name=\"assignment\">\nSynthesize {{ topic }} for {{ audience }} readers; expose contradictions.\n</section>\n\n<section name=\"findings\">\n{% for item in findings %}{{ item.title }}{% endfor %}\n</section>"
+    }
+  ],
+  "tools": [
+    {
+      "function": {
+        "description": "Cybersin tool citation_lookup",
+        "name": "citation_lookup",
+        "parameters": {
+          "additionalProperties": true,
+          "properties": {},
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ],
+  "response_format": {
+    "json_schema": {
+      "name": "synthesizer",
+      "schema": {
+        "properties": {
+          "confidence": {
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ],
+            "type": "string"
+          },
+          "findings": {
+            "items": {
+              "properties": {
+                "claim": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "claim",
+                "source"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "findings",
+          "confidence"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "json_schema"
+  }
+}
