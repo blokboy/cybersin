@@ -24,6 +24,14 @@ pub enum TraceCommand {
         /// Span id, as printed by `cybersin trace ls`.
         id: String,
     },
+    /// Promote one production LLM trace to a portable eval fixture.
+    Sample {
+        /// Span id, as printed by `cybersin trace ls`.
+        id: String,
+        /// Destination `*.eval.yaml` file.
+        #[arg(long)]
+        to_eval: PathBuf,
+    },
 }
 
 pub async fn execute(db_path: PathBuf, cmd: TraceCommand) -> anyhow::Result<()> {
@@ -77,6 +85,44 @@ pub async fn execute(db_path: PathBuf, cmd: TraceCommand) -> anyhow::Result<()> 
             Some(span) => println!("{}", serde_json::to_string_pretty(&span)?),
             None => anyhow::bail!("no span with id {id:?}"),
         },
+        TraceCommand::Sample { id, to_eval } => {
+            let span = daemon
+                .spans()
+                .get(&id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("no span with id {id:?}"))?;
+            if span.kind != cybersin_trace::SpanKind::LlmCall {
+                anyhow::bail!("span {id:?} is not an LLM call and cannot become a prompt eval");
+            }
+            let inputs = span
+                .attributes
+                .get("inputs")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let output = span
+                .attributes
+                .get("output")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let fixture = serde_json::json!({
+                "prompt": span.name,
+                "cases": [{
+                    "name": format!("production_{}", span.id),
+                    "inputs": inputs,
+                    "assertions": [{"type": "contains_none", "values": ["__cybersin_never__"]}],
+                    "recorded_outputs": [{
+                        "output": output,
+                        "judge_score": span.attributes.get("judge_score").cloned()
+                    }]
+                }],
+                "runs_per_case": 1
+            });
+            if let Some(parent) = to_eval.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&to_eval, serde_yaml::to_string(&fixture)?)?;
+            println!("wrote {}", to_eval.display());
+        }
     }
     Ok(())
 }
