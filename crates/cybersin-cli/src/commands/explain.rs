@@ -18,7 +18,7 @@ use crossterm::terminal::{
 use cybersin_backends::{backend_for, RenderedPrompt};
 use cybersin_ir::PromptIr;
 use cybersin_router::{RouteDecision, RouteModel, RoutingArtifact};
-use cybersin_runtime::{DaemonHandle, SessionRecord};
+use cybersin_runtime::{DaemonHandle, ModelAllowlist, SessionRecord};
 use cybersin_trace::{CostDimension, CostRollupRow, Span, SpanFilter, SpanKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -51,6 +51,14 @@ struct ExplainModel {
     targets: Vec<TargetTokens>,
     routing: Vec<String>,
     estimated_cost: f64,
+    /// The first candidate this environment's `cybersin.local.yaml`
+    /// allowlist would actually let a real run reach, computed at
+    /// `explain`-invocation time rather than baked into `dist/` — issue
+    /// #35 Phase 1: `dist/routing.json` stays portable across
+    /// environments, but cost visibility before a run should reflect what
+    /// *this* environment can actually call. `None` means every candidate
+    /// in this project's routing is disallowed here.
+    effective: Option<(String, f64)>,
     observed_cost: f64,
     observed_calls: usize,
     sessions: Vec<SessionRecord>,
@@ -137,6 +145,11 @@ impl ExplainModel {
             .get(prompt_name)
             .with_context(|| format!("routing.json has no route for prompt {prompt_name:?}"))?;
         let (routing, estimated_cost) = render_route(&route.decisions);
+        let allowlist = ModelAllowlist::load(project).with_context(|| {
+            format!("reading {}", project.join("cybersin.local.yaml").display())
+        })?;
+        let effective = effective_first_candidate(&route.decisions, &allowlist)
+            .map(|model| (describe_model(&model), model.estimated_cost_usd));
 
         let all_spans = daemon
             .spans()
@@ -157,6 +170,7 @@ impl ExplainModel {
             targets,
             routing,
             estimated_cost,
+            effective,
             observed_cost,
             observed_calls,
             sessions: daemon.storage().list_sessions().await?,
@@ -185,6 +199,15 @@ impl ExplainModel {
             "  Estimated: ${:.6} per routed call\n",
             self.estimated_cost
         ));
+        match &self.effective {
+            Some((model, cost)) => out.push_str(&format!(
+                "  Effective (this environment): {model} — ${cost:.6}\n"
+            )),
+            None => out.push_str(
+                "  Effective (this environment): none — every candidate is disallowed by \
+                 cybersin.local.yaml\n",
+            ),
+        }
         if self.observed_calls == 0 {
             out.push_str("  Observed: no matching LLM calls yet\n");
         } else {
@@ -309,6 +332,44 @@ fn render_route(decisions: &[RouteDecision]) -> (Vec<String>, f64) {
         }
     }
     (lines, estimated)
+}
+
+/// The first candidate a real run would actually reach in this
+/// environment: walk cascade steps then provider fallbacks in order,
+/// skipping anything `allowlist` disallows — the same skip
+/// `RouteExecutor::execute` applies at call time (issue #35 Phase 1), just
+/// simulated here instead of executed. Cache decisions are a zero-cost
+/// early exit that don't call a model at all, so they're not part of
+/// "effective candidate" — same reasoning `RouteExecutor` uses (they're
+/// not gated by the allowlist either).
+fn effective_first_candidate(
+    decisions: &[RouteDecision],
+    allowlist: &ModelAllowlist,
+) -> Option<RouteModel> {
+    for decision in decisions {
+        match decision {
+            RouteDecision::Cache(_) => {}
+            RouteDecision::Cascade(cascade) => {
+                if let Some(step) = cascade
+                    .steps
+                    .iter()
+                    .find(|step| allowlist.allows(&step.model))
+                {
+                    return Some(step.model.clone());
+                }
+            }
+            RouteDecision::Fallbacks(fallbacks) => {
+                if let Some(model) = fallbacks
+                    .providers
+                    .iter()
+                    .find(|model| allowlist.allows(model))
+                {
+                    return Some(model.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn run_tui(model: &ExplainModel) -> Result<()> {
