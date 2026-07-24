@@ -111,6 +111,11 @@ enum Command {
     },
     /// Cost rollups (spec §8.5: `cybersin cost --by <dim>`).
     Cost(commands::cost::CostArgs),
+    /// Compile, run, and gate single-prompt output-quality eval suites.
+    Eval {
+        #[command(subcommand)]
+        command: commands::eval::EvalCommand,
+    },
     /// Explain a compiled prompt's tokens, routing, cost, and operations state.
     Explain(commands::explain::ExplainArgs),
     /// Run the daemon. `--server` enables Postgres-backed TCP+mTLS
@@ -197,6 +202,7 @@ async fn main() -> ExitCode {
         Command::Run(args) => from_async(commands::run::execute(cli.db, args).await),
         Command::Trace { command } => from_async(commands::trace::execute(cli.db, command).await),
         Command::Cost(args) => from_async(commands::cost::execute(cli.db, args).await),
+        Command::Eval { command } => from_async(commands::eval::execute(command).await),
         Command::Explain(args) => from_async(commands::explain::execute(cli.db, args).await),
         Command::Daemon(args) => from_async(commands::daemon::execute(args).await),
         Command::Dlq { command } => from_async(commands::dlq::execute(cli.db, command).await),

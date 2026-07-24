@@ -10,6 +10,7 @@ pub mod cost;
 pub mod daemon;
 pub mod diff;
 pub mod dlq;
+pub mod eval;
 pub mod explain;
 pub mod fmt;
 pub mod init;
