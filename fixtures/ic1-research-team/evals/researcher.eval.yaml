@@ -15,3 +15,16 @@ cases:
       - type: judge
         rubric: Distinguishes observed facts from inference and cites evidence.
         min_score: 0.8
+    recorded_outputs:
+      - output:
+          summary: "The field reports disagree; the measured effect remains uncertain."
+          evidence: ["Conflicting field reports"]
+        judge_score: 0.92
+      - output:
+          summary: "Observed reports conflict, so no definitive effect can be inferred."
+          evidence: ["Conflicting field reports"]
+        judge_score: 0.90
+      - output:
+          summary: "Evidence supports documenting the disagreement, not resolving it."
+          evidence: ["Conflicting field reports"]
+        judge_score: 0.94

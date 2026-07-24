@@ -1,9 +1,19 @@
 use std::sync::Arc;
 
 use cybersin_runtime::stub_agent::run_stub_session;
-use cybersin_runtime::{bundled_stub_dist_dir, DistFixture, PgStorage, SqliteStorage, Storage};
+use cybersin_runtime::{DistFixture, PgStorage, SqliteStorage, Storage};
 use cybersin_trace::SpanStore;
 use serde_json::json;
+
+fn real_sample_dist() -> Arc<DistFixture> {
+    Arc::new(
+        DistFixture::load_dir(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/ic1-research-team/dist"),
+        )
+        .expect("load IC-1's real compiled dist"),
+    )
+}
 
 #[derive(Debug, PartialEq)]
 struct ParityResult {
@@ -114,11 +124,14 @@ async fn postgres_session_event_and_ledger_semantics_match_sqlite() {
 
 #[tokio::test]
 #[ignore = "requires TEST_POSTGRES_URL"]
-async fn complete_session_run_has_equivalent_postgres_and_sqlite_semantics() {
+async fn real_sample_run_has_equivalent_postgres_server_and_sqlite_dev_semantics() {
     let url = std::env::var("TEST_POSTGRES_URL").expect("TEST_POSTGRES_URL");
     let postgres: Arc<dyn Storage> = Arc::new(PgStorage::connect(&url, 8).await.unwrap());
     let sqlite: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
-    let dist = Arc::new(DistFixture::load_dir(bundled_stub_dist_dir()).unwrap());
+    // `cybersin daemon --server` selects PgStorage behind this same Storage
+    // boundary. Run the IC-1 compiler output through both implementations;
+    // the only difference here is the backend selected by dev/server mode.
+    let dist = real_sample_dist();
     let suffix = std::process::id();
     let sqlite_id = format!("sqlite-run-{suffix}");
     let postgres_id = format!("postgres-run-{suffix}");
