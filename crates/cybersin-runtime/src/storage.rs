@@ -484,23 +484,22 @@ impl Storage for SqliteStorage {
     async fn append_event(&self, session_id: &str, kind: &str, payload: Value) -> Result<i64> {
         let payload_str = serde_json::to_string(&payload)?;
         let now = now_unix_ms();
-        // Single-connection pool (see DaemonHandle) makes this
-        // read-then-insert race-free without an explicit transaction:
-        // there is only ever one sqlite connection in flight.
-        let next_seq: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?")
-                .bind(session_id)
-                .fetch_one(&self.pool)
-                .await?;
-        sqlx::query(
-            "INSERT INTO events (session_id, seq, unix_ms, kind, payload) VALUES (?, ?, ?, ?, ?)",
+        // Sequence allocation and insertion must be one SQLite statement.
+        // Even a single-connection pool can interleave two async tasks
+        // between a standalone SELECT and INSERT, giving both the same
+        // `MAX(seq) + 1` under concurrent mailbox/blackboard activity.
+        let next_seq: i64 = sqlx::query_scalar(
+            "INSERT INTO events (session_id, seq, unix_ms, kind, payload) \
+             SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ? \
+             FROM events WHERE session_id = ? \
+             RETURNING seq",
         )
         .bind(session_id)
-        .bind(next_seq)
         .bind(now)
         .bind(kind)
         .bind(payload_str)
-        .execute(&self.pool)
+        .bind(session_id)
+        .fetch_one(&self.pool)
         .await?;
         Ok(next_seq)
     }
@@ -939,6 +938,21 @@ mod tests {
         assert_eq!(events[0].kind, "session.started");
         assert_eq!(events[1].kind, "llm.call");
         assert_eq!(events[1].payload["cost"], 0.01);
+    }
+
+    #[tokio::test]
+    async fn concurrent_event_appends_allocate_distinct_sequences() {
+        let storage = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        storage.create_session("root", "supervisor").await.unwrap();
+
+        let (left, right) = tokio::join!(
+            storage.append_event("root", "mailbox.left", serde_json::json!(1)),
+            storage.append_event("root", "mailbox.right", serde_json::json!(2)),
+        );
+        let mut sequences = vec![left.unwrap(), right.unwrap()];
+        sequences.sort_unstable();
+        assert_eq!(sequences, vec![1, 2]);
+        assert_eq!(storage.load_events("root").await.unwrap().len(), 2);
     }
 
     #[tokio::test]
