@@ -26,6 +26,16 @@ Layout mirrors spec §6.6's real `dist/` shape, simplified to what
   prompt above trips eviction: dropping the 19-token `documents` section
   brings it to 22, under budget. This is what makes the stub run's spans
   show a non-empty `evicted_sections` without needing a giant fixture.
+- `tools.json` (issue #13, spec §8.2) — optional per-tool approval-gate
+  policy. Only `wire_transfer` is gated here (`retry_class: critical`,
+  `approval: required`) — deliberately a tool name the fixed stub-agent
+  script (`src/stub_agent.rs`) never calls, so the existing end-to-end
+  scenario's span count/costs are unaffected; budget/approval tests drive
+  `wire_transfer` themselves.
+- `cascade.json` (issue #13, spec §8.5) — optional cheapest-first fallback
+  `RoutingEntry` list per prompt, consulted on a `usd_per_session` budget
+  breach with `on_breach: degrade`. `researcher`'s cascade adds one
+  cheaper step (`gpt-4o-nano`) ahead of `routing.json`'s `gpt-4o-mini`.
 
 Changing the section wording changes the token math above — keep the
 word counts in sync with this file's comments (or just run

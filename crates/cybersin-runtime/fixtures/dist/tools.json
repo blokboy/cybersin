@@ -1,0 +1,6 @@
+{
+  "wire_transfer": {
+    "retry_class": "critical",
+    "approval": "required"
+  }
+}

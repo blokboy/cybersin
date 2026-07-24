@@ -77,6 +77,32 @@ fn default_target() -> String {
     "generic".to_string()
 }
 
+/// Per-tool policy (spec §8.2's approval-gate policy hook), fixture-driven
+/// the same way pricing is: an optional `dist/tools.json`, `{tool:
+/// ToolPolicy}`. Tools not listed default to no approval gate — this
+/// issue's stub tool-call flow ran every call the same way before, so
+/// "no entry" preserving that is what keeps the existing stub-agent
+/// scenario (`web_search`, ungated) behaving identically.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolPolicy {
+    #[serde(default = "default_retry_class")]
+    pub retry_class: String,
+    #[serde(default)]
+    pub approval: Option<String>,
+}
+
+fn default_retry_class() -> String {
+    "write".to_string()
+}
+
+impl ToolPolicy {
+    /// spec §8.2 / this issue's acceptance criterion: "a critical-class
+    /// call with `approval: required` parks the session".
+    pub fn requires_approval(&self) -> bool {
+        self.approval.as_deref() == Some("required")
+    }
+}
+
 /// A loaded hand-written `dist/` fixture: everything
 /// [`crate::session::RuntimeDaemon`] needs to drive one stub session.
 #[derive(Debug, Clone)]
@@ -85,6 +111,17 @@ pub struct DistFixture {
     pub prompts: BTreeMap<String, PromptIr>,
     pub routing: BTreeMap<String, RoutingEntry>,
     pub budgets: BTreeMap<String, BudgetArtifact>,
+    /// Approval-gate policy per tool name — see [`ToolPolicy`]. Empty for
+    /// any fixture without a `tools.json`.
+    pub tools: BTreeMap<String, ToolPolicy>,
+    /// Cascade fallback steps per prompt name, ordered cheapest-first
+    /// (spec §8.5's degrade target: "falls back to the cheapest cascade
+    /// step") — **not** the real router's quality-tiered cascade
+    /// (`cybersin-router`'s `CascadeStep`, a later issue's wiring); just
+    /// enough alternate `RoutingEntry`s for the stub daemon's budget
+    /// enforcement to re-route to a cheaper model. Empty for any prompt
+    /// without a `cascade.json` entry.
+    pub cascades: BTreeMap<String, Vec<RoutingEntry>>,
 }
 
 impl DistFixture {
@@ -114,11 +151,30 @@ impl DistFixture {
             }
         }
 
+        // Both optional: a fixture (or a project's real dist/, later)
+        // with no gated tools and no declared cascade fallbacks is
+        // completely valid — budget enforcement just has nothing to do.
+        let tools_path = dir.join("tools.json");
+        let tools: BTreeMap<String, ToolPolicy> = if tools_path.is_file() {
+            read_json(&tools_path)?
+        } else {
+            BTreeMap::new()
+        };
+
+        let cascade_path = dir.join("cascade.json");
+        let cascades: BTreeMap<String, Vec<RoutingEntry>> = if cascade_path.is_file() {
+            read_json(&cascade_path)?
+        } else {
+            BTreeMap::new()
+        };
+
         Ok(Self {
             manifest,
             prompts,
             routing,
             budgets,
+            tools,
+            cascades,
         })
     }
 
@@ -136,6 +192,20 @@ impl DistFixture {
 
     pub fn budget(&self, name: &str) -> Option<&BudgetArtifact> {
         self.budgets.get(name)
+    }
+
+    pub fn tool_policy(&self, tool: &str) -> Option<&ToolPolicy> {
+        self.tools.get(tool)
+    }
+
+    /// Cascade steps for `prompt_name`, ordered cheapest-first — `&[]` if
+    /// this fixture declares none, so callers can fall back to
+    /// [`DistFixture::routing`] without a special case.
+    pub fn cascade(&self, prompt_name: &str) -> &[RoutingEntry] {
+        self.cascades
+            .get(prompt_name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
