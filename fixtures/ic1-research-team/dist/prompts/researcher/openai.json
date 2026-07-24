@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "target": "openai",
+  "name": "researcher",
+  "messages": [
+    {
+      "role": "system",
+      "content": "<section name=\"role\">\nCite evidence; separate fact from inference; preserve uncertainty.\n</section>"
+    },
+    {
+      "role": "user",
+      "content": "<section name=\"assignment\">\nInvestigate {{ topic }} at {{ depth }} depth; return evidence-traceable claims.\n</section>\n\n<section name=\"documents\">\n{% for item in documents %}{{ item.title }}{% endfor %}\n</section>"
+    }
+  ],
+  "tools": [
+    {
+      "function": {
+        "description": "Cybersin tool web_search",
+        "name": "web_search",
+        "parameters": {
+          "additionalProperties": true,
+          "properties": {},
+          "type": "object"
+        }
+      },
+      "type": "function"
+    },
+    {
+      "function": {
+        "description": "Cybersin tool web_fetch",
+        "name": "web_fetch",
+        "parameters": {
+          "additionalProperties": true,
+          "properties": {},
+          "type": "object"
+        }
+      },
+      "type": "function"
+    }
+  ],
+  "response_format": {
+    "json_schema": {
+      "name": "researcher",
+      "schema": {
+        "properties": {
+          "confidence": {
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ],
+            "type": "string"
+          },
+          "findings": {
+            "items": {
+              "properties": {
+                "claim": {
+                  "type": "string"
+                },
+                "source": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "claim",
+                "source"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary",
+          "findings",
+          "confidence"
+        ],
+        "type": "object"
+      }
+    },
+    "type": "json_schema"
+  }
+}

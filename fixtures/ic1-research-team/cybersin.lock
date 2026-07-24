@@ -1,0 +1,40 @@
+models:
+  fast-low:
+    provider: recorded
+    quality: low
+    fallbacks: [balanced-medium]
+  balanced-medium:
+    provider: recorded
+    quality: medium
+    fallbacks: [premium-high]
+  premium-high:
+    provider: recorded
+    quality: high
+    fallbacks: [balanced-medium]
+prices:
+  fast-low:
+    usd_per_1k_prompt_tokens: 0.10
+    usd_per_1k_completion_tokens: 0.20
+  balanced-medium:
+    usd_per_1k_prompt_tokens: 0.50
+    usd_per_1k_completion_tokens: 1.00
+  premium-high:
+    usd_per_1k_prompt_tokens: 2.00
+    usd_per_1k_completion_tokens: 4.00
+passes:
+  compress:
+    5dbc6a08bdba07d675694a87b74a6293058a7f018b703a21aa2f38f077d52ca3:
+      model: recorded-compressor-v1
+      output: "Cite evidence; separate fact from inference; preserve uncertainty."
+    454b5017cdd7474e68f0e802019d6f51e396804a42499f02384ca0148692dea2:
+      model: recorded-compressor-v1
+      output: "Investigate {{ topic }} at {{ depth }} depth; return evidence-traceable claims."
+    84acadcf20aa3e2a5bf9691983d98e75b1013659350dc5f01daa37e741c359b6:
+      model: recorded-compressor-v1
+      output: "{% for item in documents %}{{ item.title }}{% endfor %}"
+    9d0339c45c693552c2e7d64f9030439eaeeb3cc71abde5526f33a72983c09342:
+      model: recorded-compressor-v1
+      output: "Synthesize {{ topic }} for {{ audience }} readers; expose contradictions."
+    e2a99c44285e57abc55338364f4093995f0dc71e5d7e9b042f377891f2e062f2:
+      model: recorded-compressor-v1
+      output: "{% for item in findings %}{{ item.title }}{% endfor %}"

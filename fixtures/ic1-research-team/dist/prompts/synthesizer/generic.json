@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "target": "generic",
+  "name": "synthesizer",
+  "messages": [
+    {
+      "role": "system",
+      "content": "## role\nCite evidence; separate fact from inference; preserve uncertainty."
+    },
+    {
+      "role": "user",
+      "content": "## assignment\nSynthesize {{ topic }} for {{ audience }} readers; expose contradictions.\n\n## findings\n{% for item in findings %}{{ item.title }}{% endfor %}"
+    }
+  ],
+  "tools": [
+    {
+      "input_schema": {
+        "type": "object"
+      },
+      "name": "citation_lookup"
+    }
+  ],
+  "response_format": {
+    "properties": {
+      "confidence": {
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "type": "string"
+      },
+      "findings": {
+        "items": {
+          "properties": {
+            "claim": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "claim",
+            "source"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "summary": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "summary",
+      "findings",
+      "confidence"
+    ],
+    "type": "object"
+  }
+}

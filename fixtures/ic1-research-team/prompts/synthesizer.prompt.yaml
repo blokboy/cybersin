@@ -1,0 +1,25 @@
+name: synthesizer
+quality: medium
+inputs:
+  topic: string
+  audience: enum[technical, executive]
+  findings: list[document]
+tools:
+  - citation_lookup
+sections:
+  - id: role
+    priority: 100
+    body: !include ../fragments/research-principles.md
+  - id: assignment
+    priority: 90
+    body: |
+      Synthesize the evidence about {{ topic }} for a {{ audience }} audience.
+      Resolve contradictions explicitly instead of averaging them away.
+  - id: findings
+    priority: 60
+    body: |
+      {{#each findings}}- {{this.title}}
+      {{/each}}
+output_contract:
+  type: json_schema
+  schema: !include ../fragments/schemas/report.json

@@ -1,0 +1,21 @@
+name: research-team
+harness:
+  adapter: process
+  command: ["python", "loop.py"]
+budget:
+  usd_per_session: 2.50
+  on_breach: degrade
+tools:
+  - name: web_search
+    class: read
+  - name: web_fetch
+    class: read
+  - name: citation_lookup
+    class: read
+sandbox:
+  scope: call
+  egress: [api.example.com]
+  limits:
+    cpu: 1
+    mem_mb: 512
+    wall_s: 120
