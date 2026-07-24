@@ -59,6 +59,22 @@ pub struct RoutingEntry {
     /// The stub agent never calls a real model, so completion length is a
     /// fixed fixture value rather than an observed one.
     pub completion_tokens_estimate: u32,
+    /// Which `BudgetPlan::target` (spec §6.2/§6.5) this routing entry's
+    /// model renders under, e.g. `"generic"` or a model-family name —
+    /// the same naming convention `cybersin-backends`' `Backend::target()`
+    /// will use once that crate exists (it's still a placeholder skeleton
+    /// as of this issue). Threading the target through here, rather than
+    /// hardcoding `"generic"` in the context assembler, is the least
+    /// invasive way for `RuntimeDaemon::handle_llm_request` to know which
+    /// `BudgetPlan` this specific call's assembler run should execute
+    /// (spec §8.3a). Defaults to `"generic"` so fixtures/dist artifacts
+    /// written before this field existed keep deserializing.
+    #[serde(default = "default_target")]
+    pub target: String,
+}
+
+fn default_target() -> String {
+    "generic".to_string()
 }
 
 /// A loaded hand-written `dist/` fixture: everything
