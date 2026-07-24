@@ -21,6 +21,7 @@ use serde_json::Value;
 pub type SessionId = String;
 pub type CallId = String;
 pub type ApprovalId = String;
+pub type WorkerId = String;
 
 /// Harness → daemon messages (spec §10).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -74,6 +75,23 @@ pub enum HarnessMessage {
     #[serde(rename = "signal.wait")]
     SignalWait { call_id: CallId, signal: String },
 
+    #[serde(rename = "spawn")]
+    Spawn {
+        call_id: CallId,
+        child_config: Value,
+        budget_usd: f64,
+    },
+
+    #[serde(rename = "mailbox.send")]
+    MailboxSend {
+        call_id: CallId,
+        recipient: WorkerId,
+        payload: Value,
+    },
+
+    #[serde(rename = "mailbox.receive")]
+    MailboxReceive { call_id: CallId, sender: WorkerId },
+
     #[serde(rename = "session.complete")]
     SessionComplete {
         session_id: SessionId,
@@ -93,7 +111,10 @@ impl HarnessMessage {
             | HarnessMessage::StateSet { call_id, .. }
             | HarnessMessage::Checkpoint { call_id, .. }
             | HarnessMessage::Sleep { call_id, .. }
-            | HarnessMessage::SignalWait { call_id, .. } => Some(call_id),
+            | HarnessMessage::SignalWait { call_id, .. }
+            | HarnessMessage::Spawn { call_id, .. }
+            | HarnessMessage::MailboxSend { call_id, .. }
+            | HarnessMessage::MailboxReceive { call_id, .. } => Some(call_id),
             HarnessMessage::SessionComplete { .. } => None,
         }
     }
@@ -218,5 +239,28 @@ mod tests {
             result: Value::Null,
         };
         assert_eq!(msg.call_id(), None);
+    }
+
+    #[test]
+    fn orchestration_requests_round_trip() {
+        for msg in [
+            HarnessMessage::Spawn {
+                call_id: "c3".into(),
+                child_config: serde_json::json!({"agent":"worker"}),
+                budget_usd: 1.5,
+            },
+            HarnessMessage::MailboxSend {
+                call_id: "c4".into(),
+                recipient: "w".into(),
+                payload: serde_json::json!({"job":1}),
+            },
+            HarnessMessage::MailboxReceive {
+                call_id: "c5".into(),
+                sender: "parent".into(),
+            },
+        ] {
+            let json = serde_json::to_value(&msg).unwrap();
+            assert_eq!(serde_json::from_value::<HarnessMessage>(json).unwrap(), msg);
+        }
     }
 }

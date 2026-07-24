@@ -17,7 +17,7 @@ use crate::messages::{
     AbortReason, ApprovalId, CallId, CallOutcome, DaemonMessage, HarnessMessage, SessionId,
 };
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc;
 
 /// A ledger row: the memoized outcome of one `(tool, idem_key)`, and how
@@ -114,6 +114,7 @@ pub struct DaemonDouble<C> {
     approval_required: HashSet<String>,
     pending_approvals: HashMap<ApprovalId, PendingApproval>,
     state: HashMap<(String, String), Value>,
+    mailboxes: HashMap<(String, String), VecDeque<Value>>,
     control_rx: mpsc::UnboundedReceiver<ControlMsg>,
     auto_idem_seq: u64,
     approval_seq: u64,
@@ -138,6 +139,7 @@ impl<C: DaemonChannel> DaemonDouble<C> {
             approval_required: HashSet::new(),
             pending_approvals: HashMap::new(),
             state: HashMap::new(),
+            mailboxes: HashMap::new(),
             control_rx: rx,
             auto_idem_seq: 0,
             approval_seq: 0,
@@ -450,6 +452,61 @@ impl<C: DaemonChannel> DaemonDouble<C> {
                     .send(DaemonMessage::SignalDelivered {
                         signal,
                         payload: Value::Null,
+                    })
+                    .await;
+            }
+            HarnessMessage::Spawn {
+                call_id,
+                budget_usd,
+                ..
+            } => {
+                let worker_id = format!("{}:{call_id}", self.session_id);
+                let outcome = if budget_usd <= self.usd_budget - self.usd_spent {
+                    CallOutcome::Ok {
+                        value: serde_json::json!({"worker_id": worker_id, "budget_usd": budget_usd}),
+                    }
+                } else {
+                    CallOutcome::Failed {
+                        reason: "parent_budget_exceeded".into(),
+                        retriable: false,
+                    }
+                };
+                let _ = self
+                    .channel
+                    .send(DaemonMessage::CallResult { call_id, outcome })
+                    .await;
+            }
+            HarnessMessage::MailboxSend {
+                call_id,
+                recipient,
+                payload,
+            } => {
+                self.mailboxes
+                    .entry((recipient, self.session_id.clone()))
+                    .or_default()
+                    .push_back(payload);
+                let _ = self
+                    .channel
+                    .send(DaemonMessage::CallResult {
+                        call_id,
+                        outcome: CallOutcome::Ok { value: Value::Null },
+                    })
+                    .await;
+            }
+            HarnessMessage::MailboxReceive { call_id, sender } => {
+                let messages = self
+                    .mailboxes
+                    .remove(&(self.session_id.clone(), sender))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let _ = self
+                    .channel
+                    .send(DaemonMessage::CallResult {
+                        call_id,
+                        outcome: CallOutcome::Ok {
+                            value: serde_json::json!(messages),
+                        },
                     })
                     .await;
             }

@@ -25,6 +25,7 @@ pub mod budget;
 pub mod daemon;
 pub mod dist;
 pub mod error;
+pub mod orchestration;
 mod pg_storage;
 pub mod route_executor;
 pub mod sandbox_executor;
@@ -39,6 +40,9 @@ pub use dist::{
     bundled_stub_dist_dir, DistError, DistFixture, DistManifest, RoutingEntry, ToolPolicy,
 };
 pub use error::RuntimeError;
+pub use orchestration::{
+    Mail, OrchestrationError, Orchestrator, Worker, WorkerExit, DEFAULT_MAX_RESTARTS,
+};
 pub use pg_storage::PgStorage;
 pub use route_executor::{
     cache_key, CacheArtifact, CacheEntry, ExecutionRequest, ExecutionResponse, Judge, KnnBackend,

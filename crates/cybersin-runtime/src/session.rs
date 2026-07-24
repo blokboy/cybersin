@@ -580,6 +580,78 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                     .await?;
                 Ok(0)
             }
+            HarnessMessage::Spawn {
+                call_id,
+                child_config,
+                budget_usd,
+            } => {
+                let orchestrator = crate::Orchestrator::new(self.storage.clone());
+                if self
+                    .storage
+                    .get_state(&self.session_id, "orchestration", "budget_usd")
+                    .await?
+                    .is_none()
+                {
+                    orchestrator
+                        .register_parent(
+                            &self.session_id,
+                            &self.agent_name,
+                            self.budget
+                                .as_ref()
+                                .map(|b| b.usd_per_session)
+                                .unwrap_or(f64::INFINITY),
+                        )
+                        .await
+                        .map_err(|e| RuntimeError::Session(e.to_string()))?;
+                }
+                let worker_id = format!("{}:{call_id}", self.session_id);
+                let worker = orchestrator
+                    .spawn(&self.session_id, &worker_id, child_config, budget_usd, None)
+                    .await
+                    .map_err(|e| RuntimeError::Session(e.to_string()))?;
+                self.channel
+                    .send(DaemonMessage::CallResult {
+                        call_id,
+                        outcome: CallOutcome::Ok {
+                            value: serde_json::to_value(worker)
+                                .map_err(crate::StorageError::from)?,
+                        },
+                    })
+                    .await?;
+                Ok(0)
+            }
+            HarnessMessage::MailboxSend {
+                call_id,
+                recipient,
+                payload,
+            } => {
+                crate::Orchestrator::new(self.storage.clone())
+                    .send(&self.session_id, &recipient, payload)
+                    .await
+                    .map_err(|e| RuntimeError::Session(e.to_string()))?;
+                self.channel
+                    .send(DaemonMessage::CallResult {
+                        call_id,
+                        outcome: CallOutcome::Ok { value: Value::Null },
+                    })
+                    .await?;
+                Ok(0)
+            }
+            HarnessMessage::MailboxReceive { call_id, sender } => {
+                let mail = crate::Orchestrator::new(self.storage.clone())
+                    .drain(&self.session_id, &sender)
+                    .await
+                    .map_err(|e| RuntimeError::Session(e.to_string()))?;
+                self.channel
+                    .send(DaemonMessage::CallResult {
+                        call_id,
+                        outcome: CallOutcome::Ok {
+                            value: serde_json::to_value(mail).map_err(crate::StorageError::from)?,
+                        },
+                    })
+                    .await?;
+                Ok(0)
+            }
         }
     }
 
