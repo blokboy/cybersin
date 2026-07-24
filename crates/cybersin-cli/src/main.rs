@@ -145,6 +145,23 @@ enum Command {
         /// JSON payload; use `{"signal":"name",...}` to target a named wait.
         payload: String,
     },
+    /// Execute agent-generated code in an isolated container.
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SandboxCommand {
+    /// Execute a command in a fresh call workspace or persistent session workspace.
+    Exec(commands::sandbox::ExecArgs),
+    /// Snapshot a persistent session workspace at a checkpoint.
+    Snapshot(commands::sandbox::LifecycleArgs),
+    /// Show workspace changes relative to a checkpoint snapshot.
+    Diff(commands::sandbox::LifecycleArgs),
+    /// Restore a persistent session workspace to a checkpoint snapshot.
+    Restore(commands::sandbox::LifecycleArgs),
 }
 
 #[tokio::main]
@@ -186,6 +203,12 @@ async fn main() -> ExitCode {
         Command::Notify { session, payload } => {
             from_async(commands::notify::execute(cli.db, session, payload).await)
         }
+        Command::Sandbox { command } => match command {
+            SandboxCommand::Exec(args) => from_sync(commands::sandbox::exec(args)),
+            SandboxCommand::Snapshot(args) => from_sync(commands::sandbox::snapshot(args)),
+            SandboxCommand::Diff(args) => from_sync(commands::sandbox::diff(args)),
+            SandboxCommand::Restore(args) => from_sync(commands::sandbox::restore(args)),
+        },
     }
 }
 

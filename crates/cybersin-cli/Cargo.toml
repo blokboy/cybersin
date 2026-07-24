@@ -17,6 +17,7 @@ cybersin-ir = { path = "../cybersin-ir" }
 cybersin-passes = { path = "../cybersin-passes" }
 cybersin-router = { path = "../cybersin-router" }
 cybersin-runtime = { path = "../cybersin-runtime" }
+cybersin-sandbox = { path = "../cybersin-sandbox" }
 cybersin-trace = { path = "../cybersin-trace" }
 
 anyhow = "1"

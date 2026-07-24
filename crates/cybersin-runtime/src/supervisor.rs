@@ -1,18 +1,48 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use cybersin_sandbox::{SandboxScope, WorkspaceStore};
 use serde_json::Value;
 
-use crate::{RuntimeError, Storage};
+use crate::{CheckpointRecord, RuntimeError, Storage};
 
 /// Durable lifecycle operations shared by the daemon and CLI.
 pub struct SessionSupervisor {
     storage: Arc<dyn Storage>,
+    session_sandbox: Option<WorkspaceStore>,
 }
 
 impl SessionSupervisor {
     pub fn new(storage: Arc<dyn Storage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            session_sandbox: None,
+        }
+    }
+
+    pub fn with_session_sandbox(
+        storage: Arc<dyn Storage>,
+        session_sandbox: WorkspaceStore,
+    ) -> Self {
+        Self {
+            storage,
+            session_sandbox: Some(session_sandbox),
+        }
+    }
+
+    /// Create a durable checkpoint and pair it with the session workspace.
+    pub async fn checkpoint(
+        &self,
+        session_id: &str,
+        label: Option<&str>,
+    ) -> Result<CheckpointRecord, RuntimeError> {
+        let checkpoint = self.storage.create_checkpoint(session_id, label).await?;
+        if let Some(store) = &self.session_sandbox {
+            store
+                .open(SandboxScope::Session, session_id, "checkpoint")?
+                .snapshot(&checkpoint.checkpoint_id.to_string())?;
+        }
+        Ok(checkpoint)
     }
 
     pub async fn resume(&self, session_id: &str, config_hash: &str) -> Result<Value, RuntimeError> {
@@ -27,6 +57,11 @@ impl SessionSupervisor {
             )));
         }
         let checkpoint = self.storage.latest_checkpoint(session_id).await?;
+        if let (Some(store), Some(checkpoint)) = (&self.session_sandbox, &checkpoint) {
+            store
+                .open(SandboxScope::Session, session_id, "resume")?
+                .restore(&checkpoint.checkpoint_id.to_string())?;
+        }
         // Rebuild the public resume state from the append-only log. The
         // materialized `session_state` table is only an index; events are
         // the source of truth.

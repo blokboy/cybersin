@@ -14,5 +14,6 @@ pub mod fmt;
 pub mod init;
 pub mod notify;
 pub mod run;
+pub mod sandbox;
 pub mod sessions;
 pub mod trace;

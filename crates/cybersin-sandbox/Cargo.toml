@@ -2,3 +2,9 @@
 name = "cybersin-sandbox"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+tempfile = "3"
+wait-timeout = "0.2"
+
+[dev-dependencies]

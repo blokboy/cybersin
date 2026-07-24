@@ -14,6 +14,7 @@ use std::sync::Arc;
 use cybersin_adapter::channel::DaemonChannel;
 use cybersin_adapter::messages::{AbortReason, CallOutcome, DaemonMessage, HarnessMessage};
 use cybersin_ir::{BudgetArtifact, BudgetPlan, PromptIr, Section};
+use cybersin_sandbox::{SandboxScope, WorkspaceStore};
 use cybersin_trace::{CacheStatus, Span, SpanFilter, SpanKind, SpanStatus, SpanStore};
 use serde_json::Value;
 
@@ -324,6 +325,12 @@ pub struct RuntimeDaemon<C> {
     /// [`RuntimeDaemon::run`] can report a clean, inspectable terminal
     /// status (`"halted"`) instead of the generic `"aborted"`.
     halted: bool,
+    /// Persistent per-session sandbox workspace (spec §8.4's `scope:
+    /// session`), snapshotted at every [`RuntimeDaemon::create_checkpoint`]
+    /// so a crash-and-resume restores the paired filesystem state, not
+    /// just the event log. `None` means no session-scoped sandbox is in
+    /// play — every checkpoint before this issue existed behaved this way.
+    session_sandbox: Option<WorkspaceStore>,
 }
 
 impl<C: DaemonChannel> RuntimeDaemon<C> {
@@ -348,6 +355,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             budget: None,
             degraded_prompts: HashSet::new(),
             halted: false,
+            session_sandbox: None,
         }
     }
 
@@ -360,6 +368,36 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
     pub fn with_budget(mut self, budget: BudgetConfig) -> Self {
         self.budget = Some(budget);
         self
+    }
+
+    /// Attach a persistent per-session sandbox workspace (spec §8.4).
+    /// Builder method, same reasoning as [`RuntimeDaemon::with_budget`]:
+    /// every existing caller that doesn't declare `scope: session` sandbox
+    /// is unaffected.
+    pub fn with_session_sandbox(mut self, session_sandbox: WorkspaceStore) -> Self {
+        self.session_sandbox = Some(session_sandbox);
+        self
+    }
+
+    /// Every durable checkpoint (spec §8.1) also snapshots the session
+    /// sandbox when one is attached (spec §8.4: "every session checkpoint
+    /// also takes a sandbox snapshot tied to the same checkpoint ID"), so
+    /// every call site below goes through this instead of
+    /// `self.storage.create_checkpoint` directly.
+    async fn create_checkpoint(
+        &self,
+        label: Option<&str>,
+    ) -> Result<crate::CheckpointRecord, RuntimeError> {
+        let checkpoint = self
+            .storage
+            .create_checkpoint(&self.session_id, label)
+            .await?;
+        if let Some(store) = &self.session_sandbox {
+            store
+                .open(SandboxScope::Session, &self.session_id, "checkpoint")?
+                .snapshot(&checkpoint.checkpoint_id.to_string())?;
+        }
+        Ok(checkpoint)
     }
 
     fn fresh_span_id(&mut self) -> String {
@@ -488,10 +526,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 Ok(0)
             }
             HarnessMessage::Checkpoint { call_id, label } => {
-                let checkpoint = self
-                    .storage
-                    .create_checkpoint(&self.session_id, label.as_deref())
-                    .await?;
+                let checkpoint = self.create_checkpoint(label.as_deref()).await?;
                 self.channel.send(DaemonMessage::CallResult { call_id,
                     outcome: CallOutcome::Ok { value: serde_json::json!({
                         "checkpoint_id": checkpoint.checkpoint_id, "event_seq": checkpoint.event_seq
@@ -753,9 +788,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         prompt_name: String,
         inputs: Value,
     ) -> Result<u32, RuntimeError> {
-        self.storage
-            .create_checkpoint(&self.session_id, Some("pre-llm"))
-            .await?;
+        self.create_checkpoint(Some("pre-llm")).await?;
 
         match self.enforce_session_budget(&call_id, &prompt_name).await? {
             BudgetOutcome::Proceed => {}
@@ -863,9 +896,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 }),
             )
             .await?;
-        self.storage
-            .create_checkpoint(&self.session_id, Some("periodic"))
-            .await?;
+        self.create_checkpoint(Some("periodic")).await?;
 
         self.channel
             .send(DaemonMessage::CallResult {
@@ -884,9 +915,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         tool: String,
         args: Value,
     ) -> Result<u32, RuntimeError> {
-        self.storage
-            .create_checkpoint(&self.session_id, Some("pre-tool"))
-            .await?;
+        self.create_checkpoint(Some("pre-tool")).await?;
 
         // A critical-class call with `approval: required` parks the
         // session (spec §8.2) instead of running immediately. Tools with
@@ -938,9 +967,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 serde_json::json!({ "tool": tool, "retries": retries, "usd_cost": usd_cost }),
             )
             .await?;
-        self.storage
-            .create_checkpoint(&self.session_id, Some("periodic"))
-            .await?;
+        self.create_checkpoint(Some("periodic")).await?;
 
         self.channel
             .send(DaemonMessage::CallResult {
