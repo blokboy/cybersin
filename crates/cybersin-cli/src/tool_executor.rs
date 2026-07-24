@@ -57,6 +57,54 @@ pub(crate) fn configured_executor(
     )))
 }
 
+/// Bridges `cybersin_gateway::ToolExecutor` (session_id, call_id, tool,
+/// args) -> `cybersin_runtime::ToolCaller`, so `RuntimeDaemon` can drive
+/// live tool calls through the same `SandboxToolExecutor` dispatch
+/// `dlq`/`approve`/`deny` already use (issue #35 Phase 3), without
+/// `cybersin-runtime` depending on `cybersin-gateway` (the reverse of that
+/// crate's normal dependency direction — `cybersin-gateway` depends on
+/// `cybersin-runtime`, so only a crate that depends on both, like this
+/// one, can bridge them). One call per invocation: no retry-class-bounded
+/// loop, no `tool_calls` ledger row for this path (deliberately deferred,
+/// same pattern as this file's egress/`web_search` TODOs above).
+pub(crate) struct GatewayToolCaller {
+    executor: Arc<dyn ToolExecutor>,
+}
+
+impl GatewayToolCaller {
+    pub(crate) fn new(executor: Arc<dyn ToolExecutor>) -> Self {
+        Self { executor }
+    }
+}
+
+#[async_trait]
+impl cybersin_runtime::ToolCaller for GatewayToolCaller {
+    async fn call(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        tool: &str,
+        args: &Value,
+    ) -> Result<cybersin_runtime::ToolOutput, String> {
+        let value = self
+            .executor
+            .execute(session_id, call_id, tool, args)
+            .await?;
+        Ok(cybersin_runtime::ToolOutput {
+            value,
+            // No retry occurred — this bridge doesn't implement the
+            // retry-class engine, so 0 is the honest count rather than the
+            // stub's fabricated "1".
+            retries: 0,
+            // TODO(issue #35 follow-up): real per-tool cost metering.
+            // `cybersin_sandbox::ExecOutcome` carries no cost data today,
+            // so this mirrors the pre-Phase-3 stub's flat placeholder
+            // rather than inventing false precision.
+            usd_cost: 0.0008,
+        })
+    }
+}
+
 #[async_trait]
 impl<B> ToolExecutor for SandboxToolExecutor<B>
 where
@@ -670,5 +718,64 @@ but egress allowlisting is not yet implemented — refusing to run with an ambig
 
         assert_eq!(second, serde_json::json!({"call": "second"}));
         assert_eq!(std::fs::read_to_string(victim).unwrap(), "do not overwrite");
+    }
+
+    #[tokio::test]
+    async fn gateway_tool_caller_maps_a_successful_execution() {
+        let mut dist = DistFixture::load_dir(bundled_stub_dist_dir()).unwrap();
+        dist.tools.clear();
+        dist.tools.insert(
+            "citation_lookup".into(),
+            policy(Some(vec!["python3", "citation_lookup.py"]), vec![]),
+        );
+        let state = tempfile::tempdir().unwrap();
+        let outcome = ExecOutcome {
+            exit_code: Some(0),
+            stdout: serde_json::json!({"ok": true}).to_string(),
+            stderr: String::new(),
+            termination: Termination::Exited,
+        };
+        let inner = SandboxToolExecutor::new(
+            Arc::new(dist),
+            PathBuf::new(),
+            Arc::new(FixedBackend(outcome)),
+            Arc::new(WorkspaceStore::new(state.path()).unwrap()),
+        );
+        let bridge = GatewayToolCaller::new(Arc::new(inner));
+
+        let output = cybersin_runtime::ToolCaller::call(
+            &bridge,
+            "session-1",
+            "citation_lookup:k1",
+            "citation_lookup",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.value, serde_json::json!({"ok": true}));
+        assert_eq!(output.retries, 0);
+        assert_eq!(output.usd_cost, 0.0008);
+    }
+
+    #[tokio::test]
+    async fn gateway_tool_caller_propagates_a_failure_reason_unchanged() {
+        let (_root, executor) = executor([]);
+        let bridge = GatewayToolCaller::new(Arc::new(executor));
+
+        let error = cybersin_runtime::ToolCaller::call(
+            &bridge,
+            "session-1",
+            "missing:k1",
+            "missing",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "unknown tool \"missing\" (not declared in any agent.yaml)"
+        );
     }
 }

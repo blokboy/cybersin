@@ -19,6 +19,7 @@
 
 mod commands;
 mod git;
+mod harness_config;
 mod tool_executor;
 
 use std::path::PathBuf;
@@ -221,7 +222,9 @@ async fn main() -> ExitCode {
         Command::Check { path } => from_sync(commands::check::run(&path)),
         Command::Init { dir } => from_sync(commands::init::run(&dir)),
         Command::Fmt { path, check } => from_sync(commands::fmt::run(&path, check)),
-        Command::Run(args) => from_async(commands::run::execute(db, dist, args).await),
+        Command::Run(args) => {
+            from_async(commands::run::execute(db, dist, sandbox_root, sandbox_backend, args).await)
+        }
         Command::Trace { command } => from_async(commands::trace::execute(db, command).await),
         Command::Cost(args) => from_async(commands::cost::execute(db, args).await),
         Command::Eval { command } => from_async(commands::eval::execute(command).await),
