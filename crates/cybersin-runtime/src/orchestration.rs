@@ -4,9 +4,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Mutex;
 
-use crate::{RuntimeError, SessionSupervisor, StateRecord, Storage};
+use crate::{CasOutcome, RuntimeError, SessionSupervisor, StateRecord, Storage};
 
 pub const DEFAULT_MAX_RESTARTS: u32 = 3;
 
@@ -62,9 +61,6 @@ pub enum OrchestrationError {
 pub struct Orchestrator {
     storage: Arc<dyn Storage>,
     supervisor: SessionSupervisor,
-    // Serializes compare-and-set within one daemon. Postgres multi-daemon CAS
-    // remains a server-mode refinement; stale versions are still explicit.
-    blackboard_writes: Mutex<()>,
 }
 
 impl Orchestrator {
@@ -72,16 +68,11 @@ impl Orchestrator {
         Self {
             supervisor: SessionSupervisor::new(storage.clone()),
             storage,
-            blackboard_writes: Mutex::new(()),
         }
     }
 
     pub fn with_supervisor(storage: Arc<dyn Storage>, supervisor: SessionSupervisor) -> Self {
-        Self {
-            storage,
-            supervisor,
-            blackboard_writes: Mutex::new(()),
-        }
+        Self { storage, supervisor }
     }
 
     pub async fn register_parent(
@@ -225,6 +216,12 @@ impl Orchestrator {
             .await?)
     }
 
+    /// DB-refereed compare-and-set (spec §8.7: "optimistic CAS ... the same
+    /// DB-constraint-as-referee pattern the gateway's idempotency ledger
+    /// already uses"). `Storage::cas_state` performs the version check and
+    /// the write as one atomic statement, so this holds under real
+    /// concurrent writers — including across processes/connections against
+    /// Postgres — not just within one daemon.
     pub async fn blackboard_cas(
         &self,
         root_id: &str,
@@ -233,22 +230,18 @@ impl Orchestrator {
         expected_version: Option<i64>,
         value: Value,
     ) -> Result<StateRecord, OrchestrationError> {
-        let _guard = self.blackboard_writes.lock().await;
         let ns = format!("blackboard:{namespace}");
-        let current = self.storage.get_state(root_id, &ns, key).await?;
-        let actual = current.as_ref().map(|r| r.updated_seq);
-        if actual != expected_version {
-            return Err(OrchestrationError::StaleBlackboard {
+        match self
+            .storage
+            .cas_state(root_id, &ns, key, expected_version, &value)
+            .await?
+        {
+            CasOutcome::Applied(record) => Ok(record),
+            CasOutcome::Stale { actual } => Err(OrchestrationError::StaleBlackboard {
                 expected: expected_version,
                 actual,
-            });
+            }),
         }
-        self.storage.set_state(root_id, &ns, key, &value).await?;
-        Ok(self
-            .storage
-            .get_state(root_id, &ns, key)
-            .await?
-            .expect("set state materializes row"))
     }
 
     /// Only a harness crash is death. It resumes the same child from its
@@ -385,6 +378,89 @@ mod tests {
         );
         assert_eq!(o.drain("parent", "b").await.unwrap().len(), 1);
         assert!(o.drain("parent", "a").await.unwrap().is_empty());
+    }
+
+    /// Proves the blackboard's CAS guarantee is enforced by the database,
+    /// not by any in-process lock — `Orchestrator` holds no mutex at all
+    /// (see the `blackboard_writes` field this issue removed). Uses a real
+    /// multi-connection, on-disk SQLite pool (not the usual single-
+    /// connection `in_memory()` helper) so racing writers genuinely
+    /// interleave at the database level instead of just queueing behind
+    /// one connection.
+    #[tokio::test]
+    async fn blackboard_cas_is_db_refereed_under_genuine_concurrent_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cas-race.db");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(8)
+            .connect(&format!("sqlite://{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::from_pool(pool).await.unwrap());
+        let orchestration = Arc::new(Orchestrator::new(storage.clone()));
+        orchestration
+            .register_parent("parent", "supervisor", 10.0)
+            .await
+            .unwrap();
+
+        // Race 1: N callers all believe the key doesn't exist yet
+        // (expected_version: None). Exactly one INSERT should win; every
+        // other ON CONFLICT DO NOTHING must observe 0 rows affected.
+        const RACERS: usize = 8;
+        let mut creators = Vec::new();
+        for i in 0..RACERS {
+            let o = orchestration.clone();
+            creators.push(tokio::spawn(async move {
+                o.blackboard_cas("parent", "research", "answer", None, serde_json::json!(i))
+                    .await
+            }));
+        }
+        let mut created_ok = 0;
+        let mut created_stale = 0;
+        for handle in creators {
+            match handle.await.unwrap() {
+                Ok(_) => created_ok += 1,
+                Err(OrchestrationError::StaleBlackboard { .. }) => created_stale += 1,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!(created_ok, 1, "exactly one creator should win the race");
+        assert_eq!(created_stale, RACERS - 1);
+
+        // Race 2: N callers all read the same (now-established) version and
+        // race an update against it. Exactly one `UPDATE ... WHERE
+        // updated_seq = expected` should match.
+        let current = orchestration
+            .blackboard_get("parent", "research", "answer")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut updaters = Vec::new();
+        for i in 0..RACERS {
+            let o = orchestration.clone();
+            let expected = current.updated_seq;
+            updaters.push(tokio::spawn(async move {
+                o.blackboard_cas(
+                    "parent",
+                    "research",
+                    "answer",
+                    Some(expected),
+                    serde_json::json!(100 + i),
+                )
+                .await
+            }));
+        }
+        let mut updated_ok = 0;
+        let mut updated_stale = 0;
+        for handle in updaters {
+            match handle.await.unwrap() {
+                Ok(_) => updated_ok += 1,
+                Err(OrchestrationError::StaleBlackboard { .. }) => updated_stale += 1,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!(updated_ok, 1, "exactly one updater should win the race");
+        assert_eq!(updated_stale, RACERS - 1);
     }
 
     #[tokio::test]

@@ -91,6 +91,23 @@ pub struct StateRecord {
     pub updated_seq: i64,
 }
 
+/// Result of [`Storage::cas_state`] — spec §8.7's blackboard
+/// "optimistic CAS — versioned writes where a stale write fails and the
+/// caller retries." The DB is the referee: `Applied` / `Stale` reflects
+/// exactly one atomic `UPDATE`/`INSERT ... ON CONFLICT` statement's
+/// affected-row count, the same "constraint wins races" pattern
+/// `begin_tool_call` uses — never a separate read-then-write check in
+/// application code.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CasOutcome {
+    Applied(StateRecord),
+    /// The write was rejected because `expected_version` didn't match the
+    /// row's actual version at the moment the constrained statement ran.
+    /// `actual` is a best-effort follow-up read for the caller's retry —
+    /// it is not part of the atomic decision itself.
+    Stale { actual: Option<i64> },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointRecord {
     pub checkpoint_id: i64,
@@ -172,6 +189,23 @@ pub trait Storage: Send + Sync {
         key: &str,
     ) -> Result<Option<StateRecord>>;
     async fn list_state(&self, session_id: &str) -> Result<Vec<StateRecord>>;
+    /// Compare-and-set a state row: the version check and the write are one
+    /// atomic statement (`UPDATE ... WHERE updated_seq = expected` when a
+    /// row is expected to exist, `INSERT ... ON CONFLICT DO NOTHING` when
+    /// `expected_version` is `None`), so two concurrent callers racing the
+    /// same key are refereed by the database's affected-row count — never
+    /// by a `get_state` read followed by a separate `set_state` write.
+    /// Implementations must not rely on any in-process lock for
+    /// correctness; a single-connection pool is an optimization detail, not
+    /// the safety mechanism.
+    async fn cas_state(
+        &self,
+        session_id: &str,
+        namespace: &str,
+        key: &str,
+        expected_version: Option<i64>,
+        value: &Value,
+    ) -> Result<CasOutcome>;
     async fn create_checkpoint(
         &self,
         session_id: &str,
@@ -599,6 +633,74 @@ impl Storage for SqliteStorage {
         .into_iter()
         .map(row_to_state)
         .collect()
+    }
+
+    async fn cas_state(
+        &self,
+        session_id: &str,
+        namespace: &str,
+        key: &str,
+        expected_version: Option<i64>,
+        value: &Value,
+    ) -> Result<CasOutcome> {
+        let value_type = json_type(value);
+        let value_str = serde_json::to_string(value)?;
+        let applied = match expected_version {
+            None => {
+                sqlx::query(
+                    "INSERT INTO session_state
+                     (session_id, namespace, key, value_type, value, updated_seq)
+                     VALUES (?, ?, ?, ?, ?, 1)
+                     ON CONFLICT(session_id, namespace, key) DO NOTHING",
+                )
+                .bind(session_id)
+                .bind(namespace)
+                .bind(key)
+                .bind(value_type)
+                .bind(&value_str)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                    == 1
+            }
+            Some(expected) => {
+                sqlx::query(
+                    "UPDATE session_state
+                     SET value = ?, value_type = ?, updated_seq = updated_seq + 1
+                     WHERE session_id = ? AND namespace = ? AND key = ? AND updated_seq = ?",
+                )
+                .bind(&value_str)
+                .bind(value_type)
+                .bind(session_id)
+                .bind(namespace)
+                .bind(key)
+                .bind(expected)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                    == 1
+            }
+        };
+        if !applied {
+            let actual = self
+                .get_state(session_id, namespace, key)
+                .await?
+                .map(|r| r.updated_seq);
+            return Ok(CasOutcome::Stale { actual });
+        }
+        self.append_event(
+            session_id,
+            "state.set",
+            serde_json::json!({
+                "namespace": namespace, "key": key, "value_type": value_type, "value": value
+            }),
+        )
+        .await?;
+        Ok(CasOutcome::Applied(
+            self.get_state(session_id, namespace, key)
+                .await?
+                .expect("cas_state's own write just materialized this row"),
+        ))
     }
 
     async fn create_checkpoint(
