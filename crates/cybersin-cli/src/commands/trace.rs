@@ -44,6 +44,7 @@ pub async fn execute(db_path: PathBuf, cmd: TraceCommand) -> anyhow::Result<()> 
                 agent_name: agent,
                 kind: None,
                 model,
+                since_unix_ms: None,
                 limit,
             };
             let spans = daemon.spans().list(&filter).await?;
