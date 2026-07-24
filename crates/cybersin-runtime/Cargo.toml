@@ -6,12 +6,15 @@ description = "cybersind daemon skeleton (spec §8): Storage trait + SQLite impl
 
 [dependencies]
 cybersin-adapter = { path = "../cybersin-adapter" }
+cybersin-backends = { path = "../cybersin-backends" }
 cybersin-ir = { path = "../cybersin-ir" }
 cybersin-router = { path = "../cybersin-router" }
 cybersin-sandbox = { path = "../cybersin-sandbox" }
 cybersin-trace = { path = "../cybersin-trace" }
 
 async-trait = "0.1"
+minijinja = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -30,6 +33,7 @@ tokio-rustls = "0.26"
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
 # Dev-only, and deliberately the reverse of this crate's normal
 # dependency direction (cybersin-gateway depends on cybersin-runtime):
 # cargo explicitly supports this cycle for dev-dependencies (the lib

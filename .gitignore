@@ -1,1 +1,7 @@
 /target
+
+# Environment-level provider/model allowlist (issue #35 Phase 1) — which
+# providers/models *this* environment may route to, same as API keys are
+# per-environment. Never checked in; cybersin.yaml/cybersin.lock stay the
+# project-level, portable candidate set.
+cybersin.local.yaml
