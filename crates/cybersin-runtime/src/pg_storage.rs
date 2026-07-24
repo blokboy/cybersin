@@ -6,8 +6,8 @@ use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 
 use crate::storage::{
-    json_type, now_unix_ms, CheckpointRecord, EventRecord, Result, SessionRecord, StateRecord,
-    Storage, StorageError, ToolCallRecord,
+    json_type, now_unix_ms, CasOutcome, CheckpointRecord, EventRecord, Result, SessionRecord,
+    StateRecord, Storage, StorageError, ToolCallRecord,
 };
 
 /// Multi-connection Postgres storage used by server-mode workers.
@@ -356,6 +356,73 @@ impl Storage for PgStorage {
         .into_iter()
         .map(Self::row_to_state)
         .collect())
+    }
+
+    async fn cas_state(
+        &self,
+        session_id: &str,
+        namespace: &str,
+        key: &str,
+        expected_version: Option<i64>,
+        value: &Value,
+    ) -> Result<CasOutcome> {
+        let value_type = json_type(value);
+        let applied = match expected_version {
+            None => {
+                sqlx::query(
+                    "INSERT INTO session_state
+                     (session_id, namespace, key, value_type, value, updated_seq)
+                     VALUES ($1, $2, $3, $4, $5, 1)
+                     ON CONFLICT (session_id, namespace, key) DO NOTHING",
+                )
+                .bind(session_id)
+                .bind(namespace)
+                .bind(key)
+                .bind(value_type)
+                .bind(value)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                    == 1
+            }
+            Some(expected) => {
+                sqlx::query(
+                    "UPDATE session_state
+                     SET value = $1, value_type = $2, updated_seq = updated_seq + 1
+                     WHERE session_id = $3 AND namespace = $4 AND key = $5 AND updated_seq = $6",
+                )
+                .bind(value)
+                .bind(value_type)
+                .bind(session_id)
+                .bind(namespace)
+                .bind(key)
+                .bind(expected)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                    == 1
+            }
+        };
+        if !applied {
+            let actual = self
+                .get_state(session_id, namespace, key)
+                .await?
+                .map(|r| r.updated_seq);
+            return Ok(CasOutcome::Stale { actual });
+        }
+        self.append_event(
+            session_id,
+            "state.set",
+            serde_json::json!({
+                "namespace": namespace, "key": key, "value_type": value_type, "value": value
+            }),
+        )
+        .await?;
+        Ok(CasOutcome::Applied(
+            self.get_state(session_id, namespace, key)
+                .await?
+                .expect("cas_state's own write just materialized this row"),
+        ))
     }
 
     async fn create_checkpoint(

@@ -51,7 +51,7 @@ pub use route_executor::{
 pub use sandbox_executor::RuntimeSandbox;
 pub use session::{estimate_tokens, RuntimeDaemon, RuntimeSessionSummary};
 pub use storage::{
-    CheckpointRecord, EventRecord, SessionRecord, SqliteStorage, StateRecord, Storage,
+    CasOutcome, CheckpointRecord, EventRecord, SessionRecord, SqliteStorage, StateRecord, Storage,
     StorageError, ToolCallRecord,
 };
 pub use supervisor::SessionSupervisor;
