@@ -35,7 +35,38 @@ impl PgStorage {
         &self.pool
     }
 
+    /// Arbitrary fixed key for the session-level advisory lock guarding
+    /// `migrate()`. `CREATE TABLE IF NOT EXISTS` is not atomic against a
+    /// concurrent `CREATE TABLE IF NOT EXISTS` racing on the same table:
+    /// both sides can pass the "doesn't exist yet" check before either
+    /// commits, and the loser's `CREATE TABLE` fails with a duplicate key
+    /// error against Postgres's internal `pg_type` catalog. Multiple
+    /// `PgStorage::connect` calls racing at startup (server-mode workers,
+    /// concurrent tests) hit this in practice — advisory-lock the whole
+    /// migration so only one connection runs it at a time.
+    const MIGRATION_LOCK_KEY: i64 = 0x63795f6d696772;
+
     async fn migrate(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(Self::MIGRATION_LOCK_KEY)
+            .execute(&mut *conn)
+            .await?;
+
+        let result = Self::run_migrations(&mut conn).await;
+
+        // Always release the lock, even if a migration statement failed —
+        // an unreleased session-level lock would wedge every future
+        // connect() on this session/connection.
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(Self::MIGRATION_LOCK_KEY)
+            .execute(&mut *conn)
+            .await;
+
+        result
+    }
+
+    async fn run_migrations(conn: &mut sqlx::PgConnection) -> Result<()> {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
@@ -45,12 +76,12 @@ impl PgStorage {
                 config_hash TEXT NOT NULL DEFAULT ''
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
         sqlx::query(
             "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS config_hash TEXT NOT NULL DEFAULT ''",
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS events (
@@ -62,7 +93,7 @@ impl PgStorage {
                 PRIMARY KEY (session_id, seq)
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS session_state (
@@ -75,7 +106,7 @@ impl PgStorage {
                 PRIMARY KEY (session_id, namespace, key)
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS checkpoints (
@@ -87,7 +118,7 @@ impl PgStorage {
                 created_unix_ms BIGINT NOT NULL
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS signals (
@@ -98,7 +129,7 @@ impl PgStorage {
                 delivered BOOLEAN NOT NULL DEFAULT FALSE
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS tool_calls (
@@ -121,7 +152,7 @@ impl PgStorage {
                 UNIQUE (tool, idem_key)
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *conn)
         .await?;
         Ok(())
     }
