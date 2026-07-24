@@ -27,6 +27,7 @@ pub mod dist;
 pub mod error;
 mod pg_storage;
 pub mod route_executor;
+pub mod sandbox_executor;
 pub mod session;
 pub mod storage;
 pub mod stub_agent;
@@ -43,6 +44,7 @@ pub use route_executor::{
     cache_key, CacheArtifact, CacheEntry, ExecutionRequest, ExecutionResponse, Judge, KnnBackend,
     ModelCaller, ModelOutput, RouteExecutor, RouteExecutorError, SQLITE_VEC_EVALUATION,
 };
+pub use sandbox_executor::RuntimeSandbox;
 pub use session::{estimate_tokens, RuntimeDaemon, RuntimeSessionSummary};
 pub use storage::{
     CheckpointRecord, EventRecord, SessionRecord, SqliteStorage, StateRecord, Storage,
