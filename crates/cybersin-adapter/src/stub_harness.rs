@@ -227,6 +227,58 @@ impl<C: HarnessChannel> StubHarness<C> {
         }
     }
 
+    pub async fn spawn(
+        &mut self,
+        child_config: Value,
+        budget_usd: f64,
+    ) -> (CallId, CallOutcomeOrPark) {
+        let call_id = self.fresh_call_id();
+        self.channel
+            .send(HarnessMessage::Spawn {
+                call_id: call_id.clone(),
+                child_config,
+                budget_usd,
+            })
+            .await
+            .expect("send spawn");
+        let outcome = self.await_result(&call_id).await;
+        (call_id, outcome)
+    }
+
+    pub async fn mailbox_send(
+        &mut self,
+        recipient: impl Into<String>,
+        payload: Value,
+    ) -> (CallId, CallOutcomeOrPark) {
+        let call_id = self.fresh_call_id();
+        self.channel
+            .send(HarnessMessage::MailboxSend {
+                call_id: call_id.clone(),
+                recipient: recipient.into(),
+                payload,
+            })
+            .await
+            .expect("send mailbox.send");
+        let outcome = self.await_result(&call_id).await;
+        (call_id, outcome)
+    }
+
+    pub async fn mailbox_receive(
+        &mut self,
+        sender: impl Into<String>,
+    ) -> (CallId, CallOutcomeOrPark) {
+        let call_id = self.fresh_call_id();
+        self.channel
+            .send(HarnessMessage::MailboxReceive {
+                call_id: call_id.clone(),
+                sender: sender.into(),
+            })
+            .await
+            .expect("send mailbox.receive");
+        let outcome = self.await_result(&call_id).await;
+        (call_id, outcome)
+    }
+
     /// `session.complete` — no reply; ends the session.
     pub async fn session_complete(&mut self, session_id: impl Into<String>, result: Value) {
         self.channel
