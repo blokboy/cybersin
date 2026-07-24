@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "build_hash": "035334a2c789d7c2fceb1c0a2ca6ec68fbddbda00cf9fb2711239279774f05ce",
-  "git_sha": "b32955fad37476b0369665b05814a5fe5f186701",
+  "git_sha": "cba66bb7e895dd9d33ffeb783cd2899bf8eee0a9",
   "lockfile_hash": "bf09c369ec9ac8f2a4288bcd3dd44651b8d4cf54543cbb6b978ccf3ba1b792a1",
   "artifacts": {
     "budget/researcher.json": "ca51f5380253d57664b212d5d7cb271386de788723def6b08d71531fa350a272",
@@ -13,6 +13,7 @@
     "prompts/synthesizer.json": "ecb7d3280bbb4ef502f03970a80b961809b39af23d9a5f402b7d0777bde59c55",
     "prompts/synthesizer/generic.json": "dae392b00a169398192608726b8dd3b3fc02cb0156a7badd7b62bb6181ee213c",
     "prompts/synthesizer/openai.json": "760fd78b9e65cd1b7d9dd56400a5141f0a5cb0f6b51d8923ee9f0eb8a2c8502b",
-    "routing.json": "91e0e46c03de2dcc0dca6e5d8952e47b0b849400cc1326f73120c3bec9c8121f"
+    "routing.json": "91e0e46c03de2dcc0dca6e5d8952e47b0b849400cc1326f73120c3bec9c8121f",
+    "tools.json": "14846e0f0c4b1baeee6eaaeffc370c0f8a93c8adcf999ef462c0c8ce89d95287"
   }
 }

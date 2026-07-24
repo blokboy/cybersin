@@ -1,0 +1,15 @@
+{
+  "citation_lookup": {
+    "retry_class": "read"
+  },
+  "publish_report": {
+    "retry_class": "critical",
+    "approval": "required"
+  },
+  "web_fetch": {
+    "retry_class": "read"
+  },
+  "web_search": {
+    "retry_class": "read"
+  }
+}

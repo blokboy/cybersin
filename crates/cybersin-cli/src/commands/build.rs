@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime};
 use clap::ValueEnum;
 use cybersin_backends::backend_for;
 use cybersin_frontend::{compile_prompt_source, discover_prompt_sources};
+use cybersin_gateway::RetryClass;
 use cybersin_ir::PromptIr;
 use cybersin_passes::{
     build_pipeline_with_compress_and_targets, build_pipeline_with_targets, run_pipeline,
@@ -243,6 +244,7 @@ pub fn run_into(
         .map_err(|e| format!("error: failed to write routing.json: {e}"))?;
 
     write_cache_json(dist_dir)?;
+    write_tools_json(project, dist_dir)?;
 
     // Eval compilation is issue #21; an empty directory is enough to
     // round out spec §6.6's dist/ shape for now.
@@ -292,6 +294,104 @@ fn write_cache_json(dist_dir: &Path) -> Result<(), String> {
     let bytes = to_pretty_json(&seed)?;
     fs::write(dist_dir.join("cache.json"), bytes)
         .map_err(|e| format!("error: failed to write cache.json: {e}"))
+}
+
+/// One entry in an `agents/*.agent.yaml`'s `tools:` list (spec §8.2) —
+/// only the fields the compiled policy needs; harness/budget/sandbox
+/// blocks belong to other tickets.
+#[derive(Debug, Deserialize)]
+struct AgentToolDecl {
+    name: String,
+    #[serde(default = "default_tool_class")]
+    class: String,
+    #[serde(default)]
+    approval: Option<String>,
+}
+
+fn default_tool_class() -> String {
+    "write".to_string()
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AgentYaml {
+    #[serde(default)]
+    tools: Vec<AgentToolDecl>,
+}
+
+/// Compiled per-tool policy written to `dist/tools.json` — the same
+/// shape `cybersin_runtime::dist::ToolPolicy` already deserializes
+/// (spec §8.2's approval-gate policy hook, "fixture-driven the same
+/// way pricing is").
+#[derive(Serialize)]
+struct CompiledToolPolicy {
+    retry_class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval: Option<String>,
+}
+
+/// Every `agents/*.agent.yaml` in `project`, sorted for deterministic
+/// builds (spec §7). Flat, unlike `discover_prompt_sources`: the
+/// scaffolded convention (spec §11) keeps agent definitions directly
+/// under `agents/`, with no nested-fragment equivalent to walk.
+fn discover_agent_sources(project: &Path) -> Result<Vec<PathBuf>, String> {
+    let agents_dir = project.join("agents");
+    if !agents_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    for entry in fs::read_dir(&agents_dir)
+        .map_err(|e| format!("error: failed to read {}: {e}", agents_dir.display()))?
+    {
+        let entry =
+            entry.map_err(|e| format!("error: failed to read {}: {e}", agents_dir.display()))?;
+        let path = entry.path();
+        if path.is_file() && path.to_string_lossy().ends_with(".agent.yaml") {
+            found.push(path);
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// `dist/tools.json` (spec §8.2): every agent's declared `tools:`
+/// policy, compiled so the gateway/daemon never re-parses agent yaml
+/// source at call time. Only written when at least one agent declares
+/// at least one tool — an agent-less, prompt-only project has nothing
+/// to compile here, and omitting the file (rather than writing `{}`)
+/// matches `DistFixture::load_dir`'s existing "tools.json is optional"
+/// handling, which is also what keeps every prompt-only fixture predating
+/// this issue building identically.
+fn write_tools_json(project: &Path, dist_dir: &Path) -> Result<(), String> {
+    let mut policies: BTreeMap<String, CompiledToolPolicy> = BTreeMap::new();
+    for source in discover_agent_sources(project)? {
+        let text = fs::read_to_string(&source)
+            .map_err(|e| format!("error: failed to read {}: {e}", source.display()))?;
+        let agent: AgentYaml = serde_yaml::from_str(&text)
+            .map_err(|e| format!("error: invalid {}: {e}", source.display()))?;
+        for tool in agent.tools {
+            if RetryClass::parse(&tool.class).is_none() {
+                return Err(format!(
+                    "error: {} declares tool {:?} with unknown class {:?} (expected read, write, or critical)",
+                    source.display(),
+                    tool.name,
+                    tool.class
+                ));
+            }
+            policies.insert(
+                tool.name,
+                CompiledToolPolicy {
+                    retry_class: tool.class,
+                    approval: tool.approval,
+                },
+            );
+        }
+    }
+    if policies.is_empty() {
+        return Ok(());
+    }
+    let bytes = to_pretty_json(&policies)?;
+    fs::write(dist_dir.join("tools.json"), bytes)
+        .map_err(|e| format!("error: failed to write tools.json: {e}"))
 }
 
 /// `dist/manifest.json` (spec §6.6): build hash, git SHA, lockfile
