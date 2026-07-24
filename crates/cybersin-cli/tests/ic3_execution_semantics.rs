@@ -142,6 +142,7 @@ async fn routing_context_and_sandbox_execute_in_one_real_session() {
         command: vec![command.into()],
         workspace: workspace.path().to_path_buf(),
         scope: SandboxScope::Call,
+        egress: Vec::new(),
         limits: ResourceLimits::default(),
     };
     let hostile = sandbox

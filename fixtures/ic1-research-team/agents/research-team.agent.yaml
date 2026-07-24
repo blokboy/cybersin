@@ -12,12 +12,14 @@ tools:
     class: read
   - name: citation_lookup
     class: read
+    run: ["python3", "citation_lookup.py"]
+    image: "python:3.12-slim"
   - name: publish_report
     class: critical
     approval: required
 sandbox:
   scope: call
-  egress: [api.example.com]
+  egress: []
   limits:
     cpu: 1
     mem_mb: 512

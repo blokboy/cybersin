@@ -106,3 +106,59 @@ fn explain_reports_missing_build_artifacts_clearly() {
         .failure()
         .stderr(predicate::str::contains("run `cybersin build"));
 }
+
+#[test]
+fn explain_plain_reports_compiled_tool_execution_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let db = temp.path().join("control-room.db");
+    cybersin().arg("init").arg(&project).assert().success();
+
+    let prompt_path = project.join("prompts/hello.prompt.yaml");
+    let prompt = fs::read_to_string(&prompt_path).unwrap();
+    fs::write(
+        &prompt_path,
+        prompt.replace("sections:", "tools:\n  - citation_lookup\nsections:"),
+    )
+    .unwrap();
+    fs::write(
+        project.join("agents/hello.agent.yaml"),
+        r#"
+name: hello-agent
+tools:
+  - name: citation_lookup
+    class: read
+    image: python:3.12-slim
+    run: ["python3", "citation_lookup.py"]
+sandbox:
+  scope: session
+  egress: [api.example.com]
+  limits: { cpu: 0.5, mem_mb: 64, wall_s: 10 }
+"#,
+    )
+    .unwrap();
+    cybersin()
+        .args(["build", "--profile", "dev", "--frozen"])
+        .arg(&project)
+        .assert()
+        .success();
+
+    cybersin()
+        .arg("--db")
+        .arg(db)
+        .arg("explain")
+        .arg("hello")
+        .arg(project)
+        .arg("--plain")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Tool execution"))
+        .stdout(predicate::str::contains(
+            "citation_lookup: custom image=python:3.12-slim",
+        ))
+        .stdout(predicate::str::contains("scope=session"))
+        .stdout(predicate::str::contains("egress=[api.example.com]"))
+        .stdout(predicate::str::contains(
+            "limits=cpu:0.5,mem_mb:64,wall_s:10",
+        ));
+}

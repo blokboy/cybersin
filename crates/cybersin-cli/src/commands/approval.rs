@@ -3,30 +3,43 @@
 //! the call; denial resolves it to `failed(reason: "denied")` through the
 //! same result path any failed call takes, without killing the session.
 //!
-//! Same stand-in-executor caveat as `dlq retry` (see `commands::dlq`'s
-//! doc): `approve` runs the now-cleared call against
-//! [`cybersin_gateway::EchoExecutor`], since no real tool backend is
-//! wired into this workspace yet.
+//! `approve` runs the now-cleared call through the same compiled,
+//! sandboxed executor used by `dlq retry`.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use cybersin_gateway::{EchoExecutor, ToolGateway};
+use cybersin_gateway::ToolGateway;
 use cybersin_runtime::DaemonHandle;
 
 use crate::commands::dlq::print_outcome;
+use crate::commands::sandbox::Backend;
+use crate::tool_executor::configured_executor;
 
-pub async fn approve(db_path: PathBuf, call_id: String) -> anyhow::Result<()> {
+pub async fn approve(
+    db_path: PathBuf,
+    dist_dir: PathBuf,
+    sandbox_root: PathBuf,
+    sandbox_backend: Backend,
+    call_id: String,
+) -> anyhow::Result<()> {
     let daemon = DaemonHandle::auto_start(&db_path).await?;
-    let gateway = ToolGateway::new(daemon.storage(), Arc::new(EchoExecutor));
+    let executor = configured_executor(&dist_dir, &sandbox_root, sandbox_backend)?;
+    let gateway = ToolGateway::new(daemon.storage(), executor);
     let outcome = gateway.approve(&call_id).await?;
     print_outcome(&call_id, &outcome);
     Ok(())
 }
 
-pub async fn deny(db_path: PathBuf, call_id: String) -> anyhow::Result<()> {
+pub async fn deny(
+    db_path: PathBuf,
+    dist_dir: PathBuf,
+    sandbox_root: PathBuf,
+    sandbox_backend: Backend,
+    call_id: String,
+) -> anyhow::Result<()> {
     let daemon = DaemonHandle::auto_start(&db_path).await?;
-    let gateway = ToolGateway::new(daemon.storage(), Arc::new(EchoExecutor));
+    let executor = configured_executor(&dist_dir, &sandbox_root, sandbox_backend)?;
+    let gateway = ToolGateway::new(daemon.storage(), executor);
     let outcome = gateway.deny(&call_id).await?;
     print_outcome(&call_id, &outcome);
     Ok(())

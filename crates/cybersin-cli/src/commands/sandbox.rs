@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use clap::{Args, ValueEnum};
 use cybersin_sandbox::{
-    DiffKind, DockerBackend, ExecRequest, GvisorBackend, ResourceLimits, SandboxBackend,
-    SandboxScope, Termination, WorkspaceStore,
+    DiffKind, DockerBackend, ExecOutcome, ExecRequest, GvisorBackend, ResourceLimits,
+    SandboxBackend, SandboxScope, Termination, WorkspaceStore,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -81,6 +81,7 @@ pub fn exec(args: ExecArgs) -> Result<Option<String>, String> {
             command: args.command,
             workspace: workspace.path().to_path_buf(),
             scope: args.scope.into(),
+            egress: Vec::new(),
             limits: ResourceLimits {
                 cpus: args.cpus,
                 memory_mb: args.memory_mb,
@@ -97,15 +98,19 @@ pub fn exec(args: ExecArgs) -> Result<Option<String>, String> {
     if outcome.succeeded() {
         Ok(None)
     } else {
-        let reason = match outcome.termination {
-            Termination::KilledByLimit(limit) => format!("killed by {limit:?} limit"),
-            Termination::Exited => format!("container exited with {:?}", outcome.exit_code),
-        };
-        Err(if outcome.stderr.is_empty() {
-            reason
-        } else {
-            format!("{reason}: {}", outcome.stderr.trim())
-        })
+        Err(outcome_failure_reason(&outcome))
+    }
+}
+
+pub(crate) fn outcome_failure_reason(outcome: &ExecOutcome) -> String {
+    let reason = match outcome.termination {
+        Termination::KilledByLimit(limit) => format!("killed by {limit:?} limit"),
+        Termination::Exited => format!("container exited with {:?}", outcome.exit_code),
+    };
+    if outcome.stderr.is_empty() {
+        reason
+    } else {
+        format!("{reason}: {}", outcome.stderr.trim())
     }
 }
 

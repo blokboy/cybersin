@@ -36,6 +36,7 @@ use cybersin_passes::{
 use cybersin_router::{
     compile_from_yaml, emit_routing_json, ObservedRoutingStats, WorkloadEstimate,
 };
+use cybersin_sandbox::ResourceLimits;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -245,6 +246,7 @@ pub fn run_into(
 
     write_cache_json(dist_dir)?;
     write_tools_json(project, dist_dir)?;
+    copy_tool_assets(project, dist_dir)?;
 
     // Eval compilation is issue #21; an empty directory is enough to
     // round out spec §6.6's dist/ shape for now.
@@ -296,9 +298,7 @@ fn write_cache_json(dist_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("error: failed to write cache.json: {e}"))
 }
 
-/// One entry in an `agents/*.agent.yaml`'s `tools:` list (spec §8.2) —
-/// only the fields the compiled policy needs; harness/budget/sandbox
-/// blocks belong to other tickets.
+/// One entry in an `agents/*.agent.yaml`'s `tools:` list (spec §8.2).
 #[derive(Debug, Deserialize)]
 struct AgentToolDecl {
     name: String,
@@ -306,16 +306,79 @@ struct AgentToolDecl {
     class: String,
     #[serde(default)]
     approval: Option<String>,
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    run: Option<Vec<String>>,
 }
 
 fn default_tool_class() -> String {
     "write".to_string()
 }
 
+#[derive(Debug, Deserialize)]
+struct AgentSandboxLimits {
+    #[serde(default = "default_sandbox_cpu")]
+    cpu: f64,
+    #[serde(default = "default_sandbox_memory_mb")]
+    mem_mb: u64,
+    #[serde(default = "default_sandbox_wall_s")]
+    wall_s: u64,
+}
+
+impl Default for AgentSandboxLimits {
+    fn default() -> Self {
+        let defaults = ResourceLimits::default();
+        Self {
+            cpu: defaults.cpus,
+            mem_mb: defaults.memory_mb,
+            wall_s: defaults.wall_clock.as_secs(),
+        }
+    }
+}
+
+fn default_sandbox_cpu() -> f64 {
+    ResourceLimits::default().cpus
+}
+
+fn default_sandbox_memory_mb() -> u64 {
+    ResourceLimits::default().memory_mb
+}
+
+fn default_sandbox_wall_s() -> u64 {
+    ResourceLimits::default().wall_clock.as_secs()
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentSandboxDecl {
+    #[serde(default = "default_sandbox_scope")]
+    scope: String,
+    #[serde(default)]
+    egress: Vec<String>,
+    #[serde(default)]
+    limits: AgentSandboxLimits,
+}
+
+impl Default for AgentSandboxDecl {
+    fn default() -> Self {
+        Self {
+            scope: default_sandbox_scope(),
+            egress: Vec::new(),
+            limits: AgentSandboxLimits::default(),
+        }
+    }
+}
+
+fn default_sandbox_scope() -> String {
+    "call".to_string()
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct AgentYaml {
     #[serde(default)]
     tools: Vec<AgentToolDecl>,
+    #[serde(default)]
+    sandbox: AgentSandboxDecl,
 }
 
 /// Compiled per-tool policy written to `dist/tools.json` — the same
@@ -327,6 +390,14 @@ struct CompiledToolPolicy {
     retry_class: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     approval: Option<String>,
+    image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run: Option<Vec<String>>,
+    sandbox_scope: String,
+    egress: Vec<String>,
+    cpu: f64,
+    mem_mb: u64,
+    wall_s: u64,
 }
 
 /// Every `agents/*.agent.yaml` in `project`, sorted for deterministic
@@ -353,6 +424,39 @@ fn discover_agent_sources(project: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(found)
 }
 
+fn discover_tool_asset_sources(project: &Path) -> Result<Vec<PathBuf>, String> {
+    let tools_dir = project.join("tools");
+    if !tools_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    discover_files_in(&tools_dir, &mut found)?;
+    found.sort();
+    Ok(found)
+}
+
+fn discover_files_in(dir: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries =
+        fs::read_dir(dir).map_err(|e| format!("error: failed to read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("error: failed to read {}: {e}", dir.display()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("error: failed to inspect {}: {e}", entry.path().display()))?;
+        if file_type.is_dir() {
+            discover_files_in(&entry.path(), found)?;
+        } else if file_type.is_file() {
+            found.push(entry.path());
+        } else {
+            return Err(format!(
+                "error: tool assets may not contain symlinks or special files: {}",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `dist/tools.json` (spec §8.2): every agent's declared `tools:`
 /// policy, compiled so the gateway/daemon never re-parses agent yaml
 /// source at call time. Only written when at least one agent declares
@@ -368,6 +472,13 @@ fn write_tools_json(project: &Path, dist_dir: &Path) -> Result<(), String> {
             .map_err(|e| format!("error: failed to read {}: {e}", source.display()))?;
         let agent: AgentYaml = serde_yaml::from_str(&text)
             .map_err(|e| format!("error: invalid {}: {e}", source.display()))?;
+        if !matches!(agent.sandbox.scope.as_str(), "call" | "session") {
+            return Err(format!(
+                "error: {} declares unknown sandbox scope {:?} (expected call or session)",
+                source.display(),
+                agent.sandbox.scope
+            ));
+        }
         for tool in agent.tools {
             if RetryClass::parse(&tool.class).is_none() {
                 return Err(format!(
@@ -377,11 +488,32 @@ fn write_tools_json(project: &Path, dist_dir: &Path) -> Result<(), String> {
                     tool.class
                 ));
             }
+            if tool.run.as_ref().is_some_and(Vec::is_empty) {
+                return Err(format!(
+                    "error: {} declares tool {:?} with an empty run command",
+                    source.display(),
+                    tool.name
+                ));
+            }
+            let image = tool.image.unwrap_or_else(|| {
+                if tool.run.is_some() {
+                    "python:3.12-slim".to_string()
+                } else {
+                    String::new()
+                }
+            });
             policies.insert(
                 tool.name,
                 CompiledToolPolicy {
                     retry_class: tool.class,
                     approval: tool.approval,
+                    image,
+                    run: tool.run,
+                    sandbox_scope: agent.sandbox.scope.clone(),
+                    egress: agent.sandbox.egress.clone(),
+                    cpu: agent.sandbox.limits.cpu,
+                    mem_mb: agent.sandbox.limits.mem_mb,
+                    wall_s: agent.sandbox.limits.wall_s,
                 },
             );
         }
@@ -392,6 +524,41 @@ fn write_tools_json(project: &Path, dist_dir: &Path) -> Result<(), String> {
     let bytes = to_pretty_json(&policies)?;
     fs::write(dist_dir.join("tools.json"), bytes)
         .map_err(|e| format!("error: failed to write tools.json: {e}"))
+}
+
+fn copy_tool_assets(project: &Path, dist_dir: &Path) -> Result<(), String> {
+    let source = project.join("tools");
+    if !source.is_dir() {
+        return Ok(());
+    }
+    copy_tool_asset_tree(&source, &dist_dir.join("tools"))
+}
+
+fn copy_tool_asset_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination)
+        .map_err(|e| format!("error: failed to create {}: {e}", destination.display()))?;
+    let entries = fs::read_dir(source)
+        .map_err(|e| format!("error: failed to read {}: {e}", source.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("error: failed to read {}: {e}", source.display()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("error: failed to inspect {}: {e}", entry.path().display()))?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_tool_asset_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &target)
+                .map_err(|e| format!("error: failed to copy {}: {e}", entry.path().display()))?;
+        } else {
+            return Err(format!(
+                "error: tool assets may not contain symlinks or special files: {}",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `dist/manifest.json` (spec §6.6): build hash, git SHA, lockfile
@@ -430,11 +597,9 @@ fn write_manifest(
         .map_err(|e| format!("error: failed to write manifest.json: {e}"))
 }
 
-/// A deterministic hash of the build's actual inputs — `cybersin.yaml`,
-/// `cybersin.lock`, and every discovered `*.prompt.yaml` source, by
-/// content — rather than a random id or wall-clock timestamp, so two
-/// builds of the same sources+lockfile produce the same `build_hash`
-/// (spec §7's byte-identical rebuild guarantee).
+/// A deterministic hash of the build's actual inputs — project config,
+/// lockfile, prompts, agent declarations, and packaged tool assets — by
+/// content rather than a random id or wall-clock timestamp.
 fn compute_build_hash(
     project: &Path,
     project_yaml: &str,
@@ -446,8 +611,12 @@ fn compute_build_hash(
     hasher.update(project_yaml.as_bytes());
     hasher.update([0u8]);
     hasher.update(lock_text.as_bytes());
-    // `discover_prompt_sources` already returns these sorted.
-    for source in sources {
+    let mut build_sources = sources.to_vec();
+    build_sources.extend(discover_agent_sources(project)?);
+    build_sources.extend(discover_tool_asset_sources(project)?);
+    build_sources.sort();
+    build_sources.dedup();
+    for source in &build_sources {
         let bytes = fs::read(source)
             .map_err(|e| format!("error: failed to read {}: {e}", source.display()))?;
         let relative = source.strip_prefix(project).unwrap_or(source);
@@ -553,9 +722,8 @@ pub fn watch_cli(
     Ok(None)
 }
 
-/// mtimes of everything `--watch` rebuilds on: `cybersin.yaml`,
-/// `cybersin.lock`, and every discovered `*.prompt.yaml` source (spec
-/// §11's `--watch`).
+/// mtimes of everything `--watch` rebuilds on: project config, lockfile,
+/// prompts, agent declarations, and packaged tool assets.
 fn watched_snapshot(project: &Path) -> Result<BTreeMap<PathBuf, SystemTime>, String> {
     let mut snapshot = BTreeMap::new();
     for name in ["cybersin.yaml", "cybersin.lock"] {
@@ -569,6 +737,17 @@ fn watched_snapshot(project: &Path) -> Result<BTreeMap<PathBuf, SystemTime>, Str
     }
     for source in discover_prompt_sources(project)
         .map_err(|e| format!("error: failed to discover prompts: {e}"))?
+    {
+        let metadata = fs::metadata(&source)
+            .map_err(|e| format!("error: failed to stat {}: {e}", source.display()))?;
+        let modified = metadata
+            .modified()
+            .map_err(|e| format!("error: failed to stat {}: {e}", source.display()))?;
+        snapshot.insert(source, modified);
+    }
+    for source in discover_agent_sources(project)?
+        .into_iter()
+        .chain(discover_tool_asset_sources(project)?)
     {
         let metadata = fs::metadata(&source)
             .map_err(|e| format!("error: failed to stat {}: {e}", source.display()))?;
@@ -616,6 +795,60 @@ mod tests {
     }
 
     #[test]
+    fn build_compiles_executable_tool_policy_and_packages_tool_assets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        init_project(&project);
+        fs::write(
+            project.join("agents/research.agent.yaml"),
+            r#"
+name: research
+tools:
+  - name: citation_lookup
+    class: read
+    run: ["python3", "citation_lookup.py"]
+sandbox:
+  scope: session
+  egress: [api.example.com]
+  limits:
+    cpu: 0.5
+    mem_mb: 64
+    wall_s: 10
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(project.join("tools")).unwrap();
+        fs::write(
+            project.join("tools/citation_lookup.py"),
+            "print('packaged')\n",
+        )
+        .unwrap();
+
+        run(&project, BuildProfile::Dev, true).expect("build");
+
+        let policies: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(project.join("dist/tools.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            policies["citation_lookup"],
+            serde_json::json!({
+                "retry_class": "read",
+                "image": "python:3.12-slim",
+                "run": ["python3", "citation_lookup.py"],
+                "sandbox_scope": "session",
+                "egress": ["api.example.com"],
+                "cpu": 0.5,
+                "mem_mb": 64,
+                "wall_s": 10
+            })
+        );
+        assert_eq!(
+            fs::read_to_string(project.join("dist/tools/citation_lookup.py")).unwrap(),
+            "print('packaged')\n"
+        );
+    }
+
+    #[test]
     fn two_builds_of_the_same_sources_and_lockfile_are_byte_identical() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
@@ -636,6 +869,39 @@ mod tests {
             let bytes_b = &files_b[path];
             assert_eq!(bytes_a, bytes_b, "{path} differs between builds");
         }
+    }
+
+    #[test]
+    fn executable_tool_inputs_change_the_build_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        init_project(&project);
+        fs::write(
+            project.join("agents/research.agent.yaml"),
+            r#"
+tools:
+  - name: citation_lookup
+    class: read
+    run: ["python3", "citation_lookup.py"]
+"#,
+        )
+        .unwrap();
+        fs::create_dir_all(project.join("tools")).unwrap();
+        let asset = project.join("tools/citation_lookup.py");
+        fs::write(&asset, "print('v1')\n").unwrap();
+
+        run(&project, BuildProfile::Dev, true).expect("first build");
+        let first: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(project.join("dist/manifest.json")).unwrap())
+                .unwrap();
+
+        fs::write(&asset, "print('v2')\n").unwrap();
+        run(&project, BuildProfile::Dev, true).expect("second build");
+        let second: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(project.join("dist/manifest.json")).unwrap())
+                .unwrap();
+
+        assert_ne!(first["build_hash"], second["build_hash"]);
     }
 
     fn collect_relative_files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
@@ -714,5 +980,20 @@ mod tests {
 
         let rendered = fs::read_to_string(project.join("dist/prompts/hello/generic.json")).unwrap();
         assert!(rendered.contains("enthusiastically"));
+    }
+
+    #[test]
+    fn watch_tracks_agent_declarations_and_tool_assets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        init_project(&project);
+        fs::create_dir_all(project.join("tools")).unwrap();
+        let asset = project.join("tools/citation_lookup.py");
+        fs::write(&asset, "print('ok')\n").unwrap();
+
+        let watched = watched_snapshot(&project).unwrap();
+
+        assert!(watched.contains_key(&project.join("agents/hello.agent.yaml")));
+        assert!(watched.contains_key(&asset));
     }
 }

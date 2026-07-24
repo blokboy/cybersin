@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Args;
-use cybersin_runtime::{bundled_stub_dist_dir, stub_agent, DaemonHandle, DistFixture};
+use cybersin_runtime::{stub_agent, DaemonHandle, DistFixture};
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -28,11 +28,6 @@ pub struct RunArgs {
     #[arg(long)]
     pub stub: bool,
 
-    /// Override the bundled stub `dist/` fixture directory
-    /// (`crates/cybersin-runtime/fixtures/dist/` by default).
-    #[arg(long)]
-    pub dist: Option<PathBuf>,
-
     /// Session id to record this run under. Defaults to a fresh
     /// timestamp-based id so repeated runs don't collide in the trace
     /// store.
@@ -45,7 +40,7 @@ pub struct RunArgs {
     pub agent: String,
 }
 
-pub async fn execute(db_path: PathBuf, args: RunArgs) -> anyhow::Result<()> {
+pub async fn execute(db_path: PathBuf, dist_dir: PathBuf, args: RunArgs) -> anyhow::Result<()> {
     if !args.stub {
         anyhow::bail!(
             "cybersin run currently only supports `--stub` (real *.agent.yaml compilation \
@@ -54,7 +49,6 @@ pub async fn execute(db_path: PathBuf, args: RunArgs) -> anyhow::Result<()> {
         );
     }
 
-    let dist_dir = args.dist.unwrap_or_else(bundled_stub_dist_dir);
     let dist = Arc::new(DistFixture::load_dir(&dist_dir)?);
 
     // `cybersind` auto-starts here: this is the first point a runtime

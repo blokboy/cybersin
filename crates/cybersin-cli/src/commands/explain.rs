@@ -2,6 +2,7 @@
 //! operations control room. The interactive and plain renderers share one
 //! view model so redirected output remains useful and testable.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use crossterm::terminal::{
 use cybersin_backends::{backend_for, RenderedPrompt};
 use cybersin_ir::PromptIr;
 use cybersin_router::{RouteDecision, RouteModel, RoutingArtifact};
-use cybersin_runtime::{DaemonHandle, ModelAllowlist, SessionRecord};
+use cybersin_runtime::{DaemonHandle, ModelAllowlist, SessionRecord, ToolPolicy};
 use cybersin_trace::{CostDimension, CostRollupRow, Span, SpanFilter, SpanKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -49,6 +50,7 @@ struct TargetTokens {
 struct ExplainModel {
     prompt: String,
     targets: Vec<TargetTokens>,
+    tools: Vec<(String, ToolPolicy)>,
     routing: Vec<String>,
     estimated_cost: f64,
     /// The first candidate this environment's `cybersin.local.yaml`
@@ -89,6 +91,22 @@ impl ExplainModel {
                 project.display()
             )
         })?;
+        let tools_path = project.join("dist").join("tools.json");
+        let policies: BTreeMap<String, ToolPolicy> = if tools_path.is_file() {
+            read_json(&tools_path)?
+        } else {
+            BTreeMap::new()
+        };
+        let tools = prompt
+            .tools
+            .iter()
+            .filter_map(|name| {
+                policies
+                    .get(name)
+                    .cloned()
+                    .map(|policy| (name.clone(), policy))
+            })
+            .collect();
 
         let target_dir = project.join("dist").join("prompts").join(prompt_name);
         let mut rendered_targets = Vec::new();
@@ -168,6 +186,7 @@ impl ExplainModel {
         Ok(Self {
             prompt: prompt.name,
             targets,
+            tools,
             routing,
             estimated_cost,
             effective,
@@ -190,6 +209,31 @@ impl ExplainModel {
             for (section, tokens) in &target.sections {
                 out.push_str(&format!("    {section:<24} {tokens:>6}\n"));
             }
+        }
+        out.push_str("\nTool execution\n");
+        if self.tools.is_empty() {
+            out.push_str("  no compiled tool policy for this prompt\n");
+        }
+        for (name, policy) in &self.tools {
+            let kind = if policy.is_builtin() {
+                "built-in".to_string()
+            } else {
+                format!(
+                    "custom image={} run={}",
+                    policy.image,
+                    policy.run.as_ref().unwrap().join(" ")
+                )
+            };
+            let egress = if policy.egress.is_empty() {
+                "none".to_string()
+            } else {
+                policy.egress.join(",")
+            };
+            out.push_str(&format!(
+                "  {name}: {kind} scope={} egress=[{egress}] \
+limits=cpu:{},mem_mb:{},wall_s:{}\n",
+                policy.sandbox_scope, policy.cpu, policy.mem_mb, policy.wall_s
+            ));
         }
         out.push_str("\nRouting\n");
         for line in &self.routing {

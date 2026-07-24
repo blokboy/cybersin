@@ -2,14 +2,13 @@
 //! dlq ls|show|retry|drop` and `cybersin approve|deny <call-id>`, driven
 //! through the actual compiled `cybersin` binary (spec §8.2, §11).
 //!
-//! There's no real tool backend wired into this workspace yet to produce
-//! ledger rows through a full agent run (that's a later issue), so each
-//! test seeds the shared sqlite file directly through the
-//! `cybersin-gateway`/`cybersin-runtime` libraries first — exactly the
-//! same ledger a real session would produce — then drives the CLI
-//! subprocess against that same file for the commands under test.
+//! A full agent run is still Phase 3, so each test seeds the shared
+//! SQLite ledger through `cybersin-gateway`/`cybersin-runtime`, then
+//! drives the CLI subprocess against that same database. Retry and
+//! approval execute through the real sandboxed CLI executor.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use assert_cmd::Command;
@@ -19,8 +18,62 @@ use cybersin_runtime::DaemonHandle;
 use predicates::prelude::*;
 use serde_json::json;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 fn cybersin() -> Command {
     Command::cargo_bin("cybersin").expect("find cybersin binary")
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn executable_tool_fixture(root: &Path, tool: &str) -> (PathBuf, PathBuf) {
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../cybersin-runtime/fixtures/dist");
+    let dist = root.join("dist");
+    copy_tree(&source, &dist);
+    fs::write(
+        dist.join("tools.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            tool: {
+                "retry_class": "critical",
+                "image": "python:3.12-slim",
+                "run": ["python3", format!("{tool}.py")],
+                "sandbox_scope": "call",
+                "egress": [],
+                "cpu": 1.0,
+                "mem_mb": 64,
+                "wall_s": 10
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(dist.join("tools")).unwrap();
+    fs::write(
+        dist.join("tools").join(format!("{tool}.py")),
+        "print('ok')\n",
+    )
+    .unwrap();
+
+    let runtime = root.join("docker");
+    fs::write(&runtime, "#!/bin/sh\nprintf '{\"executed\":true}'\n").unwrap();
+    let mut permissions = fs::metadata(&runtime).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&runtime, permissions).unwrap();
+    (dist, runtime)
 }
 
 struct AlwaysFailExecutor(&'static str);
@@ -29,6 +82,8 @@ struct AlwaysFailExecutor(&'static str);
 impl ToolExecutor for AlwaysFailExecutor {
     async fn execute(
         &self,
+        _session_id: &str,
+        _call_id: &str,
         _tool: &str,
         _args: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
@@ -61,15 +116,23 @@ async fn seed_failed_call(db: &Path, session_id: &str, call_seed: &str) -> Strin
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn dlq_ls_show_retry_drop_work_against_a_deliberately_failed_call() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("cybersin.db");
+    let (dist, runtime) = executable_tool_fixture(dir.path(), "charge_card");
 
     let call_id = seed_failed_call(&db, "sess-1", "charge-1").await;
 
     cybersin()
+        .env("CYBERSIN_CONTAINER_RUNTIME", &runtime)
         .arg("--db")
         .arg(&db)
+        .arg("--dist")
+        .arg(&dist)
+        .args(["--sandbox-backend", "docker"])
+        .arg("--sandbox-root")
+        .arg(dir.path().join("sandbox"))
         .arg("dlq")
         .arg("ls")
         .assert()
@@ -88,12 +151,18 @@ async fn dlq_ls_show_retry_drop_work_against_a_deliberately_failed_call() {
         .stdout(predicate::str::contains("\"status\": \"failed\""))
         .stdout(predicate::str::contains("connection refused"));
 
-    // `dlq retry` runs the CLI's own stand-in executor (EchoExecutor),
-    // which always succeeds — proving retry actually re-executes rather
-    // than just flipping a status bit.
+    // `dlq retry` runs the compiled custom tool through the selected
+    // sandbox backend, proving retry actually re-executes rather than
+    // just flipping a status bit.
     cybersin()
+        .env("CYBERSIN_CONTAINER_RUNTIME", &runtime)
         .arg("--db")
         .arg(&db)
+        .arg("--dist")
+        .arg(&dist)
+        .args(["--sandbox-backend", "docker"])
+        .arg("--sandbox-root")
+        .arg(dir.path().join("sandbox"))
         .arg("dlq")
         .arg("retry")
         .arg(&call_id)
@@ -170,9 +239,11 @@ async fn seed_parked_call(db: &Path, session_id: &str, call_seed: &str) -> Strin
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn approve_resumes_the_parked_session_via_the_cli() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("cybersin.db");
+    let (dist, runtime) = executable_tool_fixture(dir.path(), "wire_transfer");
 
     let call_id = seed_parked_call(&db, "sess-1", "wt-1").await;
 
@@ -188,8 +259,14 @@ async fn approve_resumes_the_parked_session_via_the_cli() {
     }
 
     cybersin()
+        .env("CYBERSIN_CONTAINER_RUNTIME", runtime)
         .arg("--db")
         .arg(&db)
+        .arg("--dist")
+        .arg(dist)
+        .args(["--sandbox-backend", "docker"])
+        .arg("--sandbox-root")
+        .arg(dir.path().join("sandbox"))
         .arg("approve")
         .arg(&call_id)
         .assert()

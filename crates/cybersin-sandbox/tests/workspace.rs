@@ -50,11 +50,13 @@ fn call_workspaces_are_fresh_while_session_workspaces_persist() {
         let session = store
             .open(SandboxScope::Session, "session-1", "call-1")
             .unwrap();
+        assert!(session.is_fresh());
         fs::write(session.path().join("memory.txt"), "remember me").unwrap();
     }
     let resumed = store
         .open(SandboxScope::Session, "session-1", "call-2")
         .unwrap();
+    assert!(!resumed.is_fresh());
     assert_eq!(
         fs::read_to_string(resumed.path().join("memory.txt")).unwrap(),
         "remember me"

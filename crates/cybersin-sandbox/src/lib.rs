@@ -1,7 +1,7 @@
 //! Sandboxed execution backends (spec §8.4).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -34,7 +34,26 @@ impl WorkspaceStore {
         let root = root.into();
         fs::create_dir_all(root.join("workspaces"))?;
         fs::create_dir_all(root.join("snapshots"))?;
+        fs::create_dir_all(root.join("locks"))?;
         Ok(Self { root })
+    }
+
+    /// Acquire an exclusive, process-safe lock for a session workspace.
+    ///
+    /// The lock file lives outside `workspaces/`, so sandboxed commands
+    /// cannot tamper with it through their writable bind mount. The lock
+    /// is released automatically when the returned file is dropped,
+    /// including when the owning process exits.
+    pub fn lock_session(&self, session_id: &str) -> io::Result<File> {
+        validate_id(session_id)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(self.root.join("locks").join(format!("{session_id}.lock")))?;
+        lock.lock()?;
+        Ok(lock)
     }
 
     pub fn open(
@@ -50,7 +69,18 @@ impl WorkspaceStore {
             SandboxScope::Session => PathBuf::from("sessions").join(session_id),
         };
         let path = self.root.join("workspaces").join(&relative);
-        if scope == SandboxScope::Call && path.exists() {
+        let existed = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_dir() => true,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("sandbox workspace {} is not a directory", path.display()),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        if scope == SandboxScope::Call && existed {
             fs::remove_dir_all(&path)?;
         }
         fs::create_dir_all(&path)?;
@@ -58,6 +88,7 @@ impl WorkspaceStore {
             path,
             snapshot_root: self.root.join("snapshots").join(relative),
             discard_on_drop: scope == SandboxScope::Call,
+            fresh: scope == SandboxScope::Call || !existed,
         })
     }
 }
@@ -68,11 +99,18 @@ pub struct Workspace {
     path: PathBuf,
     snapshot_root: PathBuf,
     discard_on_drop: bool,
+    fresh: bool,
 }
 
 impl Workspace {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether this call created the workspace rather than reopening an
+    /// existing session workspace.
+    pub fn is_fresh(&self) -> bool {
+        self.fresh
     }
 
     pub fn snapshot(&self, checkpoint_id: &str) -> io::Result<()> {
@@ -242,6 +280,11 @@ pub struct ExecRequest {
     pub command: Vec<String>,
     pub workspace: PathBuf,
     pub scope: SandboxScope,
+    /// Requested outbound network destinations. The container backend
+    /// does not enforce this allowlist yet and continues to run with
+    /// `--network none`; higher-level executors must fail closed when it
+    /// is non-empty until enforcement exists.
+    pub egress: Vec<String>,
     pub limits: ResourceLimits,
 }
 

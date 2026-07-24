@@ -9,6 +9,7 @@ fn request(workspace: &std::path::Path, command: &str) -> ExecRequest {
         command: vec!["sh".into(), "-c".into(), command.into()],
         workspace: workspace.to_path_buf(),
         scope: SandboxScope::Session,
+        egress: Vec::new(),
         limits: ResourceLimits {
             cpus: 0.5,
             memory_mb: 32,

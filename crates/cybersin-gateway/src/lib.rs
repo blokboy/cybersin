@@ -16,9 +16,8 @@
 //!   declarative argument guards, approval gates") and [`policy::ApprovalGate`],
 //!   the one concrete hook this issue's acceptance criteria needs.
 //! - [`executor`] — the seam between the gateway and whatever actually
-//!   runs a tool; no real tool backend exists yet in this workspace, so
-//!   [`executor::EchoExecutor`] stands in, the same way the M1 stub agent
-//!   stands in for a real compiled agent.
+//!   runs a tool. The CLI supplies the production sandboxed
+//!   implementation; [`executor::EchoExecutor`] remains a test double.
 //! - [`gateway::ToolGateway`] — ties all of the above together: submit a
 //!   call, park/approve/deny it, and the `cybersin dlq ls|show|retry|drop`
 //!   dead-letter queue operations.

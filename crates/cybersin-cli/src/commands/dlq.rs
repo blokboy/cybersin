@@ -2,18 +2,18 @@
 //! queue of `tool_calls` rows that reached `failed` and haven't been
 //! `drop`ped.
 //!
-//! Like `run --stub`, this issue has no real tool backend to execute
-//! against yet (that's a later issue, alongside `cybersin-sandbox`) — a
-//! `dlq retry` here runs against [`cybersin_gateway::EchoExecutor`], the
-//! gateway crate's own stand-in, so the command is fully real end to end
-//! except for what tool code actually gets invoked.
+//! `dlq retry` resolves the tool's compiled policy from `dist/tools.json`
+//! and runs project-registered commands through the selected container
+//! sandbox backend.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::Subcommand;
-use cybersin_gateway::{EchoExecutor, GatewayOutcome, ToolGateway};
+use cybersin_gateway::{GatewayOutcome, ToolGateway};
 use cybersin_runtime::DaemonHandle;
+
+use crate::commands::sandbox::Backend;
+use crate::tool_executor::configured_executor;
 
 #[derive(Debug, Subcommand)]
 pub enum DlqCommand {
@@ -32,9 +32,16 @@ pub enum DlqCommand {
     Drop { call_id: String },
 }
 
-pub async fn execute(db_path: PathBuf, cmd: DlqCommand) -> anyhow::Result<()> {
+pub async fn execute(
+    db_path: PathBuf,
+    dist_dir: PathBuf,
+    sandbox_root: PathBuf,
+    sandbox_backend: Backend,
+    cmd: DlqCommand,
+) -> anyhow::Result<()> {
     let daemon = DaemonHandle::auto_start(&db_path).await?;
-    let gateway = ToolGateway::new(daemon.storage(), Arc::new(EchoExecutor));
+    let executor = configured_executor(&dist_dir, &sandbox_root, sandbox_backend)?;
+    let gateway = ToolGateway::new(daemon.storage(), executor);
 
     match cmd {
         DlqCommand::Ls => {

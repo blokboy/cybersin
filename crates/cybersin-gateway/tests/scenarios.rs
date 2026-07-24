@@ -6,7 +6,7 @@
 //! locking — is what keeps a duplicate side effect from ever happening.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cybersin_adapter::messages::CallOutcome;
@@ -35,6 +35,8 @@ impl AlwaysFailExecutor {
 impl ToolExecutor for AlwaysFailExecutor {
     async fn execute(
         &self,
+        _session_id: &str,
+        _call_id: &str,
         _tool: &str,
         _args: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
@@ -55,6 +57,8 @@ struct CountingExecutor {
 impl ToolExecutor for CountingExecutor {
     async fn execute(
         &self,
+        _session_id: &str,
+        _call_id: &str,
         tool: &str,
         args: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
@@ -63,8 +67,109 @@ impl ToolExecutor for CountingExecutor {
     }
 }
 
+#[derive(Default)]
+struct RecordingExecutor {
+    calls: Mutex<Vec<(String, String, String)>>,
+}
+
+#[async_trait]
+impl ToolExecutor for RecordingExecutor {
+    async fn execute(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        tool: &str,
+        _args: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.calls.lock().unwrap().push((
+            session_id.to_string(),
+            call_id.to_string(),
+            tool.to_string(),
+        ));
+        Ok(json!({"status": "ok"}))
+    }
+}
+
 async fn daemon() -> DaemonHandle {
     DaemonHandle::auto_start_in_memory().await.unwrap()
+}
+
+#[tokio::test]
+async fn execution_receives_session_and_call_context_on_every_gateway_path() {
+    let daemon = daemon().await;
+    daemon
+        .storage()
+        .create_session("sess-context", "agent-a")
+        .await
+        .unwrap();
+
+    let recorder = Arc::new(RecordingExecutor::default());
+    let gateway = ToolGateway::new(daemon.storage(), recorder.clone())
+        .with_policy_hook(Arc::new(ApprovalGate::for_tools(["wire_transfer"])));
+
+    gateway
+        .call(
+            "sess-context",
+            "charge_card",
+            json!({"amount": 10}),
+            Some("fresh".into()),
+            RetryClass::Critical,
+        )
+        .await
+        .unwrap();
+
+    let parked = gateway
+        .call(
+            "sess-context",
+            "wire_transfer",
+            json!({"amount": 20}),
+            Some("approval".into()),
+            RetryClass::Critical,
+        )
+        .await
+        .unwrap();
+    let approval_call_id = match parked {
+        GatewayOutcome::Parked { call_id, .. } => call_id,
+        other => panic!("expected parked call, got {other:?}"),
+    };
+    gateway.approve(&approval_call_id).await.unwrap();
+
+    let failing = ToolGateway::new(
+        daemon.storage(),
+        Arc::new(AlwaysFailExecutor::new("temporary failure")),
+    );
+    failing
+        .call(
+            "sess-context",
+            "inventory_lookup",
+            json!({"sku": "A-1"}),
+            Some("retry".into()),
+            RetryClass::Critical,
+        )
+        .await
+        .unwrap();
+    gateway.dlq_retry("inventory_lookup:retry").await.unwrap();
+
+    assert_eq!(
+        *recorder.calls.lock().unwrap(),
+        vec![
+            (
+                "sess-context".into(),
+                "charge_card:fresh".into(),
+                "charge_card".into(),
+            ),
+            (
+                "sess-context".into(),
+                "wire_transfer:approval".into(),
+                "wire_transfer".into(),
+            ),
+            (
+                "sess-context".into(),
+                "inventory_lookup:retry".into(),
+                "inventory_lookup".into(),
+            ),
+        ]
+    );
 }
 
 #[tokio::test]
