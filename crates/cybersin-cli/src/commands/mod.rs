@@ -8,6 +8,7 @@ pub mod build;
 pub mod check;
 pub mod cost;
 pub mod daemon;
+pub mod diff;
 pub mod dlq;
 pub mod fmt;
 pub mod init;

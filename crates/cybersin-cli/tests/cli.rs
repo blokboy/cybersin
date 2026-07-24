@@ -210,6 +210,97 @@ fn dev_build_excludes_compression_and_succeeds_frozen_without_pins() {
 }
 
 #[test]
+fn build_writes_the_full_dist_shape_and_renders_every_configured_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    cybersin().arg("init").arg(&project).assert().success();
+
+    // Add `openai` alongside the default `generic` target so both a
+    // concrete model family and the portable target render (spec §6.5).
+    let cybersin_yaml = fs::read_to_string(project.join("cybersin.yaml")).unwrap();
+    fs::write(
+        project.join("cybersin.yaml"),
+        cybersin_yaml.replace("targets:\n  - generic", "targets:\n  - generic\n  - openai"),
+    )
+    .unwrap();
+
+    cybersin()
+        .arg("build")
+        .arg(&project)
+        .arg("--profile")
+        .arg("dev")
+        .arg("--frozen")
+        .assert()
+        .success();
+
+    let dist = project.join("dist");
+    assert!(dist.join("manifest.json").exists());
+    assert!(dist.join("routing.json").exists());
+    assert!(dist.join("cache.json").exists());
+    assert!(dist.join("evals").is_dir());
+    assert!(dist.join("budget/hello.json").exists());
+    assert!(dist.join("prompts/hello.json").exists());
+    assert!(dist.join("prompts/hello/generic.json").exists());
+    assert!(dist.join("prompts/hello/openai.json").exists());
+
+    let openai_rendered: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dist.join("prompts/hello/openai.json")).unwrap())
+            .unwrap();
+    assert_eq!(openai_rendered["target"], "openai");
+    assert!(openai_rendered["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("<section"));
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dist.join("manifest.json")).unwrap()).unwrap();
+    assert!(manifest["artifacts"]
+        .as_object()
+        .unwrap()
+        .contains_key("prompts/hello/openai.json"));
+}
+
+#[test]
+fn diff_reports_a_change_against_head_via_the_cli() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+
+    let project = repo.join("project");
+    cybersin().arg("init").arg(&project).assert().success();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "initial"]);
+
+    let prompt_path = project.join("prompts/hello.prompt.yaml");
+    let updated = fs::read_to_string(&prompt_path)
+        .unwrap()
+        .replace("warmly", "with great enthusiasm");
+    fs::write(&prompt_path, updated).unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "reword"]);
+
+    cybersin()
+        .arg("diff")
+        .arg("HEAD~1")
+        .arg(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("changed"))
+        .stdout(predicate::str::contains("prompts/hello"));
+}
+
+#[test]
 fn durable_session_cli_lists_shows_notifies_migrates_and_resumes() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("state.db");

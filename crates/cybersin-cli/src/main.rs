@@ -18,6 +18,7 @@
 //! conventions map to the same clean 0/1 exit-code contract.
 
 mod commands;
+mod git;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -56,6 +57,26 @@ enum Command {
         /// Refuse any pass that would need a network call.
         #[arg(long)]
         frozen: bool,
+        /// Rebuild automatically whenever a `*.prompt.yaml`,
+        /// `cybersin.yaml`, or `cybersin.lock` source changes.
+        #[arg(long)]
+        watch: bool,
+    },
+    /// Compare the current build against a build of the same project
+    /// checked out at another git ref (spec §7, §11): which prompts,
+    /// routes, and budgets changed, and how.
+    Diff {
+        /// Git ref to compare against (branch, tag, or commit).
+        reference: String,
+        /// Project directory containing prompts/ and cybersin.lock.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Build profile used for both sides of the comparison.
+        /// `release` only surfaces compressed-rewrite diffs once
+        /// compression is pinned in `cybersin.lock` — a frozen release
+        /// build refuses to compress anything that isn't.
+        #[arg(long, value_enum, default_value = "dev")]
+        profile: commands::build::BuildProfile,
     },
     /// Run a prompt source (or every source in a project) through the
     /// compiler frontend: parse, resolve `!include`s, typecheck inputs,
@@ -134,7 +155,19 @@ async fn main() -> ExitCode {
             path,
             profile,
             frozen,
-        } => from_sync(commands::build::run(&path, profile, frozen)),
+            watch,
+        } => {
+            if watch {
+                from_sync(commands::build::watch_cli(&path, profile, frozen))
+            } else {
+                from_sync(commands::build::run(&path, profile, frozen))
+            }
+        }
+        Command::Diff {
+            reference,
+            path,
+            profile,
+        } => from_sync(commands::diff::run(&path, &reference, profile)),
         Command::Check { path } => from_sync(commands::check::run(&path)),
         Command::Init { dir } => from_sync(commands::init::run(&dir)),
         Command::Fmt { path, check } => from_sync(commands::fmt::run(&path, check)),

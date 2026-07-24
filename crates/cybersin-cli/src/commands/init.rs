@@ -27,10 +27,19 @@ sandbox:
 "#;
 
 const CYBERSIN_LOCK: &str = r#"# Pinned models, prices, embedding model, and model-assisted pass
-# outputs (spec §7). Empty until a build runs a model-assisted pass or
-# `cybersin lock update` pins something.
-models: {}
-prices: {}
+# outputs (spec §7). `stub-medium` is priced so `cybersin build` has a
+# model to route the scaffolded `hello` prompt (quality: medium) to
+# out of the box; replace it with real pins before shipping. `passes`
+# stays empty until a release build runs a model-assisted pass or
+# `cybersin lock update` pins one.
+models:
+  stub-medium:
+    provider: stub
+    quality: medium
+prices:
+  stub-medium:
+    usd_per_1k_prompt_tokens: 1.0
+    usd_per_1k_completion_tokens: 2.0
 passes: {}
 "#;
 

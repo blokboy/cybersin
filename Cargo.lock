@@ -463,6 +463,11 @@ dependencies = [
 [[package]]
 name = "cybersin-backends"
 version = "0.1.0"
+dependencies = [
+ "cybersin-ir",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "cybersin-cli"
@@ -473,16 +478,19 @@ dependencies = [
  "async-trait",
  "clap",
  "cybersin-adapter",
+ "cybersin-backends",
  "cybersin-frontend",
  "cybersin-gateway",
  "cybersin-ir",
  "cybersin-passes",
+ "cybersin-router",
  "cybersin-runtime",
  "cybersin-trace",
  "predicates",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
 ]

@@ -11,9 +11,11 @@ path = "src/main.rs"
 [dependencies]
 cybersin-frontend = { path = "../cybersin-frontend" }
 cybersin-adapter = { path = "../cybersin-adapter" }
+cybersin-backends = { path = "../cybersin-backends" }
 cybersin-gateway = { path = "../cybersin-gateway" }
 cybersin-ir = { path = "../cybersin-ir" }
 cybersin-passes = { path = "../cybersin-passes" }
+cybersin-router = { path = "../cybersin-router" }
 cybersin-runtime = { path = "../cybersin-runtime" }
 cybersin-trace = { path = "../cybersin-trace" }
 
@@ -22,10 +24,11 @@ clap = { version = "4", features = ["derive", "env"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+sha2 = "0.10"
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 
 [dev-dependencies]
 async-trait = "0.1"
-tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
