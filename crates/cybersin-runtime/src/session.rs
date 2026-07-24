@@ -8,18 +8,19 @@
 //! routed from a hand-written [`crate::dist::DistFixture`] (spec §14's M1:
 //! "stub agent runs on a hand-written dist/").
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use cybersin_adapter::channel::DaemonChannel;
-use cybersin_adapter::messages::{CallOutcome, DaemonMessage, HarnessMessage};
+use cybersin_adapter::messages::{AbortReason, CallOutcome, DaemonMessage, HarnessMessage};
 use cybersin_ir::{BudgetArtifact, PromptIr};
-use cybersin_trace::{CacheStatus, Span, SpanKind, SpanStatus, SpanStore};
+use cybersin_trace::{CacheStatus, Span, SpanFilter, SpanKind, SpanStatus, SpanStore};
 use serde_json::Value;
 
+use crate::budget::{BudgetConfig, OnBreach};
 use crate::dist::DistFixture;
 use crate::error::RuntimeError;
-use crate::storage::Storage;
+use crate::storage::{Storage, ToolCallRecord};
 
 /// Estimated token count for `text`: a whitespace-token heuristic, not a
 /// real tokenizer. This issue's stub agent needs *a* number to price
@@ -102,7 +103,26 @@ fn cache_key(prompt_name: &str, inputs: &Value) -> (String, String) {
 pub struct RuntimeSessionSummary {
     pub session_id: String,
     pub completed: bool,
+    /// Set when a `usd_per_session` budget breach's `on_breach: halt`
+    /// terminated the session (spec §8.5) — distinct from `completed:
+    /// false` meaning an ordinary abort (channel closed early, harness
+    /// crash, ...).
+    pub halted: bool,
     pub spans_recorded: u32,
+}
+
+/// What [`RuntimeDaemon::enforce_session_budget`] decided (spec §8.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetOutcome {
+    /// No breach, or a `degrade` breach that already re-routed the
+    /// prompt — the caller proceeds with the call.
+    Proceed,
+    /// `on_breach: halt` fired; the session is over, a `session.abort`
+    /// was already sent, no `call.result` follows for this call.
+    Halted,
+    /// `on_breach: ask` fired and was denied; a `call.result` failure
+    /// was already sent for this call.
+    Denied,
 }
 
 /// The real daemon-side counterpart to
@@ -126,6 +146,19 @@ pub struct RuntimeDaemon<C> {
     cache: HashMap<(String, String), Value>,
     next_span_seq: u64,
     completed: bool,
+    /// Session-level `usd_per_session` budget (spec §8.5). `None` means
+    /// "no budget declared" — this issue's enforcement is then a no-op,
+    /// matching every session's behavior before this issue existed.
+    budget: Option<BudgetConfig>,
+    /// Prompts a `degrade` breach has re-routed to their cheapest
+    /// cascade step (spec §8.5) — the minimal "which cascade step is
+    /// active" state this issue adds, scoped per prompt rather than a
+    /// single flag, since different prompts may breach independently.
+    degraded_prompts: HashSet<String>,
+    /// Set once `on_breach: halt` fires; distinct from `completed` so
+    /// [`RuntimeDaemon::run`] can report a clean, inspectable terminal
+    /// status (`"halted"`) instead of the generic `"aborted"`.
+    halted: bool,
 }
 
 impl<C: DaemonChannel> RuntimeDaemon<C> {
@@ -147,7 +180,21 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             cache: HashMap::new(),
             next_span_seq: 0,
             completed: false,
+            budget: None,
+            degraded_prompts: HashSet::new(),
+            halted: false,
         }
+    }
+
+    /// Declare this session's `usd_per_session` budget (spec §8.5,
+    /// `agents/*.agent.yaml`'s `budget:` block — see
+    /// [`crate::budget::BudgetConfig::from_agent_yaml`]). A builder
+    /// method rather than a `RuntimeDaemon::new` parameter so every
+    /// existing caller (the M1 stub-agent scenario, this crate's own
+    /// tests) that doesn't care about budgets is unaffected.
+    pub fn with_budget(mut self, budget: BudgetConfig) -> Self {
+        self.budget = Some(budget);
+        self
     }
 
     fn fresh_span_id(&mut self) -> String {
@@ -187,7 +234,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
     pub async fn run(mut self) -> Result<RuntimeSessionSummary, RuntimeError> {
         let mut spans_recorded = 0u32;
         loop {
-            if self.completed {
+            if self.completed || self.halted {
                 break;
             }
             match self.channel.recv().await {
@@ -195,19 +242,25 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 None => break,
             }
         }
-        self.storage
-            .set_session_status(
-                &self.session_id,
-                if self.completed {
-                    "completed"
-                } else {
-                    "aborted"
-                },
-            )
-            .await?;
+        // A halt already set `status = "halted"` durably (spec §8.5)
+        // where the breach was discovered — don't overwrite that
+        // inspectable terminal status with the generic "aborted" here.
+        if !self.halted {
+            self.storage
+                .set_session_status(
+                    &self.session_id,
+                    if self.completed {
+                        "completed"
+                    } else {
+                        "aborted"
+                    },
+                )
+                .await?;
+        }
         Ok(RuntimeSessionSummary {
             session_id: self.session_id,
             completed: self.completed,
+            halted: self.halted,
             spans_recorded,
         })
     }
@@ -330,6 +383,205 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         }
     }
 
+    /// This session's running spend so far (spec §8.5): the sum of every
+    /// already-recorded span's `usd_cost`. Read from `self.spans`
+    /// (durable storage) rather than an in-memory running total, so a
+    /// budget check after a simulated process restart sees exactly what
+    /// a fresh process reconstructed from the same `Storage` would.
+    async fn session_spend_usd(&self) -> Result<f64, RuntimeError> {
+        let spans = self
+            .spans
+            .list(&SpanFilter {
+                session_id: Some(self.session_id.clone()),
+                ..Default::default()
+            })
+            .await?;
+        Ok(spans.iter().map(|s| s.usd_cost).sum())
+    }
+
+    /// Park this session behind an approval gate (spec §8.2 / §8.5): admit
+    /// `(tool, idem_key)` into the exact same `tool_calls` ledger
+    /// `cybersin_gateway::ToolGateway` uses — same call-id format
+    /// (`"{tool}:{idem_key}"`), same `awaiting_approval` flag, same
+    /// `sessions.status` transition — tell the harness the call is parked
+    /// (`call.parked`), then block/poll for a resolution: the same "set
+    /// status, block/poll, resume, restore status" shape
+    /// `HarnessMessage::SignalWait` above already uses.
+    ///
+    /// Durable by construction: every bit of state this loop reads back
+    /// (`tool_calls.status`/`awaiting_approval`, `sessions.status`) lives
+    /// in [`Storage`], not this task — so a `cybersin approve|deny
+    /// <call-id>` issued by a completely different process, hours or days
+    /// later, resolves it identically whether this task is still running
+    /// or not. This poll loop costs nothing but idle wakeups while
+    /// parked, never another billed LLM/tool call — that's what makes the
+    /// wait itself free.
+    async fn park_for_approval(
+        &mut self,
+        tool: &str,
+        idem_key: &str,
+        harness_call_id: &str,
+        args: Value,
+        retry_class: &str,
+    ) -> Result<ToolCallRecord, RuntimeError> {
+        let call_id = format!("{tool}:{idem_key}");
+        let (row, _won) = self
+            .storage
+            .begin_tool_call(
+                &call_id,
+                &self.session_id,
+                tool,
+                idem_key,
+                retry_class,
+                &args,
+            )
+            .await?;
+        // Already resolved (e.g. a replay of a call_id admitted earlier
+        // in this same session) — nothing to park.
+        if row.status != "pending" {
+            return Ok(row);
+        }
+
+        self.storage
+            .set_tool_call_awaiting_approval(&call_id, &call_id)
+            .await?;
+        self.storage
+            .set_session_status(&self.session_id, "awaiting_approval")
+            .await?;
+        self.storage
+            .append_event(
+                &self.session_id,
+                "session.parked",
+                serde_json::json!({ "call_id": call_id, "tool": tool }),
+            )
+            .await?;
+        self.channel
+            .send(DaemonMessage::CallParked {
+                call_id: harness_call_id.to_string(),
+                approval_id: call_id.clone(),
+            })
+            .await?;
+
+        let resolved = loop {
+            let row = self
+                .storage
+                .get_tool_call(&call_id)
+                .await?
+                .expect("ledger row exists: this method just admitted it");
+            if row.status != "pending" || !row.awaiting_approval {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        };
+
+        self.storage
+            .set_session_status(&self.session_id, "running")
+            .await?;
+        self.storage
+            .append_event(
+                &self.session_id,
+                "session.resumed",
+                serde_json::json!({ "call_id": call_id, "status": resolved.status }),
+            )
+            .await?;
+        Ok(resolved)
+    }
+
+    /// Budget enforcement (spec §8.5), checked before every `llm.request`
+    /// executes: compares this session's running spend against
+    /// `self.budget.usd_per_session` and applies `on_breach`. A no-op
+    /// (`BudgetOutcome::Proceed`) whenever no budget is declared, or
+    /// spend hasn't reached it yet.
+    async fn enforce_session_budget(
+        &mut self,
+        call_id: &str,
+        prompt_name: &str,
+    ) -> Result<BudgetOutcome, RuntimeError> {
+        let Some(budget) = self.budget else {
+            return Ok(BudgetOutcome::Proceed);
+        };
+        let spent = self.session_spend_usd().await?;
+        if spent < budget.usd_per_session {
+            return Ok(BudgetOutcome::Proceed);
+        }
+
+        match budget.on_breach {
+            OnBreach::Degrade => {
+                self.degraded_prompts.insert(prompt_name.to_string());
+                self.storage
+                    .append_event(
+                        &self.session_id,
+                        "budget.degraded",
+                        serde_json::json!({
+                            "prompt_name": prompt_name,
+                            "usd_spent": spent,
+                            "usd_budget": budget.usd_per_session,
+                        }),
+                    )
+                    .await?;
+                Ok(BudgetOutcome::Proceed)
+            }
+            OnBreach::Halt => {
+                self.halted = true;
+                self.storage
+                    .append_event(
+                        &self.session_id,
+                        "budget.halted",
+                        serde_json::json!({
+                            "usd_spent": spent,
+                            "usd_budget": budget.usd_per_session,
+                        }),
+                    )
+                    .await?;
+                self.storage
+                    .set_session_status(&self.session_id, "halted")
+                    .await?;
+                self.channel
+                    .send(DaemonMessage::SessionAbort {
+                        session_id: self.session_id.clone(),
+                        reason: AbortReason::BudgetHalt {
+                            usd_spent: spent,
+                            usd_budget: budget.usd_per_session,
+                        },
+                    })
+                    .await?;
+                Ok(BudgetOutcome::Halted)
+            }
+            OnBreach::Ask => {
+                // The call_id doubles as the idem_key: one budget-ask
+                // decision per `llm.request`, same reasoning
+                // `ToolGateway::call` uses for its own approval_id.
+                let row = self
+                    .park_for_approval(
+                        "budget",
+                        call_id,
+                        call_id,
+                        serde_json::json!({
+                            "prompt_name": prompt_name,
+                            "usd_spent": spent,
+                            "usd_budget": budget.usd_per_session,
+                        }),
+                        "critical",
+                    )
+                    .await?;
+                if row.status == "succeeded" {
+                    Ok(BudgetOutcome::Proceed)
+                } else {
+                    self.channel
+                        .send(DaemonMessage::CallResult {
+                            call_id: call_id.to_string(),
+                            outcome: CallOutcome::Failed {
+                                reason: row.failure_reason.unwrap_or_else(|| "denied".to_string()),
+                                retriable: row.retriable.unwrap_or(false),
+                            },
+                        })
+                        .await?;
+                    Ok(BudgetOutcome::Denied)
+                }
+            }
+        }
+    }
+
     async fn handle_llm_request(
         &mut self,
         call_id: String,
@@ -339,8 +591,28 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         self.storage
             .create_checkpoint(&self.session_id, Some("pre-llm"))
             .await?;
+
+        match self.enforce_session_budget(&call_id, &prompt_name).await? {
+            BudgetOutcome::Proceed => {}
+            // `Halted` already sent `session.abort`; `Denied` already
+            // sent a `call.result` failure. Either way there's nothing
+            // left for this message to do.
+            BudgetOutcome::Halted | BudgetOutcome::Denied => return Ok(0),
+        }
+
         let prompt = self.dist.prompt(&prompt_name)?.clone();
-        let routing = self.dist.routing(&prompt_name)?.clone();
+        // `degrade` re-routes to the cheapest declared cascade step (spec
+        // §8.5); a prompt with no `cascade.json` entry has nothing
+        // cheaper to fall back to, so it just keeps its normal routing.
+        let routing = if self.degraded_prompts.contains(&prompt_name) {
+            self.dist
+                .cascade(&prompt_name)
+                .first()
+                .cloned()
+                .unwrap_or(self.dist.routing(&prompt_name)?.clone())
+        } else {
+            self.dist.routing(&prompt_name)?.clone()
+        };
         let budget = self.dist.budget(&prompt_name).cloned();
 
         let key = cache_key(&prompt_name, &inputs);
@@ -440,6 +712,29 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         self.storage
             .create_checkpoint(&self.session_id, Some("pre-tool"))
             .await?;
+
+        // A critical-class call with `approval: required` parks the
+        // session (spec §8.2) instead of running immediately. Tools with
+        // no `tools.json` entry (e.g. this crate's own stub scenario's
+        // `web_search`) are unaffected — same immediate-execution path as
+        // before this issue.
+        if let Some(policy) = self.dist.tool_policy(&tool).cloned() {
+            if policy.requires_approval() {
+                let idem_key = format!(
+                    "{}:{}",
+                    self.session_id,
+                    self.storage
+                        .count_tool_calls_for_session(&self.session_id)
+                        .await?
+                        + 1
+                );
+                let row = self
+                    .park_for_approval(&tool, &idem_key, &call_id, args, &policy.retry_class)
+                    .await?;
+                return self.finish_parked_tool_call(call_id, tool, row).await;
+            }
+        }
+
         // The retry-class engine (spec §8.2) is a later issue (#11); this
         // stub hardcodes one simulated transient-then-succeed retry so
         // the `retries` span attribute carries a real nonzero value in
@@ -478,6 +773,63 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 outcome: CallOutcome::Ok {
                     value: serde_json::json!({ "tool": tool, "status": "ok" }),
                 },
+            })
+            .await?;
+        Ok(1)
+    }
+
+    /// Deliver the result of a `park_for_approval`-resolved tool call:
+    /// a `ToolCall` span for cost/trace visibility, a `tool.call` event,
+    /// and the harness's `call.result` — `Ok` with the ledger's recorded
+    /// result on `cybersin approve`, `Failed(reason: "denied", retriable:
+    /// false)` on `cybersin deny`, mirroring `ToolGateway::approve`/`deny`
+    /// exactly since that's what actually resolved the row.
+    async fn finish_parked_tool_call(
+        &mut self,
+        harness_call_id: String,
+        tool: String,
+        row: ToolCallRecord,
+    ) -> Result<u32, RuntimeError> {
+        let succeeded = row.status == "succeeded";
+        let usd_cost = if succeeded { 0.0008 } else { 0.0 };
+
+        self.emit_span(
+            SpanKind::ToolCall,
+            tool.clone(),
+            None,
+            None,
+            None,
+            usd_cost,
+            CacheStatus::NotApplicable,
+            row.attempts as u32,
+            Vec::new(),
+            serde_json::json!({ "args": row.args, "approval_resolved": row.status }),
+        )
+        .await?;
+        self.storage
+            .append_event(
+                &self.session_id,
+                "tool.call",
+                serde_json::json!({
+                    "tool": tool, "usd_cost": usd_cost, "approval_resolved": row.status,
+                }),
+            )
+            .await?;
+
+        let outcome = if succeeded {
+            CallOutcome::Ok {
+                value: row.result.unwrap_or(Value::Null),
+            }
+        } else {
+            CallOutcome::Failed {
+                reason: row.failure_reason.unwrap_or_default(),
+                retriable: row.retriable.unwrap_or(false),
+            }
+        };
+        self.channel
+            .send(DaemonMessage::CallResult {
+                call_id: harness_call_id,
+                outcome,
             })
             .await?;
         Ok(1)

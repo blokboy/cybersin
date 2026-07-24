@@ -12,6 +12,7 @@ cybersin-trace = { path = "../cybersin-trace" }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 sqlx = { version = "0.9", default-features = false, features = [
     "postgres",
     "sqlite",
@@ -26,3 +27,14 @@ tokio-rustls = "0.26"
 
 [dev-dependencies]
 tempfile = "3"
+# Dev-only, and deliberately the reverse of this crate's normal
+# dependency direction (cybersin-gateway depends on cybersin-runtime):
+# cargo explicitly supports this cycle for dev-dependencies (the lib
+# target builds first, then feeds cybersin-gateway, then both feed this
+# crate's own test binaries). Used so this issue's approval-parking tests
+# can drive real `ToolGateway::approve`/`deny` against ledger rows
+# `RuntimeDaemon` itself parked — proving `cybersin approve <call-id>`
+# (which is exactly `ToolGateway::approve`, see cybersin-cli's
+# `commands::approval`) actually resumes them, without duplicating that
+# logic by hand in a test-only stand-in.
+cybersin-gateway = { path = "../cybersin-gateway" }

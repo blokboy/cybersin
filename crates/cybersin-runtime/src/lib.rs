@@ -21,6 +21,7 @@
 //! harness protocol), never on `cybersin-frontend`/`cybersin-passes` — the
 //! runtime consumes artifacts, not sources.
 
+pub mod budget;
 pub mod daemon;
 pub mod dist;
 pub mod error;
@@ -30,8 +31,11 @@ pub mod storage;
 pub mod stub_agent;
 pub mod supervisor;
 
+pub use budget::{BudgetConfig, OnBreach};
 pub use daemon::{serve_server, DaemonHandle, ServerConfig};
-pub use dist::{bundled_stub_dist_dir, DistError, DistFixture, DistManifest, RoutingEntry};
+pub use dist::{
+    bundled_stub_dist_dir, DistError, DistFixture, DistManifest, RoutingEntry, ToolPolicy,
+};
 pub use error::RuntimeError;
 pub use pg_storage::PgStorage;
 pub use session::{estimate_tokens, RuntimeDaemon, RuntimeSessionSummary};
