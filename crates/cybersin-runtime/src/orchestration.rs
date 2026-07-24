@@ -144,13 +144,18 @@ impl Orchestrator {
             status: "running".into(),
         };
         self.storage
-            .create_session(
+            .create_session_pinned(
                 child_id,
                 worker
                     .config
                     .get("agent")
                     .and_then(Value::as_str)
                     .unwrap_or("worker"),
+                worker
+                    .config
+                    .get("config_hash")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
             )
             .await?;
         self.save_worker(&worker).await?;

@@ -12,6 +12,9 @@ tools:
     class: read
   - name: citation_lookup
     class: read
+  - name: publish_report
+    class: critical
+    approval: required
 sandbox:
   scope: call
   egress: [api.example.com]
