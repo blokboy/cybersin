@@ -425,3 +425,63 @@ async fn parked_approval_denied_grpc() {
     let (h, d) = grpc::in_memory_pair().await;
     scenario_parked_approval_denied(h, d).await;
 }
+
+// ---------------------------------------------------------------------
+// Scenario: spawn + mailbox queue
+//
+// Spawn is budget-gated and mailbox delivery preserves every queued
+// message in order, then drains it exactly once.
+// ---------------------------------------------------------------------
+async fn scenario_spawn_and_mailbox<H, D>(harness_io: H, daemon_io: D)
+where
+    H: HarnessChannel + 'static,
+    D: DaemonChannel + 'static,
+{
+    let (mut daemon, _ctrl) = DaemonDouble::new(daemon_io, "parent", 2.0);
+    daemon.start_session(json!({}), None).await;
+    let daemon_task = tokio::spawn(daemon.run());
+    let mut harness = StubHarness::new(harness_io);
+    harness.recv_session_start().await;
+
+    let (_, spawned) = harness.spawn(json!({"agent":"worker"}), 1.5).await;
+    assert!(matches!(
+        spawned,
+        CallOutcomeOrPark::Result(CallOutcome::Ok { .. })
+    ));
+    let (_, rejected) = harness.spawn(json!({"agent":"worker"}), 3.0).await;
+    assert!(matches!(
+        rejected,
+        CallOutcomeOrPark::Result(CallOutcome::Failed { .. })
+    ));
+
+    harness.mailbox_send("parent", json!({"seq": 1})).await;
+    harness.mailbox_send("parent", json!({"seq": 2})).await;
+    let (_, received) = harness.mailbox_receive("parent").await;
+    let CallOutcomeOrPark::Result(CallOutcome::Ok { value }) = received else {
+        panic!("expected mailbox values");
+    };
+    assert_eq!(value, json!([{"seq": 1}, {"seq": 2}]));
+
+    let (_, drained) = harness.mailbox_receive("parent").await;
+    let CallOutcomeOrPark::Result(CallOutcome::Ok { value }) = drained else {
+        panic!("expected drained mailbox");
+    };
+    assert_eq!(value, json!([]));
+
+    harness.session_complete("parent", json!({})).await;
+    harness.wait_for_close().await;
+    drop(harness);
+    assert!(daemon_task.await.expect("daemon task join").did_complete());
+}
+
+#[tokio::test]
+async fn spawn_and_mailbox_stdio() {
+    let (h, d) = stdio::in_memory_pair();
+    scenario_spawn_and_mailbox(h, d).await;
+}
+
+#[tokio::test]
+async fn spawn_and_mailbox_grpc() {
+    let (h, d) = grpc::in_memory_pair().await;
+    scenario_spawn_and_mailbox(h, d).await;
+}

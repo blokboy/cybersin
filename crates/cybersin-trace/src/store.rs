@@ -33,6 +33,9 @@ pub struct SpanFilter {
     pub agent_name: Option<String>,
     pub kind: Option<SpanKind>,
     pub model: Option<String>,
+    /// Only spans starting at or after this unix-ms timestamp (spec §9's
+    /// `cybersin optimize --since`). `None` means no lower bound.
+    pub since_unix_ms: Option<i64>,
     /// Cap on the number of rows returned, newest-first. `None` returns
     /// everything matching.
     pub limit: Option<u32>,
@@ -196,6 +199,9 @@ impl SpanStore {
         if filter.model.is_some() {
             sql.push_str(" AND model = ?");
         }
+        if filter.since_unix_ms.is_some() {
+            sql.push_str(" AND start_unix_ms >= ?");
+        }
         sql.push_str(" ORDER BY start_unix_ms DESC");
         if filter.limit.is_some() {
             sql.push_str(" LIMIT ?");
@@ -217,6 +223,9 @@ impl SpanStore {
             query = query.bind(v.as_str());
         }
         if let Some(v) = &filter.model {
+            query = query.bind(v);
+        }
+        if let Some(v) = filter.since_unix_ms {
             query = query.bind(v);
         }
         if let Some(v) = filter.limit {
@@ -385,6 +394,27 @@ mod tests {
             .unwrap();
         assert_eq!(listed.len(), 1);
         // Most recent (highest start_unix_ms) first.
+        assert_eq!(listed[0].id, "s2");
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_since_unix_ms() {
+        let store = SpanStore::in_memory().await.unwrap();
+        let mut old = sample_span("s1", "sess-1", "agent-a", "gpt-4o", 0.01);
+        old.start_unix_ms = 100;
+        let mut recent = sample_span("s2", "sess-1", "agent-a", "gpt-4o", 0.02);
+        recent.start_unix_ms = 200;
+        store.insert(&old).await.unwrap();
+        store.insert(&recent).await.unwrap();
+
+        let listed = store
+            .list(&SpanFilter {
+                since_unix_ms: Some(150),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "s2");
     }
 

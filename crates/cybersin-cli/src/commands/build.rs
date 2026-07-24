@@ -9,13 +9,13 @@
 //! only pass with a live provider call, gated by its existing
 //! [`CompressMode::Frozen`]. `cybersin-router::compile_from_yaml` is a
 //! pure function over already-in-memory YAML/IR (no network, no I/O
-//! beyond what the caller already read) — it always runs with
-//! `observed: None` here, since reading real trace statistics back into
-//! routing is `cybersin optimize`'s job (a later issue), not a build-
-//! time network call. `passes::Budget` is likewise pure IR math. So
-//! `frozen` only needs to gate `Compress`'s mode; nothing else in this
-//! pipeline can reach the network, and this file threads it nowhere
-//! else.
+//! beyond what the caller already read), so `observed` — `None` for a
+//! plain `cybersin build`, `Some(&stats)` when `cybersin optimize`
+//! (issue #23) calls [`run_into`] with trace-derived overrides — never
+//! needs gating by `frozen` either way. `passes::Budget` is likewise
+//! pure IR math. So `frozen` only needs to gate `Compress`'s mode;
+//! nothing else in this pipeline can reach the network, and this file
+//! threads it nowhere else.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -32,7 +32,9 @@ use cybersin_passes::{
     write_budget_artifact, Compress, CompressError, CompressMode, CompressionLock,
     CompressionProvider, Profile, TargetBudget,
 };
-use cybersin_router::{compile_from_yaml, emit_routing_json, WorkloadEstimate};
+use cybersin_router::{
+    compile_from_yaml, emit_routing_json, ObservedRoutingStats, WorkloadEstimate,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -86,20 +88,26 @@ impl CompressionProvider for UnavailableProvider {
     }
 }
 
-/// Build `project`'s `dist/` in place.
+/// Build `project`'s `dist/` in place, from declared `cybersin.yaml`
+/// cold-start routing defaults only (no observed trace overrides — see
+/// [`run_into`]).
 pub fn run(project: &Path, profile: BuildProfile, frozen: bool) -> Result<Option<String>, String> {
-    run_into(project, &project.join("dist"), profile, frozen)
+    run_into(project, &project.join("dist"), profile, frozen, None)
 }
 
 /// Build `project`'s sources into `dist_dir`, which need not be
 /// `project/dist` — `cybersin diff` builds two git refs into throwaway
 /// directories this way, to compare them without touching either
-/// working tree's real `dist/`.
+/// working tree's real `dist/`. `observed` overrides the router's
+/// declared cold-start cache/judge thresholds with trace-derived values
+/// (spec §9) when `cybersin optimize` supplies them; every other caller
+/// passes `None` and gets the plain declared-defaults build.
 pub fn run_into(
     project: &Path,
     dist_dir: &Path,
     profile: BuildProfile,
     frozen: bool,
+    observed: Option<&ObservedRoutingStats>,
 ) -> Result<Option<String>, String> {
     let project_yaml_path = project.join("cybersin.yaml");
     let project_yaml = fs::read_to_string(&project_yaml_path)
@@ -219,15 +227,15 @@ pub fn run_into(
         compiled.push(outcome.ir);
     }
 
-    // Cold start: no observed trace statistics exist yet at compile
-    // time (that's `cybersin optimize`'s job, reading real traces — a
-    // later issue), so routing always compiles from declared
-    // `cybersin.yaml` defaults.
+    // `observed` is `None` for a cold-start/plain build (routing compiles
+    // from declared `cybersin.yaml` defaults) or `Some(&stats)` when
+    // `cybersin optimize` (spec §9) is threading trace-derived overrides
+    // through this same build.
     let routing = compile_from_yaml(
         &compiled,
         &project_yaml,
         &lock_text,
-        None,
+        observed,
         WorkloadEstimate::default(),
     )
     .map_err(|e| format!("error: {e}"))?;
@@ -515,8 +523,8 @@ mod tests {
 
         let dist_a = tmp.path().join("dist_a");
         let dist_b = tmp.path().join("dist_b");
-        run_into(&project, &dist_a, BuildProfile::Dev, true).expect("build a");
-        run_into(&project, &dist_b, BuildProfile::Dev, true).expect("build b");
+        run_into(&project, &dist_a, BuildProfile::Dev, true, None).expect("build a");
+        run_into(&project, &dist_b, BuildProfile::Dev, true, None).expect("build b");
 
         let files_a = collect_relative_files(&dist_a);
         let files_b = collect_relative_files(&dist_b);
