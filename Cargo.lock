@@ -485,6 +485,7 @@ dependencies = [
  "cybersin-passes",
  "cybersin-router",
  "cybersin-runtime",
+ "cybersin-sandbox",
  "cybersin-trace",
  "predicates",
  "serde",
@@ -580,6 +581,10 @@ dependencies = [
 [[package]]
 name = "cybersin-sandbox"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "wait-timeout",
+]
 
 [[package]]
 name = "cybersin-trace"
