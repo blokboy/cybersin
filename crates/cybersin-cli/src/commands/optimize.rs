@@ -8,12 +8,13 @@
 //! each change and its evidence.
 //!
 //! Eval-scored production samples (spec §6.4/§8.6) would let this
-//! command also validate *direct* cache hits, not just judge-band ones —
-//! but eval compilation is a later issue, so this first cut only tunes
+//! command also validate *direct* cache hits, not just judge-band ones.
+//! Runtime spans do not carry that linkage yet, so this first cut tunes
 //! the two levers the router already exposes an observed override for
 //! ([`ObservedRoutingStats`]), from data the route/cache executor (issue
-//! #15) already records on every `CacheDecision` span: similarity and
-//! judge accept/reject.
+//! #15) records on every `CacheDecision` span: similarity and judge
+//! accept/reject. `cybersin eval gate` remains the independent quality
+//! regression gate.
 //!
 //! Nothing here writes back to `cybersin.yaml`. The declared cost model
 //! stays the conservative cold-start floor; `optimize`'s tuning is
@@ -404,9 +405,9 @@ fn render_report(
     ));
 
     out.push_str(
-        "Eval-scored production samples aren't available yet (eval compilation, spec \
-         §6.4/§8.6, is a later issue), so this report can't validate *direct* cache hits — \
-         only judge-reviewed ones carry a verdict to learn from.\n",
+        "Direct cache-hit quality scores are not recorded on runtime spans yet, so this \
+         report tunes only judge-reviewed decisions. `cybersin eval gate` remains the \
+         independent quality regression gate.\n",
     );
 
     out
