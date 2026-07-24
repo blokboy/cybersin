@@ -2,7 +2,7 @@
 name = "cybersin-cli"
 version.workspace = true
 edition.workspace = true
-description = "The `cybersin` binary: clap commands (run --stub, trace ls|show, cost --by, dlq ls|show|retry|drop, approve/deny) + ratatui views (later issue)."
+description = "The `cybersin` binary: compiler/runtime commands and ratatui explain/control-room views."
 
 [[bin]]
 name = "cybersin"
@@ -22,6 +22,8 @@ cybersin-trace = { path = "../cybersin-trace" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.28"
+ratatui = "0.29"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

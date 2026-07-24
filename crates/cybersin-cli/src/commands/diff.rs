@@ -48,7 +48,7 @@ pub fn run(
     let ref_dist = workdir.path().join("ref");
     let ref_worktree = workdir.path().join("worktree");
 
-    run_into(project, &current_dist, profile, true)
+    run_into(project, &current_dist, profile, true, None)
         .map_err(|e| format!("error: failed to build current sources: {e}"))?;
 
     git::worktree_add(&repo_root, &ref_worktree, reference)?;
@@ -57,6 +57,7 @@ pub fn run(
         &ref_dist,
         profile,
         true,
+        None,
     )
     .map_err(|e| format!("error: failed to build {reference}: {e}"));
     git::worktree_remove(&repo_root, &ref_worktree);
