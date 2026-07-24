@@ -1,0 +1,17 @@
+prompt: researcher
+runs_per_case: 3
+cases:
+  - name: preserves_uncertainty
+    inputs:
+      topic: evidence quality
+      depth: thorough
+      documents:
+        - title: Conflicting field reports
+          content: Two sources disagree on the measured effect.
+    assertions:
+      - type: json_valid
+      - type: contains_none
+        values: ["definitely proven", "guaranteed"]
+      - type: judge
+        rubric: Distinguishes observed facts from inference and cites evidence.
+        min_score: 0.8

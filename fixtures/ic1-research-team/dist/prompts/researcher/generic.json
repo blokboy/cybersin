@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "target": "generic",
+  "name": "researcher",
+  "messages": [
+    {
+      "role": "system",
+      "content": "## role\nCite evidence; separate fact from inference; preserve uncertainty."
+    },
+    {
+      "role": "user",
+      "content": "## assignment\nInvestigate {{ topic }} at {{ depth }} depth; return evidence-traceable claims.\n\n## documents\n{% for item in documents %}{{ item.title }}{% endfor %}"
+    }
+  ],
+  "tools": [
+    {
+      "input_schema": {
+        "type": "object"
+      },
+      "name": "web_search"
+    },
+    {
+      "input_schema": {
+        "type": "object"
+      },
+      "name": "web_fetch"
+    }
+  ],
+  "response_format": {
+    "properties": {
+      "confidence": {
+        "enum": [
+          "low",
+          "medium",
+          "high"
+        ],
+        "type": "string"
+      },
+      "findings": {
+        "items": {
+          "properties": {
+            "claim": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "claim",
+            "source"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "summary": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "summary",
+      "findings",
+      "confidence"
+    ],
+    "type": "object"
+  }
+}

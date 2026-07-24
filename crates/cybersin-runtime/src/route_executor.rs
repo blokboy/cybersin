@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use cybersin_router::{RouteDecision, RouteModel, RoutingArtifact};
 use cybersin_trace::{CacheStatus, Span, SpanKind, SpanStatus, SpanStore};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -16,8 +16,9 @@ static NEXT_ROUTE_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CacheArtifact {
     pub schema_version: u32,
+    #[serde(deserialize_with = "deserialize_namespace_version")]
     pub namespace_version: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_cache_entries")]
     pub entries: Vec<CacheEntry>,
 }
 
@@ -40,6 +41,40 @@ impl CacheArtifact {
             self.entries.push(entry);
         }
     }
+}
+
+fn deserialize_namespace_version<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Version {
+        String(String),
+        Number(u64),
+    }
+
+    Ok(match Version::deserialize(deserializer)? {
+        Version::String(value) => value,
+        Version::Number(value) => value.to_string(),
+    })
+}
+
+fn deserialize_cache_entries<'de, D>(deserializer: D) -> Result<Vec<CacheEntry>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entries {
+        List(Vec<CacheEntry>),
+        Map(std::collections::BTreeMap<String, CacheEntry>),
+    }
+
+    Ok(match Entries::deserialize(deserializer)? {
+        Entries::List(entries) => entries,
+        Entries::Map(entries) => entries.into_values().collect(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -174,6 +209,14 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
         Ok(Self::new(routing, cache, models, judge, spans))
     }
 
+    /// Seed or replace one cache entry using the same deterministic key
+    /// shape the on-disk artifact uses. Runtime persistence is a later
+    /// storage concern; this makes incremental in-process cache writes
+    /// available to the integrated executor today.
+    pub fn upsert_cache(&mut self, entry: CacheEntry) {
+        self.cache.upsert(entry);
+    }
+
     pub async fn execute(
         &self,
         request: &ExecutionRequest,
@@ -203,7 +246,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     request,
                                     SpanKind::LlmCall,
                                     CacheStatus::Miss,
-                                    Some(&step.model.name),
+                                    Some(&step.model),
                                     serde_json::json!({
                                         "decision": "cascade_accept",
                                         "model": step.model.name,
@@ -223,7 +266,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     request,
                                     SpanKind::LlmCall,
                                     CacheStatus::Miss,
-                                    Some(&step.model.name),
+                                    Some(&step.model),
                                     serde_json::json!({
                                         "decision": "cascade_escalation",
                                         "model": step.model.name,
@@ -238,7 +281,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     request,
                                     SpanKind::LlmCall,
                                     CacheStatus::Miss,
-                                    Some(&step.model.name),
+                                    Some(&step.model),
                                     serde_json::json!({
                                         "decision": "cascade_error",
                                         "model": step.model.name,
@@ -262,7 +305,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     request,
                                     SpanKind::LlmCall,
                                     CacheStatus::Miss,
-                                    Some(&model.name),
+                                    Some(model),
                                     serde_json::json!({
                                         "decision": "fallback_accept",
                                         "model": model.name,
@@ -281,7 +324,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     request,
                                     SpanKind::LlmCall,
                                     CacheStatus::Miss,
-                                    Some(&model.name),
+                                    Some(model),
                                     serde_json::json!({
                                         "decision": "fallback_error",
                                         "model": model.name,
@@ -398,7 +441,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 } else {
                     CacheStatus::Miss
                 },
-                Some(&cache.judge.name),
+                Some(&cache.judge),
                 serde_json::json!({
                     "decision": if accepted { "judge_hit" } else { "judge_reject" },
                     "similarity": similarity,
@@ -429,7 +472,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
         request: &ExecutionRequest,
         kind: SpanKind,
         cache_status: CacheStatus,
-        model: Option<&str>,
+        model: Option<&RouteModel>,
         attributes: Value,
     ) -> Result<(), RouteExecutorError> {
         let now = now_unix_ms();
@@ -447,10 +490,10 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 name: request.prompt_name.clone(),
                 start_unix_ms: now,
                 end_unix_ms: now,
-                model: model.map(str::to_owned),
+                model: model.map(|model| model.name.clone()),
                 tokens_prompt: None,
                 tokens_completion: None,
-                usd_cost: 0.0,
+                usd_cost: model.map(|model| model.estimated_cost_usd).unwrap_or(0.0),
                 cache_status,
                 retries: 0,
                 evicted_sections: vec![],

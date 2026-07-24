@@ -1,0 +1,48 @@
+{
+  "ir_version": 1,
+  "name": "researcher",
+  "quality": "high",
+  "inputs": {
+    "depth": {
+      "kind": "enum",
+      "variants": [
+        "quick",
+        "thorough"
+      ]
+    },
+    "documents": {
+      "kind": "list",
+      "of": {
+        "kind": "document"
+      }
+    },
+    "topic": {
+      "kind": "string"
+    }
+  },
+  "tools": [
+    "web_search",
+    "web_fetch"
+  ],
+  "sections": [
+    {
+      "id": "role",
+      "priority": 100,
+      "body": "Cite evidence; separate fact from inference; preserve uncertainty."
+    },
+    {
+      "id": "assignment",
+      "priority": 90,
+      "body": "Investigate {{ topic }} at {{ depth }} depth; return evidence-traceable claims."
+    },
+    {
+      "id": "documents",
+      "priority": 50,
+      "body": "{% for item in documents %}{{ item.title }}{% endfor %}"
+    }
+  ],
+  "output_contract": {
+    "type": "json_schema",
+    "schema": "{\n  \"type\": \"object\",\n  \"required\": [\"summary\", \"findings\", \"confidence\"],\n  \"properties\": {\n    \"summary\": { \"type\": \"string\" },\n    \"findings\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"required\": [\"claim\", \"source\"],\n        \"properties\": {\n          \"claim\": { \"type\": \"string\" },\n          \"source\": { \"type\": \"string\" }\n        }\n      }\n    },\n    \"confidence\": {\n      \"type\": \"string\",\n      \"enum\": [\"low\", \"medium\", \"high\"]\n    }\n  }\n}\n"
+  }
+}

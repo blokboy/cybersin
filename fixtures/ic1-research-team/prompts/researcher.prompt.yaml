@@ -1,0 +1,26 @@
+name: researcher
+quality: high
+inputs:
+  topic: string
+  depth: enum[quick, thorough]
+  documents: list[document]
+tools:
+  - web_search
+  - web_fetch
+sections:
+  - id: role
+    priority: 100
+    body: !include ../fragments/research-principles.md
+  - id: assignment
+    priority: 90
+    body: |
+      Investigate {{ topic }} at {{ depth }} depth. Return only claims that
+      can be traced to evidence.
+  - id: documents
+    priority: 50
+    body: |
+      {{#each documents}}- {{this.title}}
+      {{/each}}
+output_contract:
+  type: json_schema
+  schema: !include ../fragments/schemas/report.json

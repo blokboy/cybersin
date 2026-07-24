@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use cybersin_ir::{BudgetArtifact, PromptIr};
+use cybersin_router::{ModelKind, RouteDecision, RouteModel, RoutingArtifact};
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -134,7 +135,9 @@ impl DistFixture {
     pub fn load_dir(dir: impl AsRef<Path>) -> Result<Self, DistError> {
         let dir = dir.as_ref();
         let manifest: DistManifest = read_json(&dir.join("manifest.json"))?;
-        let routing: BTreeMap<String, RoutingEntry> = read_json(&dir.join("routing.json"))?;
+        let routing_path = dir.join("routing.json");
+        let routing_document: RoutingDocument = read_json(&routing_path)?;
+        let (routing, compiled_cascades) = routing_document.into_runtime_entries();
 
         let mut prompts = BTreeMap::new();
         for path in json_files_in(&dir.join("prompts"))? {
@@ -165,7 +168,7 @@ impl DistFixture {
         let cascades: BTreeMap<String, Vec<RoutingEntry>> = if cascade_path.is_file() {
             read_json(&cascade_path)?
         } else {
-            BTreeMap::new()
+            compiled_cascades
         };
 
         Ok(Self {
@@ -206,6 +209,92 @@ impl DistFixture {
             .get(prompt_name)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+}
+
+/// The runtime originally bootstrapped against a hand-written
+/// `{prompt: RoutingEntry}` map. The compiler's real §6.6 artifact wraps
+/// prompt routes in `{schema_version, prompts}` and carries ordered
+/// cache/cascade/fallback decisions. Accept both during the migration so
+/// old focused fixtures keep testing their original behavior while real
+/// compiled projects can run without a translated stand-in.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RoutingDocument {
+    Compiled(RoutingArtifact),
+    Legacy(BTreeMap<String, RoutingEntry>),
+}
+
+impl RoutingDocument {
+    fn into_runtime_entries(
+        self,
+    ) -> (
+        BTreeMap<String, RoutingEntry>,
+        BTreeMap<String, Vec<RoutingEntry>>,
+    ) {
+        match self {
+            Self::Legacy(routing) => (routing, BTreeMap::new()),
+            Self::Compiled(artifact) => {
+                let mut routing = BTreeMap::new();
+                let mut cascades = BTreeMap::new();
+
+                for (prompt_name, route) in artifact.prompts {
+                    let steps = route
+                        .decisions
+                        .iter()
+                        .find_map(|decision| match decision {
+                            RouteDecision::Cascade(cascade) => Some(
+                                cascade
+                                    .steps
+                                    .iter()
+                                    .map(|step| runtime_entry(&step.model))
+                                    .collect::<Vec<_>>(),
+                            ),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+
+                    // A normal call uses the highest-quality step the
+                    // compiler selected; `on_breach: degrade` explicitly
+                    // falls back to `steps.first()`, the cheapest tier.
+                    // If a future artifact has no cascade, use its first
+                    // provider fallback instead.
+                    let default = steps.last().cloned().or_else(|| {
+                        route.decisions.iter().find_map(|decision| match decision {
+                            RouteDecision::Fallbacks(fallbacks) => fallbacks
+                                .providers
+                                .iter()
+                                .find(|model| model.model_kind == ModelKind::Provider)
+                                .map(runtime_entry),
+                            _ => None,
+                        })
+                    });
+
+                    if let Some(default) = default {
+                        routing.insert(prompt_name.clone(), default);
+                    }
+                    if !steps.is_empty() {
+                        cascades.insert(prompt_name, steps);
+                    }
+                }
+                (routing, cascades)
+            }
+        }
+    }
+}
+
+fn runtime_entry(model: &RouteModel) -> RoutingEntry {
+    // `RoutingArtifact` carries an estimated whole-call cost, not the
+    // lockfile's two token rates. Preserve that estimate exactly under
+    // the runtime's existing pricing equation by assigning it to a
+    // fixed 1,000-token completion. This bridge can disappear once the
+    // shared route executor owns RuntimeDaemon's LLM path.
+    RoutingEntry {
+        model: model.name.clone(),
+        usd_per_1k_prompt_tokens: 0.0,
+        usd_per_1k_completion_tokens: model.estimated_cost_usd,
+        completion_tokens_estimate: 1_000,
+        target: "generic".to_string(),
     }
 }
 
@@ -279,5 +368,20 @@ mod tests {
             dist.routing("nope"),
             Err(DistError::MissingRouting(_))
         ));
+    }
+
+    #[test]
+    fn loads_real_compiler_routing_artifact() {
+        let dist_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/ic1-research-team/dist");
+        if !dist_dir.is_dir() {
+            return;
+        }
+
+        let dist = DistFixture::load_dir(dist_dir).expect("load real compiler output");
+        assert_eq!(dist.routing("researcher").unwrap().model, "premium-high");
+        assert_eq!(dist.cascade("researcher")[0].model, "fast-low");
+        assert_eq!(dist.cascade("researcher").len(), 3);
+        assert!(dist.prompt("synthesizer").is_ok());
     }
 }
