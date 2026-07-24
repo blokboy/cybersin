@@ -103,8 +103,12 @@ mod tests {
 
         assert!(summary.completed);
         assert_eq!(summary.session_id, "sess-stub-1");
-        // 2 cache-decision + 2 llm-call spans + 1 tool-call span.
-        assert_eq!(summary.spans_recorded, 5);
+        // 2 cache-decision + 3 llm-call spans (the fixture's `cascade.json`
+        // declares a cheaper "gpt-4o-nano" alternate ahead of the default
+        // "gpt-4o-mini": the real executor's cascade now genuinely
+        // escalates past it before settling on the default, spec §8.3 —
+        // two real model-call spans for the miss, not one) + 1 tool-call.
+        assert_eq!(summary.spans_recorded, 6);
 
         let session = storage.get_session("sess-stub-1").await.unwrap().unwrap();
         assert_eq!(session.status, "completed");
@@ -117,31 +121,44 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(recorded.len(), 5);
+        assert_eq!(recorded.len(), 6);
 
         let llm_spans: Vec<_> = recorded
             .iter()
             .filter(|s| s.kind == SpanKind::LlmCall)
             .collect();
-        assert_eq!(llm_spans.len(), 2);
+        assert_eq!(llm_spans.len(), 3);
         for span in &llm_spans {
-            assert_eq!(span.model.as_deref(), Some("gpt-4o-mini"));
             assert!(span.tokens_prompt.is_some());
         }
-
-        let miss = llm_spans
+        assert!(llm_spans
             .iter()
-            .find(|s| s.cache_status == cybersin_trace::CacheStatus::Miss)
-            .expect("one llm span should be a cache miss");
-        assert!(miss.usd_cost > 0.0);
-        assert_eq!(miss.evicted_sections, vec!["documents".to_string()]);
-        assert_eq!(miss.tokens_completion, Some(180));
+            .any(|s| s.model.as_deref() == Some("gpt-4o-nano")));
+
+        let miss_spans: Vec<_> = llm_spans
+            .iter()
+            .filter(|s| s.cache_status == cybersin_trace::CacheStatus::Miss)
+            .collect();
+        assert_eq!(miss_spans.len(), 2, "cheap escalation + default accept");
+        assert!(miss_spans.iter().all(|s| s.usd_cost > 0.0));
+        assert!(miss_spans
+            .iter()
+            .all(|s| s.evicted_sections == vec!["documents".to_string()]));
+        assert!(miss_spans.iter().all(|s| s.tokens_completion == Some(180)));
+        let miss_accept = miss_spans
+            .iter()
+            .find(|s| s.model.as_deref() == Some("gpt-4o-mini"))
+            .expect("the default model should be the cascade's accepted step");
+        assert_eq!(miss_accept.attributes["decision"], "cascade_accept");
 
         let hit = llm_spans
             .iter()
             .find(|s| s.cache_status == cybersin_trace::CacheStatus::Hit)
             .expect("one llm span should be a cache hit");
         assert_eq!(hit.usd_cost, 0.0);
+        // A cache hit is attributed to the prompt's default model — a
+        // cache entry doesn't record which model originally produced it.
+        assert_eq!(hit.model.as_deref(), Some("gpt-4o-mini"));
 
         let tool_spans: Vec<_> = recorded
             .iter()
@@ -239,7 +256,14 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(recorded.len(), 1);
+        // The fixture's `cascade.json` cheap alternate ("gpt-4o-nano") is
+        // escalated past before settling on the default ("gpt-4o-mini") —
+        // two real model-call spans for this one `llm.request`, not one
+        // (see `stub_session_produces_real_spans_with_cost_tokens_and_model`).
+        // Both carry identical context-assembler bookkeeping (this
+        // request's `prompt_tokens`/`evicted_sections`/`context`), so
+        // either is equally valid for the assertions below.
+        assert_eq!(recorded.len(), 2);
         let span = &recorded[0];
 
         assert_eq!(

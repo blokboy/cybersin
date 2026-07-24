@@ -21,6 +21,10 @@ use serde_json::Value;
 use crate::budget::{BudgetConfig, OnBreach};
 use crate::dist::DistFixture;
 use crate::error::RuntimeError;
+use crate::model_caller::{StubJudge, StubModelCaller};
+use crate::route_executor::{
+    cache_key, default_model, CacheEntry, ExecutionRequest, RouteExecutor,
+};
 use crate::storage::{Storage, ToolCallRecord};
 
 /// Estimated token count for `text`: a whitespace-token heuristic, not a
@@ -253,17 +257,6 @@ fn now_unix_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// A cache key for the emulated cache layer: exact prompt name + exact
-/// JSON-serialized inputs. Since `serde_json::Value`'s own equality is
-/// already exact structural equality, this just needs *a* deterministic
-/// string to key a `HashMap` on.
-fn cache_key(prompt_name: &str, inputs: &Value) -> (String, String) {
-    (
-        prompt_name.to_string(),
-        serde_json::to_string(inputs).unwrap_or_default(),
-    )
-}
-
 /// Outcome of driving one session to completion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeSessionSummary {
@@ -295,10 +288,14 @@ enum BudgetOutcome {
 /// `cybersin_adapter::daemon_double::DaemonDouble` (spec §10): drives one
 /// session's `HarnessMessage`/`DaemonMessage` exchange against real
 /// storage (event-sourced session log, spec §8.1) and a real
-/// `cybersin-trace` span store (spec §8.5), instead of `DaemonDouble`'s
-/// throwaway ledger. Routed/priced from a hand-written `DistFixture`
-/// rather than the compiler's real `routing.json`/`cache.json` — that's
-/// `cybersin-router`, a later issue.
+/// `cybersin-trace` span store (spec §8.5). `llm.request` is routed and
+/// priced by a real [`RouteExecutor`] (spec §8.3: hash lookup → kNN →
+/// borderline judge tier → cascade with confidence checks → fallbacks),
+/// seeded from `DistFixture`'s `routing_artifact`/`cache_artifact` — the
+/// real `cybersin-router` view of `routing.json`/`cache.json`, synthesized
+/// for legacy hand-written fixtures that predate a real compiler (see
+/// `dist::synthesize_routing_artifact`) so both paths run through the same
+/// executor rather than two parallel implementations.
 pub struct RuntimeDaemon<C> {
     channel: C,
     storage: Arc<dyn Storage>,
@@ -306,10 +303,7 @@ pub struct RuntimeDaemon<C> {
     dist: Arc<DistFixture>,
     session_id: String,
     agent_name: String,
-    /// Emulates the route/cache executor's cache layer (spec §8.3) just
-    /// enough to produce a `Hit` on a repeated identical `llm.request`
-    /// within the same session — not the real hash/kNN/judge cascade.
-    cache: HashMap<(String, String), Value>,
+    route_executor: RouteExecutor<StubModelCaller, StubJudge>,
     next_span_seq: u64,
     completed: bool,
     /// Session-level `usd_per_session` budget (spec §8.5). `None` means
@@ -342,6 +336,13 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         session_id: impl Into<String>,
         agent_name: impl Into<String>,
     ) -> Self {
+        let route_executor = RouteExecutor::new(
+            dist.routing_artifact.clone(),
+            dist.cache_artifact.clone(),
+            StubModelCaller,
+            StubJudge,
+            spans.clone(),
+        );
         Self {
             channel,
             storage,
@@ -349,7 +350,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             dist,
             session_id: session_id.into(),
             agent_name: agent_name.into(),
-            cache: HashMap::new(),
+            route_executor,
             next_span_seq: 0,
             completed: false,
             budget: None,
@@ -871,85 +872,70 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         }
 
         let prompt = self.dist.prompt(&prompt_name)?.clone();
-        // `degrade` re-routes to the cheapest declared cascade step (spec
-        // §8.5); a prompt with no `cascade.json` entry has nothing
-        // cheaper to fall back to, so it just keeps its normal routing.
-        let routing = if self.degraded_prompts.contains(&prompt_name) {
-            self.dist
-                .cascade(&prompt_name)
-                .first()
-                .cloned()
-                .unwrap_or(self.dist.routing(&prompt_name)?.clone())
-        } else {
-            self.dist.routing(&prompt_name)?.clone()
-        };
+        // Still consulted for the context assembler's budget-plan `target`
+        // and the legacy `completion_tokens_estimate` bookkeeping — model
+        // selection/pricing itself now comes from `self.route_executor`
+        // (spec §8.3), not this bridge.
+        let routing = self.dist.routing(&prompt_name)?.clone();
         let budget = self.dist.budget(&prompt_name).cloned();
 
-        let key = cache_key(&prompt_name, &inputs);
-        let cache_status = if self.cache.contains_key(&key) {
+        let live_sections = extract_live_sections(&inputs);
+        let assembled = assemble_context(&prompt, &live_sections, budget.as_ref(), &routing.target);
+
+        let default_model = self
+            .dist
+            .routing_artifact
+            .prompts
+            .get(&prompt_name)
+            .and_then(default_model)
+            .cloned();
+
+        let request = ExecutionRequest {
+            session_id: self.session_id.clone(),
+            agent_name: self.agent_name.clone(),
+            prompt_name: prompt_name.clone(),
+            inputs: inputs.clone(),
+            // No real embedding backend exists yet (spec §9's brute-force
+            // kNN gate already fails closed) — only the executor's
+            // exact-hash cache path is reachable today.
+            embedding: Vec::new(),
+            namespace_version: self.dist.cache_artifact.namespace_version.clone(),
+            bypass: false,
+            prompt_tokens: assembled.prompt_tokens,
+            completion_tokens: Some(routing.completion_tokens_estimate),
+            evicted_sections: assembled.evicted_sections.clone(),
+            context_attributes: serde_json::json!({
+                "target": routing.target,
+                "included_sections": assembled.included_sections,
+                "evicted_live_sections": assembled.evicted_live_sections,
+            }),
+            // spec §8.5 `on_breach: degrade`: force the executor to
+            // accept the cheapest cascade step unconditionally instead of
+            // walking the full confidence-gated cascade.
+            force_cheapest_cascade_step: self.degraded_prompts.contains(&prompt_name),
+            default_model,
+        };
+
+        let spans_before = self.session_span_count().await?;
+        let response = self.route_executor.execute(&request).await?;
+        let spans_recorded = self
+            .session_span_count()
+            .await?
+            .saturating_sub(spans_before);
+
+        if !response.cache_hit {
+            self.route_executor.upsert_cache(CacheEntry {
+                prompt_name: prompt_name.clone(),
+                input_hash: cache_key(&prompt_name, &inputs),
+                embedding: request.embedding.clone(),
+                response: response.response.clone(),
+            });
+        }
+        let cache_status = if response.cache_hit {
             CacheStatus::Hit
         } else {
             CacheStatus::Miss
         };
-
-        // Cache decision span: its own span kind, recorded ahead of the
-        // LLM call span it precedes (spec §8.5).
-        self.emit_span(
-            SpanKind::CacheDecision,
-            prompt_name.clone(),
-            None,
-            None,
-            None,
-            0.0,
-            cache_status,
-            0,
-            Vec::new(),
-            serde_json::json!({ "prompt_name": prompt_name }),
-        )
-        .await?;
-
-        let live_sections = extract_live_sections(&inputs);
-        let assembled = assemble_context(&prompt, &live_sections, budget.as_ref(), &routing.target);
-        let prompt_tokens = assembled.prompt_tokens;
-
-        let (completion_tokens, usd_cost, response_value) = match cache_status {
-            CacheStatus::Hit => {
-                let cached = self.cache.get(&key).cloned().unwrap_or(Value::Null);
-                (0u32, 0.0f64, cached)
-            }
-            _ => {
-                let completion_tokens = routing.completion_tokens_estimate;
-                let usd_cost = (prompt_tokens as f64 / 1000.0) * routing.usd_per_1k_prompt_tokens
-                    + (completion_tokens as f64 / 1000.0) * routing.usd_per_1k_completion_tokens;
-                let response = serde_json::json!({
-                    "text": format!("stub completion for prompt `{prompt_name}`"),
-                    "model": routing.model,
-                });
-                self.cache.insert(key, response.clone());
-                (completion_tokens, usd_cost, response)
-            }
-        };
-
-        self.emit_span(
-            SpanKind::LlmCall,
-            prompt_name.clone(),
-            Some(routing.model.clone()),
-            Some(prompt_tokens),
-            Some(completion_tokens),
-            usd_cost,
-            cache_status,
-            0,
-            assembled.evicted_sections.clone(),
-            serde_json::json!({
-                "inputs": inputs,
-                "context": {
-                    "target": routing.target,
-                    "included_sections": assembled.included_sections,
-                    "evicted_live_sections": assembled.evicted_live_sections,
-                },
-            }),
-        )
-        .await?;
 
         self.storage
             .append_event(
@@ -957,14 +943,14 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 "llm.call",
                 serde_json::json!({
                     "prompt_name": prompt_name,
-                    "model": routing.model,
+                    "model": response.model,
                     "cache_status": cache_status.as_str(),
-                    "usd_cost": usd_cost,
-                    "tokens_prompt": prompt_tokens,
-                    "tokens_completion": completion_tokens,
+                    "usd_cost": response.usd_cost,
+                    "tokens_prompt": assembled.prompt_tokens,
+                    "tokens_completion": routing.completion_tokens_estimate,
                     "evicted_sections": assembled.evicted_sections,
                     "evicted_live_sections": assembled.evicted_live_sections,
-                    "response": response_value,
+                    "response": response.response,
                 }),
             )
             .await?;
@@ -974,11 +960,26 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             .send(DaemonMessage::CallResult {
                 call_id,
                 outcome: CallOutcome::Ok {
-                    value: response_value,
+                    value: response.response,
                 },
             })
             .await?;
-        Ok(2) // cache-decision span + llm-call span
+        Ok(spans_recorded)
+    }
+
+    /// Total spans recorded for this session so far — used to measure how
+    /// many spans one `route_executor.execute` call just wrote, since a
+    /// real cascade may escalate through several model calls (each its
+    /// own span) rather than always writing exactly one.
+    async fn session_span_count(&self) -> Result<u32, RuntimeError> {
+        Ok(self
+            .spans
+            .list(&SpanFilter {
+                session_id: Some(self.session_id.clone()),
+                ..Default::default()
+            })
+            .await?
+            .len() as u32)
     }
 
     async fn handle_tool_request(

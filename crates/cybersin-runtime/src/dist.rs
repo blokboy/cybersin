@@ -12,9 +12,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use cybersin_ir::{BudgetArtifact, PromptIr};
-use cybersin_router::{ModelKind, RouteDecision, RouteModel, RoutingArtifact};
+use cybersin_ir::{BudgetArtifact, PromptIr, QualityTier};
+use cybersin_router::{
+    CacheDecision, CascadeDecision, CascadeStep, ConfidenceRubric, FallbackDecision, ModelKind,
+    PromptRoute, RouteDecision, RouteModel, RoutingArtifact,
+};
 use serde::Deserialize;
+
+use crate::route_executor::CacheArtifact;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DistError {
@@ -123,6 +128,19 @@ pub struct DistFixture {
     /// enforcement to re-route to a cheaper model. Empty for any prompt
     /// without a `cascade.json` entry.
     pub cascades: BTreeMap<String, Vec<RoutingEntry>>,
+    /// The real `cybersin-router` view of `routing.json` — what
+    /// [`crate::route_executor::RouteExecutor`] actually executes (spec
+    /// §8.3). Populated for both real compiled fixtures (parsed directly)
+    /// and legacy hand-written ones (synthesized from [`RoutingEntry`], a
+    /// single-step cascade that always accepts — see
+    /// [`synthesize_routing_artifact`]) so every `DistFixture`, old or
+    /// new, drives the same real executor rather than two parallel
+    /// implementations.
+    pub routing_artifact: RoutingArtifact,
+    /// The real `cache.json` view, likewise populated (empty) for legacy
+    /// fixtures that never had one — `RouteExecutor::upsert_cache` fills
+    /// it in at runtime exactly as the old in-memory `HashMap` cache did.
+    pub cache_artifact: CacheArtifact,
 }
 
 impl DistFixture {
@@ -137,6 +155,34 @@ impl DistFixture {
         let manifest: DistManifest = read_json(&dir.join("manifest.json"))?;
         let routing_path = dir.join("routing.json");
         let routing_document: RoutingDocument = read_json(&routing_path)?;
+        let cache_path = dir.join("cache.json");
+        let cache_artifact: CacheArtifact = if cache_path.is_file() {
+            read_json(&cache_path)?
+        } else {
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "0".to_string(),
+                entries: Vec::new(),
+            }
+        };
+        let routing_artifact = match &routing_document {
+            RoutingDocument::Compiled(artifact) => artifact.clone(),
+            RoutingDocument::Legacy(map) => {
+                // The only source of cascade alternates for a legacy
+                // document is an on-disk `cascade.json` — its own
+                // `into_runtime_entries` bridge always yields empty
+                // cascades (a real compiler's cascade info flows through
+                // `routing.json` itself, not a side file).
+                let legacy_cascade_path = dir.join("cascade.json");
+                let legacy_cascades: BTreeMap<String, Vec<RoutingEntry>> =
+                    if legacy_cascade_path.is_file() {
+                        read_json(&legacy_cascade_path)?
+                    } else {
+                        BTreeMap::new()
+                    };
+                synthesize_routing_artifact(map, &legacy_cascades)
+            }
+        };
         let (routing, compiled_cascades) = routing_document.into_runtime_entries();
 
         let mut prompts = BTreeMap::new();
@@ -178,6 +224,8 @@ impl DistFixture {
             budgets,
             tools,
             cascades,
+            routing_artifact,
+            cache_artifact,
         })
     }
 
@@ -280,6 +328,98 @@ impl RoutingDocument {
                 (routing, cascades)
             }
         }
+    }
+}
+
+fn legacy_route_model(entry: &RoutingEntry) -> RouteModel {
+    RouteModel {
+        name: entry.model.clone(),
+        provider: "legacy".to_string(),
+        quality: QualityTier::High,
+        estimated_cost_usd: (entry.completion_tokens_estimate as f64 / 1000.0)
+            * entry.usd_per_1k_completion_tokens,
+        model_kind: ModelKind::Provider,
+    }
+}
+
+/// Synthesize a real `cybersin-router` [`RoutingArtifact`] from a legacy
+/// hand-written `{prompt: RoutingEntry}` map (plus its optional
+/// `cascade.json` cheaper alternates), so a legacy fixture drives
+/// [`crate::route_executor::RouteExecutor`] exactly like a real compiled
+/// one instead of a second, parallel implementation.
+///
+/// Cascade steps are ordered cheapest-first, matching spec §8.5, with an
+/// unreachable `minimum_score` (`1.01`, confidence never exceeds `1.0`) on
+/// every step except the last: a normal (non-degraded) call always
+/// escalates past the cheap alternates and settles on the prompt's default
+/// model, exactly as these fixtures behaved before this executor existed.
+/// `on_breach: degrade` (spec §8.5) instead sets
+/// `ExecutionRequest::force_cheapest_cascade_step`, which makes the
+/// executor accept the first (cheapest) step unconditionally — the
+/// cheaper alternate a legacy fixture declared, if any, or the default
+/// model itself if it declared none.
+///
+/// The cache decision's similarity/judge thresholds are set unreachably
+/// high (no legacy fixture ever had embeddings), so only the executor's
+/// own exact-hash cache path — the one thing these fixtures actually
+/// exercised — can ever hit.
+fn synthesize_routing_artifact(
+    routing: &BTreeMap<String, RoutingEntry>,
+    cascades: &BTreeMap<String, Vec<RoutingEntry>>,
+) -> RoutingArtifact {
+    let prompts = routing
+        .iter()
+        .map(|(prompt_name, entry)| {
+            // Old code only ever consulted `cascade(name).first()` for a
+            // degrade breach (`session.rs`'s pre-#33 `handle_llm_request`)
+            // — any further declared entries were dead weight some
+            // fixtures carry regardless. Mirror that: at most one cheap
+            // alternate ahead of the default step.
+            let mut steps: Vec<CascadeStep> = cascades
+                .get(prompt_name)
+                .and_then(|alternates| alternates.first())
+                .map(|cheap| CascadeStep {
+                    model: legacy_route_model(cheap),
+                    confidence: ConfidenceRubric {
+                        minimum_score: 1.01,
+                        instruction: "legacy fixture: only reachable via forced degrade"
+                            .to_string(),
+                    },
+                })
+                .into_iter()
+                .collect();
+            steps.push(CascadeStep {
+                model: legacy_route_model(entry),
+                confidence: ConfidenceRubric {
+                    minimum_score: 0.0,
+                    instruction: "legacy fixture: no confidence gate".to_string(),
+                },
+            });
+            let route = PromptRoute {
+                quality: QualityTier::High,
+                decisions: vec![
+                    RouteDecision::Cache(CacheDecision {
+                        similarity_threshold: 2.0,
+                        judge_trigger_band: [2.0, 2.0],
+                        judge: RouteModel {
+                            name: "legacy-judge".to_string(),
+                            provider: "legacy".to_string(),
+                            quality: QualityTier::High,
+                            estimated_cost_usd: 0.0,
+                            model_kind: ModelKind::Judge,
+                        },
+                    }),
+                    RouteDecision::Cascade(CascadeDecision { steps }),
+                    RouteDecision::Fallbacks(FallbackDecision { providers: vec![] }),
+                ],
+                optimization_candidates: vec![],
+            };
+            (prompt_name.clone(), route)
+        })
+        .collect();
+    RoutingArtifact {
+        schema_version: 1,
+        prompts,
     }
 }
 

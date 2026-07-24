@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use cybersin_router::{RouteDecision, RouteModel, RoutingArtifact};
+use cybersin_router::{CascadeStep, RouteDecision, RouteModel, RoutingArtifact};
 use cybersin_trace::{CacheStatus, Span, SpanKind, SpanStatus, SpanStore};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -86,6 +86,31 @@ pub struct ExecutionRequest {
     pub embedding: Vec<f32>,
     pub namespace_version: String,
     pub bypass: bool,
+    /// Context-assembler output for this call (spec §8.3a), threaded
+    /// through purely so the `llm_call` span this executor writes carries
+    /// it — the executor itself has no opinion on context assembly.
+    #[doc(hidden)]
+    pub prompt_tokens: u32,
+    #[doc(hidden)]
+    pub completion_tokens: Option<u32>,
+    #[doc(hidden)]
+    pub evicted_sections: Vec<String>,
+    /// Merged verbatim into the recorded `llm_call` span's
+    /// `attributes["context"]` — the caller's own context-assembly
+    /// metadata (target, included/evicted sections), opaque to this
+    /// executor.
+    #[doc(hidden)]
+    pub context_attributes: Value,
+    /// spec §8.5's `on_breach: degrade`: skip cascade confidence checks
+    /// entirely and accept the first (cheapest) step's output
+    /// unconditionally. Set by the caller once its own budget enforcement
+    /// (outside this executor's scope) has decided to degrade.
+    pub force_cheapest_cascade_step: bool,
+    /// The model a cache hit should be attributed to for span/cost
+    /// purposes — a cache entry doesn't record which model originally
+    /// produced it, so the caller supplies "the model this prompt would
+    /// use" (its highest-quality cascade step) purely for labeling.
+    pub default_model: Option<RouteModel>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -99,6 +124,31 @@ pub struct ExecutionResponse {
     pub response: Value,
     pub model: Option<String>,
     pub cache_hit: bool,
+    pub usd_cost: f64,
+}
+
+/// The model a "normal" (non-degraded) call to `route` would use: its
+/// highest-quality cascade step, or failing that its first provider
+/// fallback. Shared by [`crate::dist::DistFixture`]'s own legacy-bridge
+/// view of the same routing document so both callers agree on what
+/// "the model this prompt uses" means.
+pub fn default_model(route: &cybersin_router::PromptRoute) -> Option<&RouteModel> {
+    route
+        .decisions
+        .iter()
+        .find_map(|decision| match decision {
+            RouteDecision::Cascade(cascade) => cascade.steps.last().map(|step| &step.model),
+            _ => None,
+        })
+        .or_else(|| {
+            route.decisions.iter().find_map(|decision| match decision {
+                RouteDecision::Fallbacks(fallbacks) => fallbacks
+                    .providers
+                    .iter()
+                    .find(|model| model.model_kind == cybersin_router::ModelKind::Provider),
+                _ => None,
+            })
+        })
 }
 
 #[async_trait]
@@ -230,25 +280,61 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
         for decision in &route.decisions {
             match decision {
                 RouteDecision::Cache(cache) => {
-                    if let Some(response) = self.execute_cache(request, cache).await? {
+                    if let Some(mut response) = self.execute_cache(request, cache).await? {
+                        // A cache hit reuses whatever model originally
+                        // produced the entry, but `CacheEntry` doesn't
+                        // record that — so this executor attributes the
+                        // hit to `default_model` (the model this prompt
+                        // would normally use) purely for span/cost
+                        // labeling. Zero cost either way: no model call
+                        // actually happened.
+                        response.model = request.default_model.as_ref().map(|m| m.name.clone());
+                        response.usd_cost = 0.0;
+                        self.record(
+                            request,
+                            SpanKind::LlmCall,
+                            CacheStatus::Hit,
+                            request.default_model.as_ref(),
+                            0.0,
+                            serde_json::json!({ "decision": "cache_hit" }),
+                        )
+                        .await?;
                         return Ok(response);
                     }
                 }
                 RouteDecision::Cascade(cascade) => {
-                    for step in &cascade.steps {
+                    // spec §8.5 `on_breach: degrade`: skip confidence
+                    // checks and accept the first (cheapest) step's
+                    // output unconditionally, rather than walking the
+                    // full cascade.
+                    let steps: &[CascadeStep] = if request.force_cheapest_cascade_step {
+                        cascade
+                            .steps
+                            .first()
+                            .map(std::slice::from_ref)
+                            .unwrap_or(&[])
+                    } else {
+                        &cascade.steps
+                    };
+                    for step in steps {
                         let result = self
                             .models
                             .call(&step.model, &request.prompt_name, &request.inputs)
                             .await;
+                        let force_accept = request.force_cheapest_cascade_step;
                         match result {
-                            Ok(output) if output.confidence >= step.confidence.minimum_score => {
+                            Ok(output)
+                                if force_accept
+                                    || output.confidence >= step.confidence.minimum_score =>
+                            {
                                 self.record(
                                     request,
                                     SpanKind::LlmCall,
                                     CacheStatus::Miss,
                                     Some(&step.model),
+                                    step.model.estimated_cost_usd,
                                     serde_json::json!({
-                                        "decision": "cascade_accept",
+                                        "decision": if force_accept { "degrade_forced" } else { "cascade_accept" },
                                         "model": step.model.name,
                                         "confidence": output.confidence,
                                         "minimum_confidence": step.confidence.minimum_score,
@@ -259,6 +345,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     response: output.response,
                                     model: Some(step.model.name.clone()),
                                     cache_hit: false,
+                                    usd_cost: step.model.estimated_cost_usd,
                                 });
                             }
                             Ok(output) => {
@@ -267,6 +354,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     SpanKind::LlmCall,
                                     CacheStatus::Miss,
                                     Some(&step.model),
+                                    step.model.estimated_cost_usd,
                                     serde_json::json!({
                                         "decision": "cascade_escalation",
                                         "model": step.model.name,
@@ -282,6 +370,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     SpanKind::LlmCall,
                                     CacheStatus::Miss,
                                     Some(&step.model),
+                                    step.model.estimated_cost_usd,
                                     serde_json::json!({
                                         "decision": "cascade_error",
                                         "model": step.model.name,
@@ -306,6 +395,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     SpanKind::LlmCall,
                                     CacheStatus::Miss,
                                     Some(model),
+                                    model.estimated_cost_usd,
                                     serde_json::json!({
                                         "decision": "fallback_accept",
                                         "model": model.name,
@@ -317,6 +407,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     response: output.response,
                                     model: Some(model.name.clone()),
                                     cache_hit: false,
+                                    usd_cost: model.estimated_cost_usd,
                                 });
                             }
                             Err(error) => {
@@ -325,6 +416,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     SpanKind::LlmCall,
                                     CacheStatus::Miss,
                                     Some(model),
+                                    model.estimated_cost_usd,
                                     serde_json::json!({
                                         "decision": "fallback_error",
                                         "model": model.name,
@@ -352,6 +444,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 SpanKind::CacheDecision,
                 CacheStatus::Miss,
                 None,
+                0.0,
                 serde_json::json!({"decision": "bypass", "similarity": Value::Null}),
             )
             .await?;
@@ -363,6 +456,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 SpanKind::CacheDecision,
                 CacheStatus::Miss,
                 None,
+                0.0,
                 serde_json::json!({
                     "decision": "namespace_invalidated",
                     "similarity": Value::Null,
@@ -386,6 +480,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 SpanKind::CacheDecision,
                 CacheStatus::Hit,
                 None,
+                0.0,
                 serde_json::json!({"decision": "hash_hit", "similarity": 1.0}),
             )
             .await?;
@@ -403,6 +498,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 SpanKind::CacheDecision,
                 CacheStatus::Miss,
                 None,
+                0.0,
                 serde_json::json!({"decision": "miss", "similarity": Value::Null}),
             )
             .await?;
@@ -415,6 +511,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 SpanKind::CacheDecision,
                 CacheStatus::Hit,
                 None,
+                0.0,
                 serde_json::json!({"decision": "knn_hit", "similarity": similarity}),
             )
             .await?;
@@ -442,6 +539,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                     CacheStatus::Miss
                 },
                 Some(&cache.judge),
+                0.0,
                 serde_json::json!({
                     "decision": if accepted { "judge_hit" } else { "judge_reject" },
                     "similarity": similarity,
@@ -461,21 +559,39 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
             SpanKind::CacheDecision,
             CacheStatus::Miss,
             None,
+            0.0,
             serde_json::json!({"decision": "miss", "similarity": similarity}),
         )
         .await?;
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record(
         &self,
         request: &ExecutionRequest,
         kind: SpanKind,
         cache_status: CacheStatus,
         model: Option<&RouteModel>,
-        attributes: Value,
+        usd_cost: f64,
+        mut attributes: Value,
     ) -> Result<(), RouteExecutorError> {
         let now = now_unix_ms();
+        // Context-assembler bookkeeping (spec §8.3a) only applies to the
+        // `llm_call` span itself — cache-decision spans stay exactly as
+        // narrow as before.
+        let (tokens_prompt, tokens_completion, evicted_sections) = if kind == SpanKind::LlmCall {
+            if let Value::Object(map) = &mut attributes {
+                map.insert("context".to_string(), request.context_attributes.clone());
+            }
+            (
+                Some(request.prompt_tokens),
+                request.completion_tokens,
+                request.evicted_sections.clone(),
+            )
+        } else {
+            (None, None, Vec::new())
+        };
         self.spans
             .insert(&Span {
                 id: format!(
@@ -491,12 +607,12 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 start_unix_ms: now,
                 end_unix_ms: now,
                 model: model.map(|model| model.name.clone()),
-                tokens_prompt: None,
-                tokens_completion: None,
-                usd_cost: model.map(|model| model.estimated_cost_usd).unwrap_or(0.0),
+                tokens_prompt,
+                tokens_completion,
+                usd_cost,
                 cache_status,
                 retries: 0,
-                evicted_sections: vec![],
+                evicted_sections,
                 status: SpanStatus::Ok,
                 attributes,
             })
@@ -519,8 +635,11 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, RouteExecut
 fn cache_response(response: Value) -> ExecutionResponse {
     ExecutionResponse {
         response,
+        // Overwritten by `execute`'s `Cache` arm with `default_model` —
+        // a cache entry alone doesn't know which model produced it.
         model: None,
         cache_hit: true,
+        usd_cost: 0.0,
     }
 }
 
@@ -736,6 +855,12 @@ mod tests {
             embedding: vec![1.0, 0.0],
             namespace_version: "v1".into(),
             bypass: false,
+            prompt_tokens: 0,
+            completion_tokens: None,
+            evicted_sections: Vec::new(),
+            context_attributes: Value::Null,
+            force_cheapest_cascade_step: false,
+            default_model: None,
         }
     }
 

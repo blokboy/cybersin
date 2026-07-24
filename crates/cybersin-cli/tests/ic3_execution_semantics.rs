@@ -2,11 +2,18 @@
 
 //! IC-3 execution-semantics checkpoint (issue #18).
 //!
-//! One live session uses the IC-1 compiled project with the real route
-//! executor, context assembler, trace store, and sandbox containment
-//! boundary. The fake Docker CLI is only a deterministic daemon stand-in:
-//! it verifies the production containment flags and simulates the
-//! container's observable outcomes without requiring Docker in CI.
+//! One live session drives the IC-1 compiled project through the real
+//! `RuntimeDaemon` — which itself now drives a real `RouteExecutor`
+//! internally (issue #33) — for both the route/cache executor and the
+//! context assembler, plus a real sandbox containment boundary in the
+//! same session. Earlier revisions of this test drove a second,
+//! disconnected `RouteExecutor` instance alongside (not inside) the one
+//! live session; now that `RuntimeDaemon::handle_llm_request` genuinely
+//! calls the real executor, the cache/cascade assertions below come from
+//! spans the one real session itself produced. The fake Docker CLI is
+//! only a deterministic daemon stand-in: it verifies the production
+//! containment flags and simulates the container's observable outcomes
+//! without requiring Docker in CI.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -14,56 +21,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use cybersin_adapter::messages::CallOutcome;
 use cybersin_adapter::stub_harness::{CallOutcomeOrPark, StubHarness};
 use cybersin_adapter::transport::stdio::in_memory_pair;
-use cybersin_router::RouteModel;
-use cybersin_runtime::{
-    cache_key, CacheEntry, DistFixture, ExecutionRequest, Judge, ModelCaller, ModelOutput,
-    RouteExecutor, RuntimeDaemon, RuntimeSandbox, Storage,
-};
+use cybersin_runtime::{DistFixture, RuntimeDaemon, RuntimeSandbox, Storage};
 use cybersin_sandbox::{DockerBackend, ExecRequest, ResourceLimits, SandboxScope, WorkspaceStore};
 use cybersin_trace::{CacheStatus, SpanFilter, SpanKind, SpanStatus, SpanStore};
-use serde_json::{json, Value};
+use serde_json::json;
 
 fn project_dist() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/ic1-research-team/dist")
-}
-
-struct ConfidenceCaller;
-
-#[async_trait]
-impl ModelCaller for ConfidenceCaller {
-    async fn call(
-        &self,
-        model: &RouteModel,
-        _prompt_name: &str,
-        _inputs: &Value,
-    ) -> Result<ModelOutput, String> {
-        Ok(ModelOutput {
-            response: json!({"model": model.name, "answer": "evidence-backed"}),
-            // Force the real high-quality route to leave its cheapest
-            // tier, then accept the medium tier.
-            confidence: if model.name == "fast-low" { 0.2 } else { 0.95 },
-        })
-    }
-}
-
-struct RejectJudge;
-
-#[async_trait]
-impl Judge for RejectJudge {
-    async fn accepts(
-        &self,
-        _model: &RouteModel,
-        _prompt_name: &str,
-        _inputs: &Value,
-        _cached_response: &Value,
-        _similarity: f64,
-    ) -> Result<bool, String> {
-        Ok(false)
-    }
 }
 
 fn fake_docker() -> (tempfile::TempDir, PathBuf) {
@@ -129,6 +96,12 @@ async fn routing_context_and_sandbox_execute_in_one_real_session() {
     let mut harness = StubHarness::new(harness_io);
     harness.recv_session_start().await;
 
+    // First call: a cache miss. The real `RouteExecutor` inside
+    // `RuntimeDaemon` walks the researcher prompt's real compiled cascade
+    // cheapest-first (fast-low -> balanced-medium -> premium-high),
+    // escalating past any tier whose confidence doesn't clear its
+    // `minimum_score` — recorded as a real `cascade_escalation` span for
+    // "fast-low" below, settling on "premium-high".
     let (_, context_outcome) = tokio::time::timeout(
         Duration::from_secs(5),
         harness.llm_request("researcher", inputs.clone()),
@@ -140,31 +113,22 @@ async fn routing_context_and_sandbox_execute_in_one_real_session() {
         CallOutcomeOrPark::Result(CallOutcome::Ok { .. })
     ));
 
-    let mut routes =
-        RouteExecutor::load_dir(project_dist(), ConfidenceCaller, RejectJudge, spans.clone())
-            .unwrap();
-    let route_request = ExecutionRequest {
-        session_id: session_id.into(),
-        agent_name: agent_name.into(),
-        prompt_name: "researcher".into(),
-        inputs: inputs.clone(),
-        embedding: vec![1.0, 0.0],
-        namespace_version: "1".into(),
-        bypass: false,
-    };
-    let routed = routes.execute(&route_request).await.unwrap();
-    assert_eq!(routed.model.as_deref(), Some("balanced-medium"));
-    assert!(!routed.cache_hit);
-
-    routes.upsert_cache(CacheEntry {
-        prompt_name: "researcher".into(),
-        input_hash: cache_key("researcher", &inputs),
-        embedding: vec![1.0, 0.0],
-        response: routed.response.clone(),
-    });
-    let cached = routes.execute(&route_request).await.unwrap();
-    assert!(cached.cache_hit);
-    assert_eq!(cached.response, routed.response);
+    // Second call: the same prompt + inputs, still inside the same
+    // session — a real exact-hash cache hit against the entry the first
+    // call's miss just upserted, proving the executor and context
+    // assembler both ran for real within the one live session (issue
+    // #18's own AC bullet 4), not stitched together from a second,
+    // disconnected executor instance.
+    let (_, cached_outcome) = tokio::time::timeout(
+        Duration::from_secs(5),
+        harness.llm_request("researcher", inputs.clone()),
+    )
+    .await
+    .expect("cached call timed out");
+    assert!(matches!(
+        cached_outcome,
+        CallOutcomeOrPark::Result(CallOutcome::Ok { .. })
+    ));
 
     let sandbox_root = tempfile::tempdir().unwrap();
     let workspaces = WorkspaceStore::new(sandbox_root.path()).unwrap();

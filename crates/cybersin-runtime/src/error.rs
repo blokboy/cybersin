@@ -13,6 +13,8 @@ pub enum RuntimeError {
     Trace(#[from] cybersin_trace::TraceError),
     #[error(transparent)]
     Dist(#[from] crate::dist::DistError),
+    #[error(transparent)]
+    RouteExecutor(#[from] crate::route_executor::RouteExecutorError),
     #[error("adapter transport error: {0}")]
     Transport(#[from] cybersin_adapter::channel::TransportError),
     #[error("sqlite error: {0}")]
