@@ -11,7 +11,8 @@ use assert_cmd::Command;
 use async_trait::async_trait;
 use cybersin_router::RouteModel;
 use cybersin_runtime::{
-    CacheEntry, DaemonHandle, ExecutionRequest, Judge, ModelCaller, ModelOutput, RouteExecutor,
+    default_model, CacheEntry, DaemonHandle, DistFixture, ExecutionRequest, Judge, ModelCaller,
+    ModelOutput, RouteExecutor,
 };
 use serde_json::{json, Value};
 
@@ -114,7 +115,11 @@ async fn real_sample_run_explain_and_optimize_share_observed_data() {
         .args(["--session-id", "ic5-observed", "--agent", "research-team"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("5 spans recorded"));
+        // The researcher prompt's real compiled cascade (issue #33) now
+        // genuinely escalates cheapest-first before settling on
+        // premium-high: 2 cache-decision + 4 llm-call (3 real cascade
+        // attempts for the miss + 1 hit) + 1 tool-call spans.
+        .stdout(predicates::str::contains("7 spans recorded"));
 
     // Accumulate judge-reviewed cache decisions through the real route
     // executor and the real IC-1 routing artifact. Similarity 0.96 lands
@@ -133,6 +138,16 @@ async fn real_sample_run_explain_and_optimize_share_observed_data() {
         embedding: vec![0.96, 0.28],
         response: json!({"summary": "cached evidence"}),
     });
+    // A cache hit is attributed to the prompt's default (highest-quality)
+    // model for span/cost labeling — a cache entry doesn't record which
+    // model originally produced it (see `route_executor::default_model`).
+    let researcher_default_model = DistFixture::load_dir(project.join("dist"))
+        .unwrap()
+        .routing_artifact
+        .prompts
+        .get("researcher")
+        .and_then(default_model)
+        .cloned();
     for sample in 0..20 {
         let response = executor
             .execute(&ExecutionRequest {
@@ -147,6 +162,12 @@ async fn real_sample_run_explain_and_optimize_share_observed_data() {
                 embedding: vec![1.0, 0.0],
                 namespace_version: "1".into(),
                 bypass: false,
+                prompt_tokens: 0,
+                completion_tokens: None,
+                evicted_sections: Vec::new(),
+                context_attributes: Value::Null,
+                force_cheapest_cascade_step: false,
+                default_model: researcher_default_model.clone(),
             })
             .await
             .unwrap();
@@ -179,7 +200,13 @@ async fn real_sample_run_explain_and_optimize_share_observed_data() {
         "cache ≥ 0.97; judge 0.90..0.97",
         "premium-high",
         "Estimated: $5.200000 per routed call",
-        "Observed: $4.000000 across 2 LLM calls",
+        // 4 real llm-call spans from the "ic5-observed" session (the
+        // real cascade's 3 escalation attempts + 1 cache hit, issue #33)
+        // plus 20 cache-hit spans from the PGO-seeding loop below, which
+        // also now records a real `llm_call` span per hit — a genuine
+        // prompt invocation, spec §8.5's "span per LLM call... cache
+        // status", even though no model was actually called.
+        "Observed: $5.200000 across 24 LLM calls",
         "ic5-observed  completed  research-team",
     ] {
         assert!(
@@ -202,11 +229,15 @@ async fn real_sample_run_explain_and_optimize_share_observed_data() {
 
     let report = fs::read_to_string(project.join("optimize-report.md")).unwrap();
     for expected in [
-        "Spans considered: 25",
+        // The real cascade's escalation spans (issue #33) and the PGO
+        // loop's now-genuine per-hit `llm_call` spans both land in the
+        // trace store, so the window covers more real spans and real
+        // accumulated cost than before.
+        "Spans considered: 47",
         "cache_similarity_threshold: 0.9700 -> 0.9560 (lowered)",
         "100.0% of judge calls",
         "Judge calls: 20, accept rate 100.0%",
-        "Observed cost in window: $4.000800",
+        "Observed cost in window: $5.200800",
         "`cybersin eval gate` remains the independent quality regression gate",
     ] {
         assert!(

@@ -50,7 +50,13 @@ async fn ic1_compiler_output_runs_through_the_real_daemon() {
     .unwrap();
 
     assert!(summary.completed);
-    assert_eq!(summary.spans_recorded, 5);
+    // The real `RouteExecutor` (issue #33) walks the researcher prompt's
+    // real compiled cascade cheapest-first for the miss: fast-low and
+    // balanced-medium are escalated past (their confidence doesn't clear
+    // `minimum_score`), settling on premium-high — 3 real model-call spans
+    // for the miss, not one — plus the repeat call's cache hit, plus the
+    // tool call and both cache-decision spans.
+    assert_eq!(summary.spans_recorded, 7);
     let llm_spans = spans
         .list(&SpanFilter {
             session_id: Some("ic2-real-dist".into()),
@@ -59,10 +65,23 @@ async fn ic1_compiler_output_runs_through_the_real_daemon() {
         })
         .await
         .unwrap();
-    assert_eq!(llm_spans.len(), 2);
+    assert_eq!(llm_spans.len(), 4);
     assert!(llm_spans
         .iter()
-        .all(|span| span.model.as_deref() == Some("premium-high")));
+        .any(|span| span.model.as_deref() == Some("fast-low")));
+    let miss_accept = llm_spans
+        .iter()
+        .find(|span| span.attributes["decision"] == "cascade_accept")
+        .expect("the cascade should settle on an accepted step");
+    assert_eq!(miss_accept.model.as_deref(), Some("premium-high"));
+    let hit = llm_spans
+        .iter()
+        .find(|span| span.cache_status == cybersin_trace::CacheStatus::Hit)
+        .expect("the repeat call should be a cache hit");
+    // A cache hit is attributed to the prompt's default (highest-quality)
+    // model — a cache entry doesn't record which model originally
+    // produced it.
+    assert_eq!(hit.model.as_deref(), Some("premium-high"));
     assert!(llm_spans.iter().any(|span| span.usd_cost > 0.0));
     assert!(llm_spans.iter().any(|span| span.usd_cost == 0.0));
 }

@@ -25,6 +25,7 @@ pub mod budget;
 pub mod daemon;
 pub mod dist;
 pub mod error;
+pub mod model_caller;
 pub mod orchestration;
 mod pg_storage;
 pub mod route_executor;
@@ -40,13 +41,15 @@ pub use dist::{
     bundled_stub_dist_dir, DistError, DistFixture, DistManifest, RoutingEntry, ToolPolicy,
 };
 pub use error::RuntimeError;
+pub use model_caller::{StubJudge, StubModelCaller};
 pub use orchestration::{
     Mail, OrchestrationError, Orchestrator, Worker, WorkerExit, DEFAULT_MAX_RESTARTS,
 };
 pub use pg_storage::PgStorage;
 pub use route_executor::{
-    cache_key, CacheArtifact, CacheEntry, ExecutionRequest, ExecutionResponse, Judge, KnnBackend,
-    ModelCaller, ModelOutput, RouteExecutor, RouteExecutorError, SQLITE_VEC_EVALUATION,
+    cache_key, default_model, CacheArtifact, CacheEntry, ExecutionRequest, ExecutionResponse,
+    Judge, KnnBackend, ModelCaller, ModelOutput, RouteExecutor, RouteExecutorError,
+    SQLITE_VEC_EVALUATION,
 };
 pub use sandbox_executor::RuntimeSandbox;
 pub use session::{estimate_tokens, RuntimeDaemon, RuntimeSessionSummary};

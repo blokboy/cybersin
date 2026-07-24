@@ -28,7 +28,12 @@ fn stub_run_then_trace_and_cost_show_real_data() {
         .success()
         .stdout(predicate::str::contains("cybersind: auto-starting"))
         .stdout(predicate::str::contains("sess-e2e completed"))
-        .stdout(predicate::str::contains("5 spans recorded"));
+        // The bundled stub fixture's `cascade.json` declares a cheaper
+        // "gpt-4o-nano" alternate ahead of the default "gpt-4o-mini": the
+        // real route executor (issue #33) now genuinely escalates past it
+        // before settling on the default — 2 real model-call spans for
+        // the miss, not one.
+        .stdout(predicate::str::contains("6 spans recorded"));
 
     assert!(
         db.exists(),
@@ -37,7 +42,7 @@ fn stub_run_then_trace_and_cost_show_real_data() {
 
     // `trace ls` sees the real spans this run recorded, scoped to the
     // session id.
-    cybersin()
+    let ls = cybersin()
         .arg("--db")
         .arg(&db)
         .arg("trace")
@@ -49,7 +54,22 @@ fn stub_run_then_trace_and_cost_show_real_data() {
         .stdout(predicate::str::contains("llm_call"))
         .stdout(predicate::str::contains("tool_call"))
         .stdout(predicate::str::contains("cache_decision"))
-        .stdout(predicate::str::contains("gpt-4o-mini"));
+        .stdout(predicate::str::contains("gpt-4o-mini"))
+        .get_output()
+        .stdout
+        .clone();
+    let ls = String::from_utf8(ls).unwrap();
+    // The real route executor (issue #33) writes `llm_call`/`cache_decision`
+    // spans with their own `route-<session>-<nanos>-<seq>` ids rather than
+    // the daemon's own `<session>:span-<n>` sequence (still used for tool
+    // calls only), so this test finds a real `llm_call` span id from `ls`
+    // instead of assuming a fixed one.
+    let llm_call_span_id = ls
+        .lines()
+        .find(|line| line.contains("llm_call") && line.contains("gpt-4o-mini"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("an llm_call span line with an id")
+        .to_string();
 
     // `trace show` on a specific span id returns real JSON with the
     // attributes spec §8.5 names.
@@ -58,7 +78,7 @@ fn stub_run_then_trace_and_cost_show_real_data() {
         .arg(&db)
         .arg("trace")
         .arg("show")
-        .arg("sess-e2e:span-2")
+        .arg(&llm_call_span_id)
         .assert()
         .success()
         .stdout(predicate::str::contains("\"usd_cost\""))
@@ -67,7 +87,10 @@ fn stub_run_then_trace_and_cost_show_real_data() {
         .stdout(predicate::str::contains("\"evicted_sections\""));
 
     // `cost --by <dim>` rolls this run's real spend up along every
-    // dimension the spec names.
+    // dimension the spec names. Total now includes the real cascade
+    // escalation's extra model-call cost (issue #33: gpt-4o-nano $0.000108
+    // + gpt-4o-mini $0.000432 + the tool call's $0.0008 = $0.001340),
+    // not just one flat per-request price.
     for dim in ["session", "agent", "model", "tool", "day"] {
         cybersin()
             .arg("--db")
@@ -78,7 +101,7 @@ fn stub_run_then_trace_and_cost_show_real_data() {
             .assert()
             .success()
             .stdout(predicate::str::contains("TOTAL"))
-            .stdout(predicate::str::contains("0.001245").or(predicate::str::contains("0.000")));
+            .stdout(predicate::str::contains("0.001340").or(predicate::str::contains("0.000")));
     }
 
     // Cost by model specifically names the model this run priced.

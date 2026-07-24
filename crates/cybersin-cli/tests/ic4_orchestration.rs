@@ -70,8 +70,16 @@ async fn real_multi_agent_tree_survives_worker_crash_and_coordinates_under_budge
     let supervisor = SessionSupervisor::with_session_sandbox(storage.clone(), workspaces.clone());
     let orchestration = Arc::new(Orchestrator::with_supervisor(storage.clone(), supervisor));
 
+    // The researcher prompt's real compiled cascade (issue #33) now
+    // genuinely escalates cheapest-first — fast-low ($0.2) and
+    // balanced-medium ($1.0) are both attempted and paid for before
+    // settling on premium-high ($4.0), for a real accumulated cost of
+    // $5.2 per call, not just the single accepted step's price. The
+    // researcher child's budget slice (and the parent ceiling, exactly
+    // the sum of both children's slices so the "over ceiling" spawn
+    // below still has zero headroom to work with) is sized accordingly.
     orchestration
-        .register_parent(parent_id, "research-supervisor", 10.0)
+        .register_parent(parent_id, "research-supervisor", 11.0)
         .await
         .unwrap();
     orchestration
@@ -83,7 +91,7 @@ async fn real_multi_agent_tree_survives_worker_crash_and_coordinates_under_budge
                 "prompt": "researcher",
                 "config_hash": dist.manifest.build_hash,
             }),
-            5.0,
+            6.0,
             Some(2),
         )
         .await
