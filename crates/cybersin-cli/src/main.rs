@@ -150,6 +150,10 @@ enum Command {
         #[command(subcommand)]
         command: SandboxCommand,
     },
+    /// Profile-guided optimization (spec §9): re-derive cache/judge
+    /// routing thresholds from observed trace data and emit a normal
+    /// build plus `optimize-report.md`.
+    Optimize(commands::optimize::OptimizeArgs),
 }
 
 #[derive(Subcommand)]
@@ -209,6 +213,7 @@ async fn main() -> ExitCode {
             SandboxCommand::Diff(args) => from_sync(commands::sandbox::diff(args)),
             SandboxCommand::Restore(args) => from_sync(commands::sandbox::restore(args)),
         },
+        Command::Optimize(args) => from_async(commands::optimize::execute(cli.db, args).await),
     }
 }
 
