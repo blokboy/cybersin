@@ -72,7 +72,10 @@ impl Orchestrator {
     }
 
     pub fn with_supervisor(storage: Arc<dyn Storage>, supervisor: SessionSupervisor) -> Self {
-        Self { storage, supervisor }
+        Self {
+            storage,
+            supervisor,
+        }
     }
 
     pub async fn register_parent(

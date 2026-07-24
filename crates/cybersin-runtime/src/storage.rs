@@ -105,7 +105,9 @@ pub enum CasOutcome {
     /// row's actual version at the moment the constrained statement ran.
     /// `actual` is a best-effort follow-up read for the caller's retry —
     /// it is not part of the atomic decision itself.
-    Stale { actual: Option<i64> },
+    Stale {
+        actual: Option<i64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
