@@ -10,7 +10,7 @@ use std::sync::Arc;
 use cybersin_adapter::messages::CallOutcome;
 use cybersin_adapter::stub_harness::{CallOutcomeOrPark, StubHarness};
 use cybersin_adapter::transport::stdio::in_memory_pair;
-use cybersin_gateway::{ApprovalGate, EchoExecutor, GatewayOutcome, RetryClass, ToolGateway};
+use cybersin_gateway::{EchoExecutor, GatewayOutcome, RetryClass, ToolGateway};
 use cybersin_runtime::{
     stub_agent, BudgetConfig, DaemonHandle, DistFixture, OnBreach, RuntimeDaemon,
     SessionSupervisor, Storage,
@@ -191,38 +191,45 @@ async fn real_compiled_route_degrades_to_its_cheapest_cascade_step() {
     assert_eq!(llm_spans[0].model.as_deref(), Some("fast-low"));
 }
 
+/// Issue #31: `publish_report`'s `class: critical` / `approval: required`
+/// policy is read from the *real compiled* `dist/tools.json` — via
+/// `dist.tool_policy`, the same lookup `RuntimeDaemon::handle_tool_request`
+/// uses — and the parking scenario is driven through that real daemon over
+/// the wire, not through a hand-built `ToolGateway` + `ApprovalGate`
+/// standing in for it.
 #[tokio::test]
 async fn real_projects_critical_tool_parks_and_resumes_on_approval() {
-    let agent_source =
-        std::fs::read_to_string(project_root().join("agents/research-team.agent.yaml")).unwrap();
-    assert!(agent_source.contains("name: publish_report"));
-    assert!(agent_source.contains("class: critical"));
-    assert!(agent_source.contains("approval: required"));
+    let dist = compiled_dist();
+    let policy = dist
+        .tool_policy("publish_report")
+        .expect("compiled dist/tools.json must declare publish_report's policy");
+    assert!(policy.requires_approval());
+    assert_eq!(policy.retry_class, "critical");
 
     let storage: Arc<dyn Storage> =
         Arc::new(cybersin_runtime::SqliteStorage::in_memory().await.unwrap());
-    storage
-        .create_session_pinned(
-            "ic2-approval",
-            "research-team",
-            &compiled_dist().manifest.build_hash,
-        )
-        .await
-        .unwrap();
-    let gateway = ToolGateway::new(storage.clone(), Arc::new(EchoExecutor))
-        .with_policy_hook(Arc::new(ApprovalGate::for_tools(["publish_report"])));
-    let parked = gateway
-        .call(
-            "ic2-approval",
-            "publish_report",
-            json!({"report": "evidence-backed"}),
-            None,
-            RetryClass::Critical,
-        )
-        .await
-        .unwrap();
-    let approval_id = match parked {
-        GatewayOutcome::Parked { approval_id, .. } => approval_id,
+    let spans = SpanStore::in_memory().await.unwrap();
+
+    let (harness_io, daemon_io) = in_memory_pair();
+    let mut daemon = RuntimeDaemon::new(
+        daemon_io,
+        storage.clone(),
+        spans,
+        dist,
+        "ic2-approval",
+        "research-team",
+    );
+    daemon.start_session(researcher_inputs()).await.unwrap();
+    let daemon_task = tokio::spawn(daemon.run());
+
+    let mut harness = StubHarness::new(harness_io);
+    harness.recv_session_start().await;
+
+    let (call_id, outcome) = harness
+        .tool_request("publish_report", json!({"report": "evidence-backed"}), None)
+        .await;
+    let approval_id = match outcome {
+        CallOutcomeOrPark::Parked(approval_id) => approval_id,
         other => panic!("critical project tool should park, got {other:?}"),
     };
     assert_eq!(
@@ -235,12 +242,28 @@ async fn real_projects_critical_tool_parks_and_resumes_on_approval() {
         "awaiting_approval"
     );
 
-    let resumed_gateway = ToolGateway::new(storage.clone(), Arc::new(EchoExecutor));
-    let resumed = resumed_gateway.approve(&approval_id).await.unwrap();
+    // Simulate `cybersin approve <call-id>` issued from a separate
+    // process: a fresh gateway bound to the same durable storage, exactly
+    // as `park_for_approval`'s doc comment describes.
+    let approving_gateway = ToolGateway::new(storage.clone(), Arc::new(EchoExecutor));
+    let resumed = approving_gateway.approve(&approval_id).await.unwrap();
     assert!(matches!(
         resumed,
         GatewayOutcome::Resolved(CallOutcome::Ok { .. })
     ));
+
+    let result = harness.await_result(&call_id).await;
+    assert!(matches!(
+        result,
+        CallOutcomeOrPark::Result(CallOutcome::Ok { .. })
+    ));
+
+    harness
+        .session_complete("ic2-approval", json!({"status": "ok"}))
+        .await;
+    harness.wait_for_close().await;
+    daemon_task.await.unwrap().unwrap();
+
     assert_eq!(
         storage
             .get_session("ic2-approval")
@@ -248,7 +271,7 @@ async fn real_projects_critical_tool_parks_and_resumes_on_approval() {
             .unwrap()
             .unwrap()
             .status,
-        "running"
+        "completed"
     );
     assert_eq!(
         storage
