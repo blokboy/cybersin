@@ -174,4 +174,86 @@ mod tests {
         let by_day = spans.cost_rollup(CostDimension::Day).await.unwrap();
         assert_eq!(by_day.len(), 1);
     }
+
+    /// End-to-end coverage for issue #16: a real `llm.request` driven
+    /// through `RuntimeDaemon`, carrying a live context section via
+    /// `inputs.__live_context`, produces an `llm_call` span whose
+    /// `evicted_sections`/`attributes` record both the live and compiled
+    /// drops the context assembler made (spec §8.3a).
+    #[tokio::test]
+    async fn stub_session_records_live_and_compiled_evictions_as_span_attributes() {
+        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let dist = Arc::new(DistFixture::load_dir(bundled_stub_dist_dir()).unwrap());
+
+        let (harness_io, daemon_io) = in_memory_pair();
+        let session_id = "sess-live-context-1".to_string();
+        let mut daemon = RuntimeDaemon::new(
+            daemon_io,
+            storage.clone(),
+            spans.clone(),
+            dist,
+            session_id.clone(),
+            "research-agent",
+        );
+
+        // Fixture budget: context_window 40 - reserved 10 = 30 available.
+        // Compiled total is 41 (role 10 + instructions 12 + documents 19).
+        // Adding a 5-token live "memory" section (lowest priority of all,
+        // so it's shed first) brings the total to 46. Dropping the live
+        // section alone (46 - 5 = 41) still isn't enough, so the compiled
+        // plan's own eviction of "documents" also runs (41 - 19 = 22),
+        // landing under the 30-token budget.
+        let inputs = json!({
+            "topic": "cybernetics",
+            "depth": "quick",
+            "documents": [],
+            "__live_context": [
+                { "id": "memory", "priority": 5, "body": "one two three four five" }
+            ],
+        });
+
+        daemon.start_session(inputs.clone()).await.unwrap();
+        let daemon_task = tokio::spawn(daemon.run());
+
+        let mut harness = StubHarness::new(harness_io);
+        let (_sid, _inputs, _resume) = harness.recv_session_start().await;
+        harness.llm_request("researcher", inputs).await;
+        harness
+            .session_complete(&session_id, json!({ "status": "ok" }))
+            .await;
+        harness.wait_for_close().await;
+
+        let summary = daemon_task
+            .await
+            .map_err(|e| RuntimeError::Join(e.to_string()))
+            .unwrap()
+            .unwrap();
+        assert!(summary.completed);
+
+        let recorded = spans
+            .list(&SpanFilter {
+                session_id: Some(session_id.clone()),
+                kind: Some(SpanKind::LlmCall),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(recorded.len(), 1);
+        let span = &recorded[0];
+
+        assert_eq!(
+            span.evicted_sections,
+            vec!["memory".to_string(), "documents".to_string()]
+        );
+        assert_eq!(span.tokens_prompt, Some(22));
+
+        let context_attrs = &span.attributes["context"];
+        assert_eq!(context_attrs["target"], "generic");
+        assert_eq!(
+            context_attrs["included_sections"],
+            json!(["role", "instructions"])
+        );
+        assert_eq!(context_attrs["evicted_live_sections"], json!(["memory"]));
+    }
 }

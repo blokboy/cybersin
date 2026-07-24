@@ -8,12 +8,12 @@
 //! routed from a hand-written [`crate::dist::DistFixture`] (spec §14's M1:
 //! "stub agent runs on a hand-written dist/").
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use cybersin_adapter::channel::DaemonChannel;
 use cybersin_adapter::messages::{CallOutcome, DaemonMessage, HarnessMessage};
-use cybersin_ir::{BudgetArtifact, PromptIr};
+use cybersin_ir::{BudgetArtifact, BudgetPlan, PromptIr, Section};
 use cybersin_trace::{CacheStatus, Span, SpanKind, SpanStatus, SpanStore};
 use serde_json::Value;
 
@@ -29,53 +29,218 @@ pub fn estimate_tokens(text: &str) -> u32 {
     text.split_whitespace().count().max(1) as u32
 }
 
-/// Fill `prompt`'s sections in priority order and evict per `budget`
-/// (spec §8.3a: "fills sections in priority order, evicts per plan when
-/// over the target's token budget") once the assembled size exceeds the
-/// target's available budget. Returns `(evicted_section_ids,
-/// tokens_after_eviction)`.
+/// Reserved key inside `HarnessMessage::LlmRequest::inputs` carrying live,
+/// call-time-only context (spec §8.3a: "retrieved documents, memory,
+/// conversation") — a JSON array shaped exactly like [`Section`] (`{id,
+/// priority, body}`).
 ///
-/// This is a deliberately small stand-in for the real context assembler:
-/// it has exactly one render target's worth of logic (whichever
-/// `BudgetPlan` is named `"generic"`, or the first plan if none is) and no
-/// live retrieved-document/memory/conversation inputs to fold in — sections
-/// straight from the compiled `PromptIr` are the whole context.
-fn assemble_context(prompt: &PromptIr, budget: Option<&BudgetArtifact>) -> (Vec<String>, u32) {
-    let tokens_by_section: BTreeMap<&str, u32> = prompt
-        .sections
-        .iter()
-        .map(|s| (s.id.as_str(), estimate_tokens(&s.body)))
-        .collect();
-    let total: u32 = tokens_by_section.values().sum();
+/// `inputs: Value` is today's only source of call-time data on the wire
+/// (`cybersin_adapter::messages::HarnessMessage::LlmRequest`); rather than
+/// growing the protocol with a new field, live sections travel inside the
+/// existing `inputs` object under this key. A harness that never sends one
+/// (every `inputs` shape before this issue) folds in zero live sections
+/// and behaves exactly as the stand-in assembler did.
+const LIVE_CONTEXT_KEY: &str = "__live_context";
 
-    let plan = budget.and_then(|b| {
+/// Pull the live, call-time-only sections out of an `llm.request`'s
+/// `inputs` (see [`LIVE_CONTEXT_KEY`]). Absent or malformed entries just
+/// mean no live sections — this never fails the call.
+fn extract_live_sections(inputs: &Value) -> Vec<Section> {
+    inputs
+        .get(LIVE_CONTEXT_KEY)
+        .and_then(|v| serde_json::from_value::<Vec<Section>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Where one section folded into context assembly came from: straight
+/// from the compiled `PromptIr::sections`, or a live section folded in via
+/// [`extract_live_sections`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SectionSource {
+    Compiled,
+    Live,
+}
+
+#[derive(Debug, Clone)]
+struct SectionEntry {
+    priority: u32,
+    tokens: u32,
+    source: SectionSource,
+}
+
+/// Result of one `assemble_context` run: enough detail for the caller to
+/// price the call and record what got dropped as span attributes (spec
+/// §8.3a).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AssembledContext {
+    /// Final token count after eviction (or the full total, if nothing
+    /// needed to evict).
+    pub prompt_tokens: u32,
+    /// Every dropped section's id, in the order it was dropped: live
+    /// sections first (ascending priority — see this function's doc
+    /// comment for why), then compiled sections per the compiled plan's
+    /// own `eviction_order`. This is what lands in `Span::evicted_sections`
+    /// verbatim.
+    pub evicted_sections: Vec<String>,
+    /// The subset of `evicted_sections` that were live sections rather
+    /// than compiled ones. `Span::evicted_sections` itself doesn't
+    /// distinguish source, so this is carried separately for the
+    /// `llm.call` span's `attributes` — compiled-vs-live is inspectable
+    /// in `cybersin trace show` without a schema change to `Span`.
+    pub evicted_live_sections: Vec<String>,
+    /// Every section that made it into the final context, in fill order:
+    /// priority descending, ties broken by insertion order (compiled
+    /// sections in `PromptIr` order, then live sections in `inputs` order)
+    /// — spec §8.3a's "fills sections in priority order".
+    pub included_sections: Vec<String>,
+}
+
+/// Pick the `BudgetPlan` matching `target`, falling back to a plan named
+/// `"generic"` and then to the first plan if `target` itself has no exact
+/// match — the same fallback the stand-in assembler used unconditionally,
+/// now only reached once exact-target matching has had a chance.
+fn resolve_plan<'a>(budget: Option<&'a BudgetArtifact>, target: &str) -> Option<&'a BudgetPlan> {
+    budget.and_then(|b| {
         b.plans
             .iter()
-            .find(|p| p.target == "generic")
+            .find(|p| p.target == target)
+            .or_else(|| b.plans.iter().find(|p| p.target == "generic"))
             .or_else(|| b.plans.first())
-    });
-    let Some(plan) = plan else {
-        return (Vec::new(), total);
+    })
+}
+
+/// Assemble the final context for one `llm.request` (spec §8.3a): fold the
+/// compiled prompt's sections and `live_sections` (retrieved
+/// documents/memory/conversation, folded in from `inputs` — see
+/// [`extract_live_sections`]) into one priority-ordered fill list, then —
+/// only if the assembled size exceeds `target`'s available budget in
+/// `budget` — evict down to fit.
+///
+/// Compile time authors the eviction *policy* for sections it knew about
+/// (`BudgetPlan::eviction_order`); it has no opinion about live sections,
+/// since those only exist at call time. So eviction runs in two phases:
+///
+/// 1. **Live sections first**, lowest priority first. They're extra
+///    weight the compiled plan never priced in, so all of it is shed
+///    before the compiled policy is touched at all.
+/// 2. **Compiled sections**, per `eviction_order`, unchanged from the
+///    stand-in assembler's logic (already correct per this issue's scope).
+///
+/// A compiled section not named in `eviction_order` is never evicted,
+/// budget or no budget — same as before. With no matching budget plan at
+/// all, nothing evicts (no plan means no policy to execute).
+fn assemble_context(
+    prompt: &PromptIr,
+    live_sections: &[Section],
+    budget: Option<&BudgetArtifact>,
+    target: &str,
+) -> AssembledContext {
+    // Compiled sections first, live sections after: on an id collision,
+    // the live section wins (last insertion wins) — a harness can
+    // deliberately shadow a compiled placeholder section with live
+    // content by reusing its id.
+    let mut fill_order: Vec<String> = Vec::new();
+    let mut entries: HashMap<String, SectionEntry> = HashMap::new();
+    for s in &prompt.sections {
+        if !entries.contains_key(&s.id) {
+            fill_order.push(s.id.clone());
+        }
+        entries.insert(
+            s.id.clone(),
+            SectionEntry {
+                priority: s.priority,
+                tokens: estimate_tokens(&s.body),
+                source: SectionSource::Compiled,
+            },
+        );
+    }
+    for s in live_sections {
+        if !entries.contains_key(&s.id) {
+            fill_order.push(s.id.clone());
+        }
+        entries.insert(
+            s.id.clone(),
+            SectionEntry {
+                priority: s.priority,
+                tokens: estimate_tokens(&s.body),
+                source: SectionSource::Live,
+            },
+        );
+    }
+
+    // Priority-order fill: stable sort keeps the compiled-then-live
+    // insertion order as the tiebreak at equal priority.
+    fill_order.sort_by_key(|id| std::cmp::Reverse(entries[id].priority));
+    let total: u32 = entries.values().map(|e| e.tokens).sum();
+
+    let Some(plan) = resolve_plan(budget, target) else {
+        return AssembledContext {
+            prompt_tokens: total,
+            evicted_sections: Vec::new(),
+            evicted_live_sections: Vec::new(),
+            included_sections: fill_order,
+        };
     };
     let available = plan
         .context_window_tokens
         .saturating_sub(plan.reserved_output_tokens);
     if total <= available {
-        return (Vec::new(), total);
+        return AssembledContext {
+            prompt_tokens: total,
+            evicted_sections: Vec::new(),
+            evicted_live_sections: Vec::new(),
+            included_sections: fill_order,
+        };
     }
 
-    let mut evicted = Vec::new();
     let mut remaining = total;
+    let mut evicted_sections = Vec::new();
+    let mut evicted_live_sections = Vec::new();
+    let mut evicted: HashSet<String> = HashSet::new();
+
+    // Phase 1: live sections, lowest priority first.
+    let mut live_ids: Vec<&String> = fill_order
+        .iter()
+        .filter(|id| entries[*id].source == SectionSource::Live)
+        .collect();
+    live_ids.sort_by_key(|id| entries[*id].priority);
+    for id in live_ids {
+        if remaining <= available {
+            break;
+        }
+        remaining = remaining.saturating_sub(entries[id].tokens);
+        evicted_sections.push(id.clone());
+        evicted_live_sections.push(id.clone());
+        evicted.insert(id.clone());
+    }
+
+    // Phase 2: compiled sections, per the compiled plan's own eviction
+    // order — identical to the stand-in assembler's logic.
     for step in &plan.eviction_order {
         if remaining <= available {
             break;
         }
-        if let Some(t) = tokens_by_section.get(step.section_id.as_str()) {
-            remaining = remaining.saturating_sub(*t);
-            evicted.push(step.section_id.clone());
+        if evicted.contains(&step.section_id) {
+            continue;
+        }
+        if let Some(entry) = entries.get(&step.section_id) {
+            remaining = remaining.saturating_sub(entry.tokens);
+            evicted_sections.push(step.section_id.clone());
+            evicted.insert(step.section_id.clone());
         }
     }
-    (evicted, remaining)
+
+    let included_sections: Vec<String> = fill_order
+        .into_iter()
+        .filter(|id| !evicted.contains(id))
+        .collect();
+
+    AssembledContext {
+        prompt_tokens: remaining,
+        evicted_sections,
+        evicted_live_sections,
+        included_sections,
+    }
 }
 
 fn now_unix_ms() -> i64 {
@@ -366,7 +531,9 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         )
         .await?;
 
-        let (evicted, prompt_tokens) = assemble_context(&prompt, budget.as_ref());
+        let live_sections = extract_live_sections(&inputs);
+        let assembled = assemble_context(&prompt, &live_sections, budget.as_ref(), &routing.target);
+        let prompt_tokens = assembled.prompt_tokens;
 
         let (completion_tokens, usd_cost, response_value) = match cache_status {
             CacheStatus::Hit => {
@@ -395,8 +562,15 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             usd_cost,
             cache_status,
             0,
-            evicted.clone(),
-            serde_json::json!({ "inputs": inputs }),
+            assembled.evicted_sections.clone(),
+            serde_json::json!({
+                "inputs": inputs,
+                "context": {
+                    "target": routing.target,
+                    "included_sections": assembled.included_sections,
+                    "evicted_live_sections": assembled.evicted_live_sections,
+                },
+            }),
         )
         .await?;
 
@@ -411,7 +585,8 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                     "usd_cost": usd_cost,
                     "tokens_prompt": prompt_tokens,
                     "tokens_completion": completion_tokens,
-                    "evicted_sections": evicted,
+                    "evicted_sections": assembled.evicted_sections,
+                    "evicted_live_sections": assembled.evicted_live_sections,
                     "response": response_value,
                 }),
             )
@@ -524,7 +699,8 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cybersin_ir::{BudgetPlan, EvictionStep, Section};
+    use cybersin_ir::EvictionStep;
+    use std::collections::BTreeMap;
 
     fn sample_prompt() -> PromptIr {
         PromptIr::new(
@@ -557,51 +733,178 @@ mod tests {
         assert_eq!(estimate_tokens("solo"), 1);
     }
 
-    #[test]
-    fn assemble_context_keeps_everything_under_budget() {
-        let prompt = sample_prompt();
-        let budget = BudgetArtifact {
+    fn generic_budget(context_window_tokens: u32, reserved_output_tokens: u32) -> BudgetArtifact {
+        BudgetArtifact {
             prompt_name: "researcher".to_string(),
             plans: vec![BudgetPlan {
                 target: "generic".to_string(),
-                context_window_tokens: 100,
-                reserved_output_tokens: 10,
+                context_window_tokens,
+                reserved_output_tokens,
                 eviction_order: vec![EvictionStep {
                     section_id: "documents".to_string(),
-                    evict_at_tokens: 50,
+                    evict_at_tokens: 6,
                 }],
             }],
-        };
-        let (evicted, tokens) = assemble_context(&prompt, Some(&budget));
-        assert!(evicted.is_empty());
-        assert_eq!(tokens, 15); // 5 + 10, nothing evicted
+        }
+    }
+
+    #[test]
+    fn assemble_context_keeps_everything_under_budget() {
+        let prompt = sample_prompt();
+        let budget = generic_budget(100, 10);
+        let assembled = assemble_context(&prompt, &[], Some(&budget), "generic");
+        assert!(assembled.evicted_sections.is_empty());
+        assert_eq!(assembled.prompt_tokens, 15); // 5 + 10, nothing evicted
+        assert_eq!(
+            assembled.included_sections,
+            vec!["role".to_string(), "documents".to_string()]
+        );
     }
 
     #[test]
     fn assemble_context_evicts_lowest_priority_first_over_budget() {
         let prompt = sample_prompt();
+        let budget = generic_budget(10, 4); // available = 6, total = 15
+        let assembled = assemble_context(&prompt, &[], Some(&budget), "generic");
+        assert_eq!(assembled.evicted_sections, vec!["documents".to_string()]);
+        assert!(assembled.evicted_live_sections.is_empty());
+        assert_eq!(assembled.prompt_tokens, 5); // just "role" left
+        assert_eq!(assembled.included_sections, vec!["role".to_string()]);
+    }
+
+    #[test]
+    fn assemble_context_with_no_budget_never_evicts() {
+        let prompt = sample_prompt();
+        let assembled = assemble_context(&prompt, &[], None, "generic");
+        assert!(assembled.evicted_sections.is_empty());
+        assert_eq!(assembled.prompt_tokens, 15);
+        assert_eq!(
+            assembled.included_sections,
+            vec!["role".to_string(), "documents".to_string()]
+        );
+    }
+
+    #[test]
+    fn assemble_context_folds_live_sections_into_priority_order_fill() {
+        // priority 100(role) > 70(live "memory") > 50(documents): the live
+        // section should slot between the two compiled ones in fill order.
+        let prompt = sample_prompt();
+        let live = vec![Section {
+            id: "memory".to_string(),
+            priority: 70,
+            body: "k l m".to_string(), // 3 tokens
+            dedup_ref: None,
+        }];
+        let budget = generic_budget(100, 10); // available = 90, well under total
+        let assembled = assemble_context(&prompt, &live, Some(&budget), "generic");
+        assert!(assembled.evicted_sections.is_empty());
+        assert_eq!(assembled.prompt_tokens, 18); // 5 + 3 + 10
+        assert_eq!(
+            assembled.included_sections,
+            vec![
+                "role".to_string(),
+                "memory".to_string(),
+                "documents".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn assemble_context_evicts_live_sections_before_compiled_ones() {
+        // total = 5 (role) + 3 (live "memory", priority 10 - lowest) + 10
+        // (documents) = 18; available = 6 - 4 = ... use a budget that only
+        // needs the live section dropped to fit.
+        let prompt = sample_prompt();
+        let live = vec![Section {
+            id: "memory".to_string(),
+            priority: 10,              // lower priority than "documents" (50)
+            body: "k l m".to_string(), // 3 tokens
+            dedup_ref: None,
+        }];
         let budget = BudgetArtifact {
             prompt_name: "researcher".to_string(),
             plans: vec![BudgetPlan {
                 target: "generic".to_string(),
-                context_window_tokens: 10,
-                reserved_output_tokens: 4, // available = 6, total = 15
+                context_window_tokens: 20,
+                reserved_output_tokens: 5, // available = 15, total = 18
                 eviction_order: vec![EvictionStep {
                     section_id: "documents".to_string(),
                     evict_at_tokens: 6,
                 }],
             }],
         };
-        let (evicted, tokens) = assemble_context(&prompt, Some(&budget));
-        assert_eq!(evicted, vec!["documents".to_string()]);
-        assert_eq!(tokens, 5); // just "role" left
+        let assembled = assemble_context(&prompt, &live, Some(&budget), "generic");
+        // Dropping the 3-token live section alone (18 - 3 = 15) is enough
+        // to fit, so the compiled "documents" section, despite being
+        // lower priority than "role", is never touched.
+        assert_eq!(assembled.evicted_sections, vec!["memory".to_string()]);
+        assert_eq!(assembled.evicted_live_sections, vec!["memory".to_string()]);
+        assert_eq!(assembled.prompt_tokens, 15);
+        assert_eq!(
+            assembled.included_sections,
+            vec!["role".to_string(), "documents".to_string()]
+        );
     }
 
     #[test]
-    fn assemble_context_with_no_budget_never_evicts() {
+    fn assemble_context_falls_through_to_compiled_eviction_after_live_sections_exhausted() {
+        // Dropping the live section alone isn't enough; the compiled plan's
+        // own eviction_order still runs afterward.
         let prompt = sample_prompt();
-        let (evicted, tokens) = assemble_context(&prompt, None);
-        assert!(evicted.is_empty());
-        assert_eq!(tokens, 15);
+        let live = vec![Section {
+            id: "memory".to_string(),
+            priority: 10,
+            body: "k l m".to_string(), // 3 tokens
+            dedup_ref: None,
+        }];
+        let budget = generic_budget(10, 4); // available = 6, total = 18
+        let assembled = assemble_context(&prompt, &live, Some(&budget), "generic");
+        assert_eq!(
+            assembled.evicted_sections,
+            vec!["memory".to_string(), "documents".to_string()]
+        );
+        assert_eq!(assembled.evicted_live_sections, vec!["memory".to_string()]);
+        assert_eq!(assembled.prompt_tokens, 5); // just "role" left
+        assert_eq!(assembled.included_sections, vec!["role".to_string()]);
+    }
+
+    #[test]
+    fn assemble_context_picks_the_plan_matching_the_calls_target() {
+        let prompt = sample_prompt();
+        let budget = BudgetArtifact {
+            prompt_name: "researcher".to_string(),
+            plans: vec![
+                BudgetPlan {
+                    target: "generic".to_string(),
+                    context_window_tokens: 100,
+                    reserved_output_tokens: 10, // available = 90: nothing evicts
+                    eviction_order: vec![EvictionStep {
+                        section_id: "documents".to_string(),
+                        evict_at_tokens: 6,
+                    }],
+                },
+                BudgetPlan {
+                    target: "openai".to_string(),
+                    context_window_tokens: 10,
+                    reserved_output_tokens: 4, // available = 6: documents evicts
+                    eviction_order: vec![EvictionStep {
+                        section_id: "documents".to_string(),
+                        evict_at_tokens: 6,
+                    }],
+                },
+            ],
+        };
+
+        let generic = assemble_context(&prompt, &[], Some(&budget), "generic");
+        assert!(generic.evicted_sections.is_empty());
+
+        let openai = assemble_context(&prompt, &[], Some(&budget), "openai");
+        assert_eq!(openai.evicted_sections, vec!["documents".to_string()]);
+
+        // An unknown target falls back to the "generic" plan rather than
+        // the first plan in the list (which happens to also be "generic"
+        // here, but the fallback is by name, not position).
+        let unknown = assemble_context(&prompt, &[], Some(&budget), "anthropic");
+        assert!(unknown.evicted_sections.is_empty());
     }
 }
