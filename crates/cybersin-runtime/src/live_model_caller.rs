@@ -13,11 +13,21 @@
 //! runtime consumes artifacts, not sources") — `minijinja` itself is a
 //! plain third-party template engine, not a dependency on the compiler.
 //!
-//! A real model has no built-in notion of the `confidence` score
+//! A real model has no built-in notion of the confidence score
 //! `RouteExecutor`'s cascade needs to decide whether to escalate — so
-//! every request's structured output contract gets a `confidence` field
-//! injected (or, if the prompt declared no contract, a minimal envelope
-//! that still asks for one), and the model self-reports it.
+//! every request's structured output contract gets a `__cascade_confidence`
+//! field injected (or, if the prompt declared no contract, a minimal
+//! envelope that still asks for one), and the model self-reports it. The
+//! `__`-prefixed name is deliberate and load-bearing, mirroring
+//! `session.rs`'s `__live_context` reserved-key convention: a prompt's own
+//! `output_contract` schema is free to declare its own domain-meaningful
+//! `confidence` field (research-team's `report.json` fragment does exactly
+//! this, as a qualitative `low`/`medium`/`high` enum) without colliding
+//! with the routing layer's numeric self-report. An earlier, unprefixed
+//! `confidence` key silently overwrote any such field via a plain
+//! `properties_obj.insert` — first surfaced by live-testing against a real
+//! prompt with a real model, since no synthetic/`--stub` dist ever
+//! exercised a real structured-output round trip against this code path.
 //!
 //! Gateway failover (Vercel AI Gateway, then a self-hosted LiteLLM proxy,
 //! if OpenRouter itself is unreachable) is deliberately not implemented
@@ -111,10 +121,19 @@ fn render_template(body: &str, inputs: &Value) -> Result<String, minijinja::Erro
     template.render(inputs)
 }
 
-/// Merge a self-reported `confidence` requirement into a structured
-/// output contract's JSON schema — or, if the prompt declared none,
-/// synthesize a minimal envelope that still asks for one. This is the
-/// only route to a real cascade confidence signal (this module's doc).
+/// Reserved key for the cascade's self-reported confidence signal —
+/// `__`-prefixed and namespaced away from `confidence`, exactly like
+/// `session.rs`'s `LIVE_CONTEXT_KEY`, so a prompt's own `output_contract`
+/// schema can declare a domain-meaningful field literally named
+/// `confidence` (research-team's `report.json` fragment does) without it
+/// being silently overwritten by this module's routing-layer signal.
+const CASCADE_CONFIDENCE_KEY: &str = "__cascade_confidence";
+
+/// Merge a self-reported [`CASCADE_CONFIDENCE_KEY`] requirement into a
+/// structured output contract's JSON schema — or, if the prompt declared
+/// none, synthesize a minimal envelope that still asks for one. This is
+/// the only route to a real cascade confidence signal (this module's
+/// doc).
 fn response_format_with_confidence(rendered: &RenderedPrompt) -> Result<Value, String> {
     let mut format = rendered.response_format.clone().unwrap_or_else(|| {
         json!({
@@ -137,7 +156,7 @@ fn response_format_with_confidence(rendered: &RenderedPrompt) -> Result<Value, S
         .as_object_mut()
         .ok_or_else(|| "output_contract schema `properties` must be a JSON object".to_string())?;
     properties_obj.insert(
-        "confidence".to_string(),
+        CASCADE_CONFIDENCE_KEY.to_string(),
         json!({"type": "number", "minimum": 0, "maximum": 1}),
     );
     let required_arr = schema_obj
@@ -145,8 +164,11 @@ fn response_format_with_confidence(rendered: &RenderedPrompt) -> Result<Value, S
         .or_insert_with(|| json!([]))
         .as_array_mut()
         .ok_or_else(|| "output_contract schema `required` must be a JSON array".to_string())?;
-    if !required_arr.iter().any(|value| value == "confidence") {
-        required_arr.push(json!("confidence"));
+    if !required_arr
+        .iter()
+        .any(|value| value == CASCADE_CONFIDENCE_KEY)
+    {
+        required_arr.push(json!(CASCADE_CONFIDENCE_KEY));
     }
     Ok(format)
 }
@@ -211,14 +233,22 @@ impl ModelCaller for OpenRouterModelCaller {
                     model.name
                 )
             })?;
-        let parsed: Value = serde_json::from_str(content).map_err(|error| {
+        let mut parsed: Value = serde_json::from_str(content).map_err(|error| {
             format!(
                 "model {} did not return valid JSON matching its output contract: {error}",
                 model.name
             )
         })?;
+        // Extract, then strip, the reserved routing-layer field: it's
+        // internal cascade bookkeeping, not part of the prompt's own
+        // domain response — a harness reading `ModelOutput.response`
+        // should see exactly what the prompt's own `output_contract`
+        // promised, nothing extra (and, per `CASCADE_CONFIDENCE_KEY`'s
+        // doc, that promise is free to include its own unrelated
+        // `confidence` field without this one ever having collided with
+        // it in the first place).
         let confidence = parsed
-            .get("confidence")
+            .get(CASCADE_CONFIDENCE_KEY)
             .and_then(Value::as_f64)
             .ok_or_else(|| {
                 format!(
@@ -226,6 +256,9 @@ impl ModelCaller for OpenRouterModelCaller {
                     model.name
                 )
             })?;
+        if let Some(obj) = parsed.as_object_mut() {
+            obj.remove(CASCADE_CONFIDENCE_KEY);
+        }
 
         Ok(ModelOutput {
             response: parsed,
@@ -308,7 +341,7 @@ mod tests {
                 "choices": [{
                     "message": {
                         "role": "assistant",
-                        "content": "{\"summary\": \"done\", \"confidence\": 0.91}"
+                        "content": "{\"summary\": \"done\", \"__cascade_confidence\": 0.91}"
                     }
                 }]
             })))
@@ -329,6 +362,9 @@ mod tests {
 
         assert_eq!(output.confidence, 0.91);
         assert_eq!(output.response["summary"], "done");
+        // The reserved routing-layer field never leaks into the domain
+        // response a harness actually sees.
+        assert!(output.response.get("__cascade_confidence").is_none());
     }
 
     #[tokio::test]
@@ -350,15 +386,15 @@ mod tests {
                             "type": "object",
                             "properties": {
                                 "summary": {"type": "string"},
-                                "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+                                "__cascade_confidence": {"type": "number", "minimum": 0, "maximum": 1}
                             },
-                            "required": ["summary", "confidence"]
+                            "required": ["summary", "__cascade_confidence"]
                         }
                     }
                 }
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "choices": [{"message": {"content": "{\"summary\": \"ok\", \"confidence\": 0.5}"}}]
+                "choices": [{"message": {"content": "{\"summary\": \"ok\", \"__cascade_confidence\": 0.5}"}}]
             })))
             .mount(&server)
             .await;
@@ -395,6 +431,86 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("did not self-report a confidence field"));
+    }
+
+    #[tokio::test]
+    async fn a_prompt_declaring_its_own_confidence_field_is_not_overwritten() {
+        // research-team's real report.json fragment does exactly this: a
+        // qualitative `low`/`medium`/`high` enum literally named
+        // `confidence`, distinct from the cascade's own numeric signal.
+        // Regression test for the collision `CASCADE_CONFIDENCE_KEY`'s
+        // `__` prefix exists to prevent.
+        let prompt_with_domain_confidence = PromptIr::new(
+            "researcher",
+            QualityTier::High,
+            StdBTreeMap::new(),
+            vec![],
+            vec![Section {
+                id: "assignment".into(),
+                priority: 90,
+                body: "Investigate {{ topic }}.".into(),
+                dedup_ref: None,
+            }],
+            Some(OutputContract {
+                contract_type: "json_schema".into(),
+                schema: r#"{"type":"object","properties":{"summary":{"type":"string"},"confidence":{"type":"string","enum":["low","medium","high"]}},"required":["summary","confidence"]}"#.into(),
+            }),
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_json(json!({
+                "model": "anthropic/claude-3-5-sonnet",
+                "messages": [{
+                    "role": "system",
+                    "content": "<section name=\"assignment\">\nInvestigate evidence quality.\n</section>"
+                }],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "researcher",
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "summary": {"type": "string"},
+                                // The prompt's own domain field, untouched.
+                                "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+                                "__cascade_confidence": {"type": "number", "minimum": 0, "maximum": 1}
+                            },
+                            "required": ["summary", "confidence", "__cascade_confidence"]
+                        }
+                    }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {
+                    "content": "{\"summary\": \"ok\", \"confidence\": \"high\", \"__cascade_confidence\": 0.97}"
+                }}]
+            })))
+            .mount(&server)
+            .await;
+
+        let caller =
+            OpenRouterModelCaller::new(dist_with_prompt(prompt_with_domain_confidence), "test-key")
+                .with_base_url(server.uri());
+
+        let output = caller
+            .call(
+                &model(),
+                "researcher",
+                &json!({"topic": "evidence quality"}),
+            )
+            .await
+            .unwrap();
+
+        // The routing layer's own numeric signal, extracted correctly...
+        assert_eq!(output.confidence, 0.97);
+        // ...and the prompt's own domain field survives in the visible
+        // response, exactly as the model returned it -- never
+        // overwritten, never stripped.
+        assert_eq!(output.response["confidence"], "high");
+        assert!(output.response.get("__cascade_confidence").is_none());
     }
 
     #[test]

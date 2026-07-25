@@ -661,7 +661,16 @@ mod tests {
 
     #[tokio::test]
     async fn registry_distinguishes_unknown_tools_from_unconfigured_builtins() {
+        // Hermetic on purpose: `executor()` -> `SandboxToolExecutor::new`
+        // builds its built-ins via `default_builtins()`, which reads
+        // `TAVILY_API_KEY` from the ambient environment. That's always
+        // absent in CI, but a developer machine genuinely configured with
+        // a real key (e.g. for live-testing web_search itself) would
+        // otherwise flip this test's "no provider configured" assertion
+        // into a real network call. Force the key absent explicitly
+        // rather than relying on the environment happening to agree.
         let (_root, executor) = executor([("web_search", policy(None, vec![]))]);
+        let executor = executor.with_tavily(TavilyClient::new(None));
 
         let unknown = executor
             .execute("session-1", "missing:k1", "missing", &serde_json::json!({}))
