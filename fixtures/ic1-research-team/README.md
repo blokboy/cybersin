@@ -8,6 +8,8 @@ uses more than the minimal scaffold:
 - generic and OpenAI render targets;
 - an eval source and an agent configuration with read tools plus a
   critical, approval-gated publishing tool;
+- a real `citation_lookup` custom tool packaged into `dist/tools/` and
+  executed in `python:3.12-slim`;
 - committed `dist/` output for later runtime integration checkpoints.
 
 Issue #14 consumes this committed `dist/` directly in the real daemon and

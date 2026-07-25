@@ -19,11 +19,14 @@
 
 mod commands;
 mod git;
+mod harness_config;
+mod tool_executor;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use cybersin_runtime::bundled_stub_dist_dir;
 
 /// Cybersin: a prompt compiler and agent runtime in one binary (spec §1).
 #[derive(Parser)]
@@ -39,6 +42,19 @@ struct Cli {
     /// same recorded data. Ignored by compile commands.
     #[arg(long, global = true, default_value = ".cybersin/cybersin.db")]
     db: PathBuf,
+
+    /// Compiled project artifact directory used by runtime commands.
+    /// Defaults to the bundled stub fixture for backward compatibility.
+    #[arg(long, global = true)]
+    dist: Option<PathBuf>,
+
+    /// Root directory for tool execution workspaces and snapshots.
+    #[arg(long, global = true, default_value = ".cybersin/sandbox")]
+    sandbox_root: PathBuf,
+
+    /// Container backend used for live tool execution.
+    #[arg(long, global = true, value_enum, default_value = "docker-gvisor")]
+    sandbox_backend: commands::sandbox::Backend,
 
     #[command(subcommand)]
     command: Command,
@@ -177,8 +193,15 @@ enum SandboxCommand {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
-    match cli.command {
+    let Cli {
+        db,
+        dist,
+        sandbox_root,
+        sandbox_backend,
+        command,
+    } = Cli::parse();
+    let dist = dist.unwrap_or_else(bundled_stub_dist_dir);
+    match command {
         Command::Build {
             path,
             profile,
@@ -199,22 +222,26 @@ async fn main() -> ExitCode {
         Command::Check { path } => from_sync(commands::check::run(&path)),
         Command::Init { dir } => from_sync(commands::init::run(&dir)),
         Command::Fmt { path, check } => from_sync(commands::fmt::run(&path, check)),
-        Command::Run(args) => from_async(commands::run::execute(cli.db, args).await),
-        Command::Trace { command } => from_async(commands::trace::execute(cli.db, command).await),
-        Command::Cost(args) => from_async(commands::cost::execute(cli.db, args).await),
+        Command::Run(args) => {
+            from_async(commands::run::execute(db, dist, sandbox_root, sandbox_backend, args).await)
+        }
+        Command::Trace { command } => from_async(commands::trace::execute(db, command).await),
+        Command::Cost(args) => from_async(commands::cost::execute(db, args).await),
         Command::Eval { command } => from_async(commands::eval::execute(command).await),
-        Command::Explain(args) => from_async(commands::explain::execute(cli.db, args).await),
+        Command::Explain(args) => from_async(commands::explain::execute(db, args).await),
         Command::Daemon(args) => from_async(commands::daemon::execute(args).await),
-        Command::Dlq { command } => from_async(commands::dlq::execute(cli.db, command).await),
-        Command::Approve { call_id } => {
-            from_async(commands::approval::approve(cli.db, call_id).await)
-        }
-        Command::Deny { call_id } => from_async(commands::approval::deny(cli.db, call_id).await),
-        Command::Sessions { command } => {
-            from_async(commands::sessions::execute(cli.db, command).await)
-        }
+        Command::Dlq { command } => from_async(
+            commands::dlq::execute(db, dist, sandbox_root, sandbox_backend, command).await,
+        ),
+        Command::Approve { call_id } => from_async(
+            commands::approval::approve(db, dist, sandbox_root, sandbox_backend, call_id).await,
+        ),
+        Command::Deny { call_id } => from_async(
+            commands::approval::deny(db, dist, sandbox_root, sandbox_backend, call_id).await,
+        ),
+        Command::Sessions { command } => from_async(commands::sessions::execute(db, command).await),
         Command::Notify { session, payload } => {
-            from_async(commands::notify::execute(cli.db, session, payload).await)
+            from_async(commands::notify::execute(db, session, payload).await)
         }
         Command::Sandbox { command } => match command {
             SandboxCommand::Exec(args) => from_sync(commands::sandbox::exec(args)),
@@ -222,7 +249,7 @@ async fn main() -> ExitCode {
             SandboxCommand::Diff(args) => from_sync(commands::sandbox::diff(args)),
             SandboxCommand::Restore(args) => from_sync(commands::sandbox::restore(args)),
         },
-        Command::Optimize(args) => from_async(commands::optimize::execute(cli.db, args).await),
+        Command::Optimize(args) => from_async(commands::optimize::execute(db, args).await),
     }
 }
 

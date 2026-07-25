@@ -57,4 +57,23 @@ Run the sample project's recorded regression suite:
 ./target/debug/cybersin eval gate fixtures/ic1-research-team
 ```
 
+### Live tool execution
+
+Custom tools declared with `run:` and an optional container `image:` are
+compiled into `dist/tools.json`; files under the project's `tools/`
+directory are packaged into `dist/tools/`. DLQ retries and approved calls
+execute those commands in the selected Docker sandbox:
+
+```sh
+./target/debug/cybersin \
+  --dist fixtures/ic1-research-team/dist \
+  --sandbox-backend docker \
+  dlq retry '<call-id>'
+```
+
+Network egress allowlisting is not implemented yet. A tool whose agent
+declares a non-empty `sandbox.egress` fails closed before a container is
+started. The `web_search` built-in is recognized but likewise fails
+clearly until a search provider is configured.
+
 For the full product design and command surface, see [cybersin-spec.md](cybersin-spec.md).

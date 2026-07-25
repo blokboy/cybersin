@@ -17,6 +17,7 @@ use cybersin_router::{
     CacheDecision, CascadeDecision, CascadeStep, ConfidenceRubric, FallbackDecision, ModelKind,
     PromptRoute, RouteDecision, RouteModel, RoutingArtifact,
 };
+use cybersin_sandbox::{ResourceLimits, SandboxScope};
 use serde::Deserialize;
 
 use crate::route_executor::CacheArtifact;
@@ -95,10 +96,44 @@ pub struct ToolPolicy {
     pub retry_class: String,
     #[serde(default)]
     pub approval: Option<String>,
+    #[serde(default = "default_tool_image")]
+    pub image: String,
+    #[serde(default)]
+    pub run: Option<Vec<String>>,
+    #[serde(default = "default_sandbox_scope")]
+    pub sandbox_scope: String,
+    #[serde(default)]
+    pub egress: Vec<String>,
+    #[serde(default = "default_sandbox_cpu")]
+    pub cpu: f64,
+    #[serde(default = "default_sandbox_memory_mb")]
+    pub mem_mb: u64,
+    #[serde(default = "default_sandbox_wall_s")]
+    pub wall_s: u64,
 }
 
 fn default_retry_class() -> String {
     "write".to_string()
+}
+
+fn default_tool_image() -> String {
+    "python:3.12-slim".to_string()
+}
+
+fn default_sandbox_scope() -> String {
+    "call".to_string()
+}
+
+fn default_sandbox_cpu() -> f64 {
+    ResourceLimits::default().cpus
+}
+
+fn default_sandbox_memory_mb() -> u64 {
+    ResourceLimits::default().memory_mb
+}
+
+fn default_sandbox_wall_s() -> u64 {
+    ResourceLimits::default().wall_clock.as_secs()
 }
 
 impl ToolPolicy {
@@ -106,6 +141,27 @@ impl ToolPolicy {
     /// call with `approval: required` parks the session".
     pub fn requires_approval(&self) -> bool {
         self.approval.as_deref() == Some("required")
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        self.run.is_none()
+    }
+
+    pub fn resource_limits(&self) -> ResourceLimits {
+        ResourceLimits {
+            cpus: self.cpu,
+            memory_mb: self.mem_mb,
+            wall_clock: std::time::Duration::from_secs(self.wall_s),
+            ..ResourceLimits::default()
+        }
+    }
+
+    pub fn sandbox_scope(&self) -> Result<SandboxScope, String> {
+        match self.sandbox_scope.as_str() {
+            "call" => Ok(SandboxScope::Call),
+            "session" => Ok(SandboxScope::Session),
+            other => Err(format!("unknown sandbox scope {other:?}")),
+        }
     }
 }
 
@@ -511,6 +567,44 @@ mod tests {
     }
 
     #[test]
+    fn tool_policy_exposes_compiled_sandbox_execution_settings() {
+        let policy: ToolPolicy = serde_json::from_value(serde_json::json!({
+            "retry_class": "read",
+            "image": "python:3.12-slim",
+            "run": ["python3", "citation_lookup.py"],
+            "sandbox_scope": "session",
+            "egress": ["api.example.com"],
+            "cpu": 0.5,
+            "mem_mb": 64,
+            "wall_s": 10
+        }))
+        .unwrap();
+
+        assert!(!policy.is_builtin());
+        assert_eq!(policy.image, "python:3.12-slim");
+        assert_eq!(
+            policy.run.as_deref().unwrap(),
+            ["python3", "citation_lookup.py"]
+        );
+        assert_eq!(policy.sandbox_scope().unwrap(), SandboxScope::Session);
+        assert_eq!(
+            policy.resource_limits(),
+            ResourceLimits {
+                cpus: 0.5,
+                memory_mb: 64,
+                pids: 128,
+                wall_clock: std::time::Duration::from_secs(10),
+            }
+        );
+
+        let legacy: ToolPolicy =
+            serde_json::from_value(serde_json::json!({"retry_class": "write"})).unwrap();
+        assert!(legacy.is_builtin());
+        assert_eq!(legacy.sandbox_scope().unwrap(), SandboxScope::Call);
+        assert_eq!(legacy.resource_limits(), ResourceLimits::default());
+    }
+
+    #[test]
     fn loads_real_compiler_routing_artifact() {
         let dist_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/ic1-research-team/dist");
@@ -523,5 +617,15 @@ mod tests {
         assert_eq!(dist.cascade("researcher")[0].model, "fast-low");
         assert_eq!(dist.cascade("researcher").len(), 3);
         assert!(dist.prompt("synthesizer").is_ok());
+        let citation = dist.tool_policy("citation_lookup").unwrap();
+        assert!(!citation.is_builtin());
+        assert_eq!(
+            citation.run.as_deref().unwrap(),
+            ["python3", "citation_lookup.py"]
+        );
+        assert_eq!(citation.image, "python:3.12-slim");
+        assert_eq!(citation.sandbox_scope().unwrap(), SandboxScope::Call);
+        assert!(citation.egress.is_empty());
+        assert_eq!(citation.resource_limits().wall_clock.as_secs(), 120);
     }
 }

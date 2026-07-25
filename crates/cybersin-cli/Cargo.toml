@@ -21,6 +21,7 @@ cybersin-sandbox = { path = "../cybersin-sandbox" }
 cybersin-trace = { path = "../cybersin-trace" }
 
 anyhow = "1"
+async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.28"
 ratatui = "0.29"
@@ -29,9 +30,9 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process"] }
 
 [dev-dependencies]
-async-trait = "0.1"
 assert_cmd = "2"
 predicates = "3"

@@ -36,6 +36,7 @@ pub mod session;
 pub mod storage;
 pub mod stub_agent;
 pub mod supervisor;
+pub mod tool_caller;
 
 pub use allowlist::{AllowlistError, ModelAllowlist};
 pub use budget::{BudgetConfig, OnBreach};
@@ -62,3 +63,4 @@ pub use storage::{
     StorageError, ToolCallRecord,
 };
 pub use supervisor::SessionSupervisor;
+pub use tool_caller::{StubToolCaller, ToolCaller, ToolOutput};

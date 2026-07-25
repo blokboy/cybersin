@@ -1,15 +1,43 @@
 {
   "citation_lookup": {
-    "retry_class": "read"
+    "retry_class": "read",
+    "image": "python:3.12-slim",
+    "run": [
+      "python3",
+      "citation_lookup.py"
+    ],
+    "sandbox_scope": "call",
+    "egress": [],
+    "cpu": 1.0,
+    "mem_mb": 512,
+    "wall_s": 120
   },
   "publish_report": {
     "retry_class": "critical",
-    "approval": "required"
+    "approval": "required",
+    "image": "",
+    "sandbox_scope": "call",
+    "egress": [],
+    "cpu": 1.0,
+    "mem_mb": 512,
+    "wall_s": 120
   },
   "web_fetch": {
-    "retry_class": "read"
+    "retry_class": "read",
+    "image": "",
+    "sandbox_scope": "call",
+    "egress": [],
+    "cpu": 1.0,
+    "mem_mb": 512,
+    "wall_s": 120
   },
   "web_search": {
-    "retry_class": "read"
+    "retry_class": "read",
+    "image": "",
+    "sandbox_scope": "call",
+    "egress": [],
+    "cpu": 1.0,
+    "mem_mb": 512,
+    "wall_s": 120
   }
 }

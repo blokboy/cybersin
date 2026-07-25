@@ -27,6 +27,7 @@ use crate::route_executor::{
     cache_key, default_model, CacheEntry, ExecutionRequest, ModelCaller, RouteExecutor,
 };
 use crate::storage::{Storage, ToolCallRecord};
+use crate::tool_caller::{StubToolCaller, ToolCaller, ToolOutput};
 
 /// Estimated token count for `text`: a whitespace-token heuristic, not a
 /// real tokenizer. This issue's stub agent needs *a* number to price
@@ -326,6 +327,11 @@ pub struct RuntimeDaemon<C> {
     /// just the event log. `None` means no session-scoped sandbox is in
     /// play — every checkpoint before this issue existed behaved this way.
     session_sandbox: Option<WorkspaceStore>,
+    /// Backs ungated `tool.request`s (spec §8.2) — defaults to
+    /// [`StubToolCaller`], the same hardcoded fake result this field
+    /// replaces, so `new` alone (no builder call) reproduces the exact
+    /// pre-issue-#35-Phase-3 behavior.
+    tool_caller: Box<dyn ToolCaller>,
 }
 
 impl<C: DaemonChannel> RuntimeDaemon<C> {
@@ -358,6 +364,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             degraded_prompts: HashSet::new(),
             halted: false,
             session_sandbox: None,
+            tool_caller: Box::new(StubToolCaller) as Box<dyn ToolCaller>,
         }
     }
 
@@ -404,6 +411,19 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             self.spans.clone(),
         )
         .with_allowlist(allowlist);
+        self
+    }
+
+    /// Swap in a real [`ToolCaller`] (e.g. a bridge to
+    /// `cybersin_gateway::ToolExecutor`, issue #35 Phase 3), replacing the
+    /// [`StubToolCaller`] default `new` wires up. Builder method, same
+    /// reasoning as [`RuntimeDaemon::with_budget`]: every existing caller
+    /// that doesn't call this keeps the M1 stub behavior unchanged. Only
+    /// backs ungated tool calls — an approval-gated call's result still
+    /// comes from whatever ultimately resolves its ledger row (spec §8.2),
+    /// unaffected by this seam.
+    pub fn with_tool_caller(mut self, tool_caller: impl ToolCaller + 'static) -> Self {
+        self.tool_caller = Box::new(tool_caller);
         self
     }
 
@@ -1039,12 +1059,46 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             }
         }
 
-        // The retry-class engine (spec §8.2) is a later issue (#11); this
-        // stub hardcodes one simulated transient-then-succeed retry so
-        // the `retries` span attribute carries a real nonzero value in
-        // this issue's demo run, not just an always-zero schema field.
-        let retries = 1u32;
-        let usd_cost = 0.0008;
+        // No retry-class-bounded auto-retry loop or `tool_calls` ledger row
+        // here (issue #35 Phase 3, deliberately deferred, mirroring Phase
+        // 2's egress/web_search deferrals) — one real call through
+        // `self.tool_caller`, which defaults to `StubToolCaller`
+        // reproducing this method's pre-Phase-3 hardcoded fake result
+        // byte-for-byte when no live tool caller has been attached.
+        let call_result = self
+            .tool_caller
+            .call(&self.session_id, &call_id, &tool, &args)
+            .await;
+
+        let (retries, usd_cost, span_status, event_payload, outcome) = match call_result {
+            Ok(ToolOutput {
+                value,
+                retries,
+                usd_cost,
+            }) => (
+                retries,
+                usd_cost,
+                SpanStatus::Ok,
+                serde_json::json!({ "tool": tool, "retries": retries, "usd_cost": usd_cost }),
+                CallOutcome::Ok { value },
+            ),
+            Err(reason) => (
+                0,
+                0.0,
+                SpanStatus::Error {
+                    message: reason.clone(),
+                },
+                serde_json::json!({ "tool": tool, "error": reason }),
+                // No ledger exhaustion tracking on this single-shot bridge
+                // call, so there's no basis to ever claim "don't retry
+                // this" — `true` keeps the door open rather than asserting
+                // a guarantee this path can't back up.
+                CallOutcome::Failed {
+                    reason,
+                    retriable: true,
+                },
+            ),
+        };
 
         self.emit_span(
             SpanKind::ToolCall,
@@ -1057,25 +1111,17 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             retries,
             Vec::new(),
             serde_json::json!({ "args": args }),
+            span_status,
         )
         .await?;
 
         self.storage
-            .append_event(
-                &self.session_id,
-                "tool.call",
-                serde_json::json!({ "tool": tool, "retries": retries, "usd_cost": usd_cost }),
-            )
+            .append_event(&self.session_id, "tool.call", event_payload)
             .await?;
         self.create_checkpoint(Some("periodic")).await?;
 
         self.channel
-            .send(DaemonMessage::CallResult {
-                call_id,
-                outcome: CallOutcome::Ok {
-                    value: serde_json::json!({ "tool": tool, "status": "ok" }),
-                },
-            })
+            .send(DaemonMessage::CallResult { call_id, outcome })
             .await?;
         Ok(1)
     }
@@ -1106,6 +1152,13 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             row.attempts as u32,
             Vec::new(),
             serde_json::json!({ "args": row.args, "approval_resolved": row.status }),
+            if succeeded {
+                SpanStatus::Ok
+            } else {
+                SpanStatus::Error {
+                    message: row.failure_reason.clone().unwrap_or_default(),
+                }
+            },
         )
         .await?;
         self.storage
@@ -1150,6 +1203,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         retries: u32,
         evicted_sections: Vec<String>,
         attributes: Value,
+        status: SpanStatus,
     ) -> Result<(), RuntimeError> {
         let now = now_unix_ms();
         let span = Span {
@@ -1167,7 +1221,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             cache_status,
             retries,
             evicted_sections,
-            status: SpanStatus::Ok,
+            status,
             attributes,
         };
         self.spans.insert(&span).await?;

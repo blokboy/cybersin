@@ -179,7 +179,7 @@ impl ToolGateway {
             }
         }
 
-        self.execute_and_resolve(&call_id, tool, &args, retry_class)
+        self.execute_and_resolve(session_id, &call_id, tool, &args, retry_class)
             .await
     }
 
@@ -250,6 +250,7 @@ impl ToolGateway {
     /// [`ToolGateway::dlq_retry`].
     async fn execute_and_resolve(
         &self,
+        session_id: &str,
         call_id: &str,
         tool: &str,
         args: &Value,
@@ -259,7 +260,7 @@ impl ToolGateway {
         let mut last_reason = String::new();
         for _ in 0..attempts_allowed {
             self.storage.increment_tool_call_attempt(call_id).await?;
-            match self.executor.execute(tool, args).await {
+            match self.executor.execute(session_id, call_id, tool, args).await {
                 Ok(value) => {
                     self.storage
                         .resolve_tool_call_succeeded(call_id, value.clone())
@@ -338,7 +339,7 @@ impl ToolGateway {
             .await?;
         self.notify.notify_waiters();
         let retry_class = RetryClass::parse(&row.retry_class).unwrap_or(RetryClass::Write);
-        self.execute_and_resolve(call_id, &row.tool, &row.args, retry_class)
+        self.execute_and_resolve(&row.session_id, call_id, &row.tool, &row.args, retry_class)
             .await
     }
 
@@ -402,7 +403,7 @@ impl ToolGateway {
         self.storage.reopen_tool_call(call_id).await?;
         self.notify.notify_waiters();
         let retry_class = RetryClass::parse(&row.retry_class).unwrap_or(RetryClass::Write);
-        self.execute_and_resolve(call_id, &row.tool, &row.args, retry_class)
+        self.execute_and_resolve(&row.session_id, call_id, &row.tool, &row.args, retry_class)
             .await
     }
 

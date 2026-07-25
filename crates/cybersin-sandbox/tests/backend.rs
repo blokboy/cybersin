@@ -40,6 +40,7 @@ printf 'sandbox output'
             command: vec!["sh".into(), "-c".into(), "echo hello".into()],
             workspace: workspace.path().to_path_buf(),
             scope: SandboxScope::Call,
+            egress: vec!["api.example.com".into()],
             limits: ResourceLimits {
                 cpus: 1.0,
                 memory_mb: 64,
@@ -70,6 +71,7 @@ sleep 5
             command: vec!["long-task".into()],
             workspace: workspace.path().to_path_buf(),
             scope: SandboxScope::Call,
+            egress: Vec::new(),
             limits: ResourceLimits {
                 wall_clock: std::time::Duration::from_millis(50),
                 ..ResourceLimits::default()
@@ -104,6 +106,7 @@ esac
             command: vec!["true".into()],
             workspace: workspace.path().to_path_buf(),
             scope: SandboxScope::Call,
+            egress: Vec::new(),
             limits: ResourceLimits::default(),
         })
         .unwrap();
@@ -123,6 +126,7 @@ fn container_resource_kills_are_inspectable_outcomes() {
             command: vec!["hostile-payload".into()],
             workspace: workspace.path().to_path_buf(),
             scope: SandboxScope::Call,
+            egress: Vec::new(),
             limits: ResourceLimits::default(),
         })
         .unwrap();
