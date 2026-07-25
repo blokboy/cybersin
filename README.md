@@ -2,6 +2,8 @@
 
 Cybersin is a Rust-based prompt compiler and durable agent runtime that turns typed prompt sources into optimized, routable, cacheable artifacts. It gives agent developers one CLI for deterministic builds, regression evals, sandboxed execution, resumable sessions, cost tracing, and profile-guided optimization.
 
+![Cybersin crate architecture](docs/assets/cybersin-crate-architecture.png)
+
 ## Getting Started
 
 ### Prerequisites
