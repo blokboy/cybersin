@@ -11,6 +11,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::allowlist::ModelAllowlist;
+
 static NEXT_ROUTE_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -206,6 +208,13 @@ pub struct RouteExecutor<M, J> {
     models: M,
     judge: J,
     spans: SpanStore,
+    /// Environment-level restriction on which candidates this executor may
+    /// actually call (issue #35 Phase 1). Defaults to "everything allowed"
+    /// so every caller that predates this config is unaffected. Enforced
+    /// here, at call time, rather than by filtering `routing.json` at
+    /// build time — see `crate::allowlist` — so `dist/` stays portable
+    /// across environments.
+    allowlist: ModelAllowlist,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -244,7 +253,15 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
             models,
             judge,
             spans,
+            allowlist: ModelAllowlist::allow_all(),
         }
+    }
+
+    /// Restrict which candidates this executor will actually call. See
+    /// `crate::allowlist::ModelAllowlist`.
+    pub fn with_allowlist(mut self, allowlist: ModelAllowlist) -> Self {
+        self.allowlist = allowlist;
+        self
     }
 
     pub fn load_dir(
@@ -317,6 +334,14 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                         &cascade.steps
                     };
                     for step in steps {
+                        if !self.allowlist.allows(&step.model) {
+                            // Not a call failure — this environment simply
+                            // isn't configured to reach this candidate.
+                            // Fall through the cascade exactly as if this
+                            // step didn't exist, same as a real error
+                            // would, but without spending a call on it.
+                            continue;
+                        }
                         let result = self
                             .models
                             .call(&step.model, &request.prompt_name, &request.inputs)
@@ -384,6 +409,9 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 }
                 RouteDecision::Fallbacks(fallbacks) => {
                     for model in &fallbacks.providers {
+                        if !self.allowlist.allows(model) {
+                            continue;
+                        }
                         match self
                             .models
                             .call(model, &request.prompt_name, &request.inputs)
@@ -1036,6 +1064,60 @@ mod tests {
         assert!(recorded
             .iter()
             .any(|span| span.attributes["decision"] == "fallback_accept"));
+    }
+
+    #[tokio::test]
+    async fn allowlist_skips_disallowed_cascade_steps_without_calling_them() {
+        let mut req = request();
+        req.bypass = true;
+        let spans = SpanStore::in_memory().await.unwrap();
+        let executor = RouteExecutor::new(
+            routing(),
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "v1".into(),
+                entries: vec![],
+            },
+            Calls::default(),
+            AcceptJudge,
+            spans,
+        )
+        .with_allowlist(crate::allowlist::ModelAllowlist::new(
+            vec!["test".into()],
+            BTreeMap::from([("test".to_string(), vec!["strong".to_string()])]),
+        ));
+
+        let response = executor.execute(&req).await.unwrap();
+
+        assert_eq!(response.model.as_deref(), Some("strong"));
+        assert_eq!(*executor.models.0.lock().unwrap(), vec!["strong"]);
+    }
+
+    #[tokio::test]
+    async fn allowlist_exhausting_every_candidate_reports_exhausted_not_a_call_error() {
+        let mut req = request();
+        req.bypass = true;
+        let spans = SpanStore::in_memory().await.unwrap();
+        let executor = RouteExecutor::new(
+            routing(),
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "v1".into(),
+                entries: vec![],
+            },
+            Calls::default(),
+            AcceptJudge,
+            spans,
+        )
+        .with_allowlist(crate::allowlist::ModelAllowlist::new(
+            vec!["anthropic".into()],
+            BTreeMap::new(),
+        ));
+
+        let error = executor.execute(&req).await.unwrap_err();
+
+        assert!(matches!(error, RouteExecutorError::Exhausted(prompt) if prompt == "answer"));
+        assert!(executor.models.0.lock().unwrap().is_empty());
     }
 
     #[test]

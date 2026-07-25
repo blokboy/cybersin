@@ -18,12 +18,13 @@ use cybersin_sandbox::{SandboxScope, WorkspaceStore};
 use cybersin_trace::{CacheStatus, Span, SpanFilter, SpanKind, SpanStatus, SpanStore};
 use serde_json::Value;
 
+use crate::allowlist::ModelAllowlist;
 use crate::budget::{BudgetConfig, OnBreach};
 use crate::dist::DistFixture;
 use crate::error::RuntimeError;
 use crate::model_caller::{StubJudge, StubModelCaller};
 use crate::route_executor::{
-    cache_key, default_model, CacheEntry, ExecutionRequest, RouteExecutor,
+    cache_key, default_model, CacheEntry, ExecutionRequest, ModelCaller, RouteExecutor,
 };
 use crate::storage::{Storage, ToolCallRecord};
 
@@ -303,7 +304,7 @@ pub struct RuntimeDaemon<C> {
     dist: Arc<DistFixture>,
     session_id: String,
     agent_name: String,
-    route_executor: RouteExecutor<StubModelCaller, StubJudge>,
+    route_executor: RouteExecutor<Box<dyn ModelCaller>, StubJudge>,
     next_span_seq: u64,
     completed: bool,
     /// Session-level `usd_per_session` budget (spec §8.5). `None` means
@@ -339,7 +340,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         let route_executor = RouteExecutor::new(
             dist.routing_artifact.clone(),
             dist.cache_artifact.clone(),
-            StubModelCaller,
+            Box::new(StubModelCaller) as Box<dyn ModelCaller>,
             StubJudge,
             spans.clone(),
         );
@@ -377,6 +378,32 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
     /// is unaffected.
     pub fn with_session_sandbox(mut self, session_sandbox: WorkspaceStore) -> Self {
         self.session_sandbox = Some(session_sandbox);
+        self
+    }
+
+    /// Swap in a real [`ModelCaller`] (e.g.
+    /// `crate::live_model_caller::OpenRouterModelCaller`) and this
+    /// environment's [`ModelAllowlist`] (issue #35 Phase 1), replacing the
+    /// `StubModelCaller` default `new` wires up. Builder method, same
+    /// reasoning as [`RuntimeDaemon::with_budget`]: every existing caller
+    /// that doesn't call this keeps the M1 stub behavior unchanged.
+    /// Rebuilds the route executor from `self.dist`'s own routing/cache
+    /// artifacts rather than exposing `RouteExecutor`'s private fields, so
+    /// this crate's only seam for "which routing/cache artifact is this
+    /// session driven by" stays `DistFixture`.
+    pub fn with_models(
+        mut self,
+        models: impl ModelCaller + 'static,
+        allowlist: ModelAllowlist,
+    ) -> Self {
+        self.route_executor = RouteExecutor::new(
+            self.dist.routing_artifact.clone(),
+            self.dist.cache_artifact.clone(),
+            Box::new(models) as Box<dyn ModelCaller>,
+            StubJudge,
+            self.spans.clone(),
+        )
+        .with_allowlist(allowlist);
         self
     }
 

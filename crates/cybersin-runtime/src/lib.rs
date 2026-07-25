@@ -21,10 +21,12 @@
 //! harness protocol), never on `cybersin-frontend`/`cybersin-passes` — the
 //! runtime consumes artifacts, not sources.
 
+pub mod allowlist;
 pub mod budget;
 pub mod daemon;
 pub mod dist;
 pub mod error;
+pub mod live_model_caller;
 pub mod model_caller;
 pub mod orchestration;
 mod pg_storage;
@@ -35,12 +37,14 @@ pub mod storage;
 pub mod stub_agent;
 pub mod supervisor;
 
+pub use allowlist::{AllowlistError, ModelAllowlist};
 pub use budget::{BudgetConfig, OnBreach};
 pub use daemon::{serve_server, DaemonHandle, ServerConfig};
 pub use dist::{
     bundled_stub_dist_dir, DistError, DistFixture, DistManifest, RoutingEntry, ToolPolicy,
 };
 pub use error::RuntimeError;
+pub use live_model_caller::{MissingApiKey, OpenRouterModelCaller};
 pub use model_caller::{StubJudge, StubModelCaller};
 pub use orchestration::{
     Mail, OrchestrationError, Orchestrator, Worker, WorkerExit, DEFAULT_MAX_RESTARTS,

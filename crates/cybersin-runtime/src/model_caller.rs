@@ -1,7 +1,12 @@
-//! Stub [`ModelCaller`]/[`Judge`] implementations `RuntimeDaemon` drives
-//! `RouteExecutor` with (spec §8.3): no real backend exists yet
-//! (`cybersin-backends` is still a placeholder), so these fabricate a
-//! deterministic response/confidence instead of calling a real model.
+//! Stub [`ModelCaller`]/[`Judge`] implementations `RuntimeDaemon` defaults
+//! to (spec §8.3), plus the `Box<dyn ModelCaller>` forwarding impl that
+//! lets it swap the stub for a real one (`crate::live_model_caller`, issue
+//! #35 Phase 1) via `RuntimeDaemon::with_models` without threading a
+//! second generic parameter through every one of its methods.
+//! `StubModelCaller` fabricates a deterministic response/confidence
+//! instead of calling a real model — still used wherever no live
+//! `ModelCaller` has been attached (every caller that predates issue #35,
+//! and this crate's own tests).
 //!
 //! Confidence is derived from `RouteModel::quality`, mirroring the same
 //! self-assessment a real model's judged output would plausibly score
@@ -70,5 +75,23 @@ impl Judge for StubJudge {
         _similarity: f64,
     ) -> Result<bool, String> {
         Ok(true)
+    }
+}
+
+/// Forwarding impl so `RouteExecutor<Box<dyn ModelCaller>, _>` can hold
+/// any live `ModelCaller` behind one concrete field type — lets
+/// `RuntimeDaemon` swap `StubModelCaller` for a real implementation
+/// (`crate::live_model_caller::OpenRouterModelCaller`) via a builder
+/// method without threading a second generic parameter through every one
+/// of its methods.
+#[async_trait]
+impl ModelCaller for Box<dyn ModelCaller> {
+    async fn call(
+        &self,
+        model: &RouteModel,
+        prompt_name: &str,
+        inputs: &Value,
+    ) -> Result<ModelOutput, String> {
+        (**self).call(model, prompt_name, inputs).await
     }
 }
