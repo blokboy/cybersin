@@ -155,11 +155,22 @@ pub fn default_model(route: &cybersin_router::PromptRoute) -> Option<&RouteModel
 
 #[async_trait]
 pub trait ModelCaller: Send + Sync {
+    /// `confidence_instruction`: the cascade step's own
+    /// `ConfidenceRubric::instruction` (spec's confidence rubric,
+    /// compiled into `routing.json` — e.g. "Score 0..1 whether the
+    /// response satisfies the High quality contract; accept at or above
+    /// 0.90") for a real implementation to actually put in front of the
+    /// model, so its self-reported confidence means something instead of
+    /// being an ungrounded guess at a bare schema field. `None` for calls
+    /// with no such rubric (`RouteDecision::Fallbacks`, which accepts
+    /// unconditionally and never compares confidence against a
+    /// threshold at all).
     async fn call(
         &self,
         model: &RouteModel,
         prompt_name: &str,
         inputs: &Value,
+        confidence_instruction: Option<&str>,
     ) -> Result<ModelOutput, String>;
 }
 
@@ -344,7 +355,12 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                         }
                         let result = self
                             .models
-                            .call(&step.model, &request.prompt_name, &request.inputs)
+                            .call(
+                                &step.model,
+                                &request.prompt_name,
+                                &request.inputs,
+                                Some(&step.confidence.instruction),
+                            )
                             .await;
                         let force_accept = request.force_cheapest_cascade_step;
                         match result {
@@ -414,7 +430,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                         }
                         match self
                             .models
-                            .call(model, &request.prompt_name, &request.inputs)
+                            .call(model, &request.prompt_name, &request.inputs, None)
                             .await
                         {
                             Ok(output) => {
@@ -759,6 +775,7 @@ mod tests {
             model: &RouteModel,
             _prompt_name: &str,
             _inputs: &Value,
+            _confidence_instruction: Option<&str>,
         ) -> Result<ModelOutput, String> {
             self.0.lock().unwrap().push(model.name.clone());
             Ok(ModelOutput {
@@ -812,6 +829,7 @@ mod tests {
             model: &RouteModel,
             _prompt_name: &str,
             _inputs: &Value,
+            _confidence_instruction: Option<&str>,
         ) -> Result<ModelOutput, String> {
             self.0.lock().unwrap().push(model.name.clone());
             if model.name == "backup" {
