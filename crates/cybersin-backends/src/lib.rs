@@ -106,7 +106,8 @@ impl Backend for OpenAiBackend {
                     })
                 })
                 .collect(),
-            response_format: contract(prompt)?.map(|schema| {
+            response_format: contract(prompt)?.map(|mut schema| {
+                enforce_additional_properties_false(&mut schema);
                 json!({
                     "type": "json_schema",
                     "json_schema": {"name": prompt.name, "schema": schema}
@@ -203,6 +204,37 @@ fn split_messages(prompt: &PromptIr, tags: bool) -> Vec<Message> {
     messages
 }
 
+/// OpenAI's structured-output "strict" `json_schema` mode requires
+/// `additionalProperties: false` on *every* object node in the schema,
+/// not just the root -- an undocumented-enough constraint that it bites
+/// the first time a schema author nests an object without knowing about
+/// it (first surfaced live-testing research-team's own `report.json`
+/// fragment, whose `findings[].items` object lacked it: OpenAI rejected
+/// the whole request with a 400 before generating anything). Only fills
+/// the gap where nothing was declared -- an author's own explicit
+/// `additionalProperties` (even `true`, which OpenAI's strict mode will
+/// still reject) is left untouched rather than silently overridden,
+/// mirroring `cybersin_runtime::live_model_caller`'s
+/// `CASCADE_CONFIDENCE_KEY` precedent of never clobbering a schema
+/// author's own explicit intent.
+fn enforce_additional_properties_false(schema: &mut Value) {
+    let Value::Object(obj) = schema else {
+        return;
+    };
+    if obj.get("type").and_then(Value::as_str) == Some("object") {
+        obj.entry("additionalProperties")
+            .or_insert(Value::Bool(false));
+    }
+    if let Some(Value::Object(properties)) = obj.get_mut("properties") {
+        for value in properties.values_mut() {
+            enforce_additional_properties_false(value);
+        }
+    }
+    if let Some(items) = obj.get_mut("items") {
+        enforce_additional_properties_false(items);
+    }
+}
+
 fn contract(prompt: &PromptIr) -> Result<Option<Value>, String> {
     prompt
         .output_contract
@@ -267,6 +299,63 @@ mod tests {
             rendered.response_format.as_ref().unwrap()["type"],
             "json_schema"
         );
+    }
+
+    #[test]
+    fn openai_fills_in_additional_properties_false_recursively() {
+        let mut nested = prompt();
+        nested.output_contract = Some(OutputContract {
+            contract_type: "json_schema".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "required": ["summary", "findings"],
+                "properties": {
+                    "summary": {"type": "string"},
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["claim", "source"],
+                            "properties": {
+                                "claim": {"type": "string"},
+                                "source": {"type": "string"}
+                            }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        });
+
+        let rendered = OpenAiBackend.render(&nested).unwrap();
+        let schema = &rendered.response_format.as_ref().unwrap()["json_schema"]["schema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["findings"]["items"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn openai_leaves_an_explicit_additional_properties_untouched() {
+        let mut explicit = prompt();
+        explicit.output_contract = Some(OutputContract {
+            contract_type: "json_schema".into(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "additionalProperties": true
+            })
+            .to_string(),
+        });
+
+        let rendered = OpenAiBackend.render(&explicit).unwrap();
+        let schema = &rendered.response_format.as_ref().unwrap()["json_schema"]["schema"];
+        // An author's own explicit choice survives, even one OpenAI's own
+        // strict mode would go on to reject -- this backend doesn't get
+        // to silently override stated intent, matching this crate's
+        // upstream precedent for reserved/injected fields.
+        assert_eq!(schema["additionalProperties"], true);
     }
 
     #[test]

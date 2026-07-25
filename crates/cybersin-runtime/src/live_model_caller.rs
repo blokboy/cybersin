@@ -384,6 +384,7 @@ mod tests {
                         "name": "researcher",
                         "schema": {
                             "type": "object",
+                            "additionalProperties": false,
                             "properties": {
                                 "summary": {"type": "string"},
                                 "__cascade_confidence": {"type": "number", "minimum": 0, "maximum": 1}
@@ -472,6 +473,7 @@ mod tests {
                         "name": "researcher",
                         "schema": {
                             "type": "object",
+                            "additionalProperties": false,
                             "properties": {
                                 "summary": {"type": "string"},
                                 // The prompt's own domain field, untouched.
