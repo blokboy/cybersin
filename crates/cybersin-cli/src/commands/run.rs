@@ -310,19 +310,31 @@ async fn spawn_harness(
     }
 }
 
-/// Waits for `child` to exit and, if it exited non-zero, returns a clear
-/// "harness process exited unexpectedly" error in place of `err` — the
-/// process's own exit status is more useful than whatever transport error
-/// its death produced on the channel talking to it.
+/// Waits for `child` to exit and, if it exited non-zero, prepends a clear
+/// "harness process exited unexpectedly" note ahead of `err` — the
+/// process's own exit status is useful context (a harness that died is
+/// worth knowing about on its own), but `err` is not discarded: a harness
+/// crash is very often a *symptom* of a daemon-side failure (a channel
+/// closing with no reply, because e.g. `handle_llm_request` propagated a
+/// model-call error and aborted the session — see issue #48 — makes any
+/// harness blocked on that reply panic on the closed channel), not the
+/// root cause. An earlier version of this function discarded `err`
+/// entirely whenever the child had crashed, which repeatedly hid the
+/// actually-actionable error during live testing behind a content-free
+/// "the harness crashed" message.
 async fn harness_crash_or(child: &mut tokio::process::Child, err: anyhow::Error) -> anyhow::Error {
     match child.wait().await {
-        Ok(status) if !status.success() => anyhow::anyhow!(
-            "harness process exited unexpectedly ({}) before completing the session",
-            status
+        Ok(status) if !status.success() => {
+            let exit_description = status
                 .code()
                 .map(|code| format!("code {code}"))
-                .unwrap_or_else(|| "killed by signal".to_string())
-        ),
+                .unwrap_or_else(|| "killed by signal".to_string());
+            anyhow::anyhow!(
+                "harness process exited unexpectedly ({exit_description}) before completing \
+the session -- this is often a symptom of the underlying error below, not independent of it: \
+{err}"
+            )
+        }
         _ => err,
     }
 }

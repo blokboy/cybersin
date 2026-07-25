@@ -28,6 +28,14 @@
 //! `properties_obj.insert` — first surfaced by live-testing against a real
 //! prompt with a real model, since no synthetic/`--stub` dist ever
 //! exercised a real structured-output round trip against this code path.
+//! The schema field alone isn't enough for a self-report to mean
+//! anything, though: `call`'s `confidence_instruction` parameter carries
+//! the cascade step's own `ConfidenceRubric::instruction` (compiled into
+//! `routing.json`, e.g. "Score 0..1 whether the response satisfies the
+//! High quality contract") as an extra system message, so the model has
+//! an actual rubric to score against instead of guessing at a bare schema
+//! field — also first surfaced live, as a real cascade exhausting every
+//! step because an ungrounded guess kept landing under threshold.
 //!
 //! Gateway failover (Vercel AI Gateway, then a self-hosted LiteLLM proxy,
 //! if OpenRouter itself is unreachable) is deliberately not implemented
@@ -180,6 +188,7 @@ impl ModelCaller for OpenRouterModelCaller {
         model: &RouteModel,
         prompt_name: &str,
         inputs: &Value,
+        confidence_instruction: Option<&str>,
     ) -> Result<ModelOutput, String> {
         let prompt = self
             .dist
@@ -188,13 +197,34 @@ impl ModelCaller for OpenRouterModelCaller {
         let rendered = self.render_messages(prompt, inputs)?;
         let response_format = response_format_with_confidence(&rendered)?;
 
+        let mut messages: Vec<Value> = rendered
+            .messages
+            .iter()
+            .map(|message| json!({"role": message.role, "content": message.content}))
+            .collect();
+        // Without this, the model sees a bare schema field demanding a
+        // 0-1 number and has to guess what it's supposed to represent --
+        // an ungrounded guess that has no reason to correlate with
+        // `RouteExecutor`'s cascade thresholds, and in practice tends to
+        // fall under them (first surfaced live: a real cascade exhausted
+        // every step because of exactly this). `confidence_instruction`
+        // is the cascade step's own compiled `ConfidenceRubric::instruction`
+        // (route_executor.rs) -- `None` only for calls with no such rubric
+        // to give (plain fallbacks, which accept unconditionally and never
+        // compare confidence against anything).
+        if let Some(instruction) = confidence_instruction {
+            messages.push(json!({
+                "role": "system",
+                "content": format!(
+                    "Self-report your confidence in the `{CASCADE_CONFIDENCE_KEY}` field of \
+            your JSON response using this rubric: {instruction}"
+                ),
+            }));
+        }
+
         let mut body = json!({
             "model": format!("{}/{}", model.provider, model.name),
-            "messages": rendered
-                .messages
-                .iter()
-                .map(|message| json!({"role": message.role, "content": message.content}))
-                .collect::<Vec<_>>(),
+            "messages": messages,
             "response_format": response_format,
         });
         if !rendered.tools.is_empty() {
@@ -356,6 +386,7 @@ mod tests {
                 &model(),
                 "researcher",
                 &json!({"topic": "evidence quality"}),
+                None,
             )
             .await
             .unwrap();
@@ -408,6 +439,7 @@ mod tests {
                 &model(),
                 "researcher",
                 &json!({"topic": "evidence quality"}),
+                None,
             )
             .await
             .unwrap();
@@ -428,10 +460,73 @@ mod tests {
             .with_base_url(server.uri());
 
         let error = caller
-            .call(&model(), "researcher", &json!({"topic": "x"}))
+            .call(&model(), "researcher", &json!({"topic": "x"}), None)
             .await
             .unwrap_err();
         assert!(error.contains("did not self-report a confidence field"));
+    }
+
+    #[tokio::test]
+    async fn a_confidence_instruction_is_sent_as_an_extra_system_message() {
+        // Regression test: the schema alone asking for `__cascade_confidence`
+        // gives the model no idea what the number is supposed to mean --
+        // first surfaced live as a real cascade exhausting every step
+        // because an ungrounded self-report kept landing under threshold.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_json(json!({
+                "model": "anthropic/claude-3-5-sonnet",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "<section name=\"assignment\">\nInvestigate evidence quality.\n</section>"
+                    },
+                    {
+                        "role": "system",
+                        "content": "Self-report your confidence in the `__cascade_confidence` field of \
+your JSON response using this rubric: Score 0..1 whether the response satisfies the High quality contract; accept at or above 0.90."
+                    }
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "researcher",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "summary": {"type": "string"},
+                                "__cascade_confidence": {"type": "number", "minimum": 0, "maximum": 1}
+                            },
+                            "required": ["summary", "__cascade_confidence"]
+                        }
+                    }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": "{\"summary\": \"ok\", \"__cascade_confidence\": 0.92}"}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let caller = OpenRouterModelCaller::new(dist_with_prompt(researcher_prompt()), "test-key")
+            .with_base_url(server.uri());
+
+        let output = caller
+            .call(
+                &model(),
+                "researcher",
+                &json!({"topic": "evidence quality"}),
+                Some(
+                    "Score 0..1 whether the response satisfies the High quality contract; \
+accept at or above 0.90.",
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.confidence, 0.92);
     }
 
     #[tokio::test]
@@ -502,6 +597,7 @@ mod tests {
                 &model(),
                 "researcher",
                 &json!({"topic": "evidence quality"}),
+                None,
             )
             .await
             .unwrap();

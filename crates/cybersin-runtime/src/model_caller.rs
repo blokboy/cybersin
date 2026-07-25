@@ -46,6 +46,7 @@ impl ModelCaller for StubModelCaller {
         model: &RouteModel,
         prompt_name: &str,
         _inputs: &Value,
+        _confidence_instruction: Option<&str>,
     ) -> Result<ModelOutput, String> {
         Ok(ModelOutput {
             response: serde_json::json!({
@@ -91,7 +92,10 @@ impl ModelCaller for Box<dyn ModelCaller> {
         model: &RouteModel,
         prompt_name: &str,
         inputs: &Value,
+        confidence_instruction: Option<&str>,
     ) -> Result<ModelOutput, String> {
-        (**self).call(model, prompt_name, inputs).await
+        (**self)
+            .call(model, prompt_name, inputs, confidence_instruction)
+            .await
     }
 }

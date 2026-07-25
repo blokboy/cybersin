@@ -46,6 +46,7 @@ impl ModelCaller for UnusedModel {
         _model: &RouteModel,
         _prompt_name: &str,
         _inputs: &Value,
+        _confidence_instruction: Option<&str>,
     ) -> Result<ModelOutput, String> {
         Err("the accepted cache candidate should avoid a provider call".into())
     }
