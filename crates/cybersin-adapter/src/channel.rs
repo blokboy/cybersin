@@ -42,3 +42,23 @@ pub trait DaemonChannel: Send {
     /// Returns `None` once the harness has closed the channel.
     async fn recv(&mut self) -> Option<HarnessMessage>;
 }
+
+/// Forwarding impl so a caller that picks its transport at runtime (e.g.
+/// `cybersin run`'s `harness.adapter: process | grpc`, issue #37) can hold
+/// one `Box<dyn DaemonChannel>` regardless of which concrete transport
+/// connected — `DaemonChannel: Send` already, so this is automatically
+/// `Send + 'static` too. Deliberately not `+ Sync`: tonic's `Streaming<T>`
+/// (inside `GrpcDaemonChannel`) type-erases its body without a `Sync`
+/// bound, so a caller driving `RuntimeDaemon<Box<dyn DaemonChannel>>`
+/// needs to do so without `tokio::spawn`ing it onto its own task (`Send`
+/// alone is enough for `tokio::select!`/`.await` in the current task).
+#[async_trait]
+impl DaemonChannel for Box<dyn DaemonChannel> {
+    async fn send(&mut self, msg: DaemonMessage) -> Result<(), TransportError> {
+        (**self).send(msg).await
+    }
+
+    async fn recv(&mut self) -> Option<HarnessMessage> {
+        (**self).recv().await
+    }
+}

@@ -25,6 +25,18 @@ pub struct ToolOutput {
     pub usd_cost: f64,
 }
 
+/// A tool call's terminal failure — mirrors `cybersin_adapter::messages::
+/// CallOutcome::Failed`'s shape exactly, since `RuntimeDaemon::
+/// handle_tool_request` forwards `retriable` straight into that message.
+/// A `ToolCaller` backed by a real `cybersin_gateway::ToolGateway` reports
+/// the ledger's actual retriable determination here; `StubToolCaller`
+/// never fails so it never constructs one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCallFailure {
+    pub reason: String,
+    pub retriable: bool,
+}
+
 #[async_trait]
 pub trait ToolCaller: Send + Sync {
     async fn call(
@@ -33,7 +45,7 @@ pub trait ToolCaller: Send + Sync {
         call_id: &str,
         tool: &str,
         args: &Value,
-    ) -> Result<ToolOutput, String>;
+    ) -> Result<ToolOutput, ToolCallFailure>;
 }
 
 /// Reproduces the ungated tool-call behavior `RuntimeDaemon` hardcoded
@@ -51,7 +63,7 @@ impl ToolCaller for StubToolCaller {
         _call_id: &str,
         tool: &str,
         _args: &Value,
-    ) -> Result<ToolOutput, String> {
+    ) -> Result<ToolOutput, ToolCallFailure> {
         Ok(ToolOutput {
             value: serde_json::json!({ "tool": tool, "status": "ok" }),
             retries: 1,
@@ -71,7 +83,7 @@ impl ToolCaller for Box<dyn ToolCaller> {
         call_id: &str,
         tool: &str,
         args: &Value,
-    ) -> Result<ToolOutput, String> {
+    ) -> Result<ToolOutput, ToolCallFailure> {
         (**self).call(session_id, call_id, tool, args).await
     }
 }

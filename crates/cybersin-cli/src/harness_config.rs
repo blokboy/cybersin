@@ -39,8 +39,8 @@ pub(crate) enum HarnessConfigError {
     #[error("parsing agent.yaml: {0}")]
     Yaml(#[from] serde_yaml::Error),
     #[error(
-        "harness.adapter = {0:?} is not supported; only \"process\" is implemented \
-         (gRPC transport is out of scope for issue #35 Phase 3)"
+        "harness.adapter = {0:?} is not supported; only \"process\" (stdio) and \"grpc\" \
+         are implemented"
     )]
     UnsupportedAdapter(String),
     #[error("harness.command must not be empty")]
@@ -51,7 +51,7 @@ impl AgentMeta {
     /// Parse `name:`/`harness:` out of one `agents/*.agent.yaml` source.
     pub(crate) fn from_agent_yaml(yaml: &str) -> Result<Self, HarnessConfigError> {
         let parsed: AgentYaml = serde_yaml::from_str(yaml)?;
-        if parsed.harness.adapter != "process" {
+        if parsed.harness.adapter != "process" && parsed.harness.adapter != "grpc" {
             return Err(HarnessConfigError::UnsupportedAdapter(
                 parsed.harness.adapter,
             ));
@@ -89,15 +89,28 @@ tools: []
     }
 
     #[test]
-    fn rejects_a_grpc_adapter() {
+    fn parses_a_grpc_adapter() {
         let yaml = r#"
 name: research-team
 harness:
   adapter: grpc
   command: ["python", "loop.py"]
 "#;
+        let meta = AgentMeta::from_agent_yaml(yaml).unwrap();
+        assert_eq!(meta.harness.adapter, "grpc");
+        assert_eq!(meta.harness.command, vec!["python", "loop.py"]);
+    }
+
+    #[test]
+    fn rejects_an_unknown_adapter() {
+        let yaml = r#"
+name: research-team
+harness:
+  adapter: websocket
+  command: ["python", "loop.py"]
+"#;
         let err = AgentMeta::from_agent_yaml(yaml).unwrap_err();
-        assert!(matches!(err, HarnessConfigError::UnsupportedAdapter(a) if a == "grpc"));
+        assert!(matches!(err, HarnessConfigError::UnsupportedAdapter(a) if a == "websocket"));
     }
 
     #[test]

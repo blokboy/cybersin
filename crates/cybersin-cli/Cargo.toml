@@ -8,6 +8,14 @@ description = "The `cybersin` binary: compiler/runtime commands and ratatui expl
 name = "cybersin"
 path = "src/main.rs"
 
+# Test-support binary only (issue #37): a minimal gRPC-speaking harness
+# used by tests/run_live_grpc.rs to exercise `cybersin run`'s
+# `harness.adapter: grpc` path end-to-end without needing a Python gRPC
+# client in this repo. Not part of the `cybersin` product surface.
+[[bin]]
+name = "grpc_stub_harness"
+path = "src/bin/grpc_stub_harness.rs"
+
 [dependencies]
 cybersin-frontend = { path = "../cybersin-frontend" }
 cybersin-adapter = { path = "../cybersin-adapter" }
