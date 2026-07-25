@@ -189,38 +189,26 @@ async fn run_live(
     )
     .with_models(model_caller, allowlist)
     .with_tool_caller(tool_caller);
-    runtime_daemon.start_session(inputs).await?;
+    // A harness that crashes immediately closes its stdin/stdout out from
+    // under the channel before we've necessarily observed its exit status,
+    // so a send/recv here can fail with a raw transport error (e.g. a
+    // broken pipe) instead of the more useful "the process died" signal.
+    // Any time a channel operation on this session errors, prefer the
+    // child's actual exit status over the raw transport error.
+    if let Err(err) = runtime_daemon.start_session(inputs).await {
+        return Err(harness_crash_or(&mut child, err.into()).await);
+    }
     let mut daemon_task = tokio::spawn(runtime_daemon.run());
 
     let summary = tokio::select! {
         result = &mut daemon_task => {
-            // The daemon loop ended on its own — reap the child now that
-            // its stdin (owned by the dropped RuntimeDaemon's channel) has
-            // closed; a well-behaved harness exits promptly once it sees
-            // EOF. If the daemon errored, check whether that's because the
-            // harness had already crashed: a crash closes the harness's
-            // stdin/stdout out from under the channel, and the daemon's
-            // next read or write can lose the race against child.wait()
-            // below, surfacing a raw transport error instead of the
-            // process's actual exit status. Prefer the exit status when
-            // it's available and non-zero — it's the more useful signal.
-            let child_status = child.wait().await.ok();
+            // The daemon loop ended on its own (SessionComplete or a
+            // closed channel) — reap the child now that its stdin (owned
+            // by the dropped RuntimeDaemon's channel) has closed; a
+            // well-behaved harness exits promptly once it sees EOF.
             match result.context("daemon task panicked")? {
                 Ok(summary) => summary,
-                Err(err) => {
-                    if let Some(status) = child_status {
-                        if !status.success() {
-                            anyhow::bail!(
-                                "harness process exited unexpectedly ({}) before completing the session",
-                                status
-                                    .code()
-                                    .map(|code| format!("code {code}"))
-                                    .unwrap_or_else(|| "killed by signal".to_string())
-                            );
-                        }
-                    }
-                    return Err(err.into());
-                }
+                Err(err) => return Err(harness_crash_or(&mut child, err.into()).await),
             }
         }
         status = child.wait() => {
@@ -240,6 +228,23 @@ async fn run_live(
 
     print_summary(&summary);
     Ok(())
+}
+
+/// Waits for `child` to exit and, if it exited non-zero, returns a clear
+/// "harness process exited unexpectedly" error in place of `err` — the
+/// process's own exit status is more useful than whatever transport error
+/// its death produced on the channel talking to it.
+async fn harness_crash_or(child: &mut tokio::process::Child, err: anyhow::Error) -> anyhow::Error {
+    match child.wait().await {
+        Ok(status) if !status.success() => anyhow::anyhow!(
+            "harness process exited unexpectedly ({}) before completing the session",
+            status
+                .code()
+                .map(|code| format!("code {code}"))
+                .unwrap_or_else(|| "killed by signal".to_string())
+        ),
+        _ => err,
+    }
 }
 
 fn print_summary(summary: &cybersin_runtime::RuntimeSessionSummary) {
