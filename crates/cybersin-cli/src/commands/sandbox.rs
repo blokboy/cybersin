@@ -10,7 +10,11 @@ use cybersin_sandbox::{
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Backend {
     Docker,
-    #[value(name = "docker-gvisor")]
+    // `docker+gvisor` is accepted for backward compatibility: `cybersin
+    // init`'s scaffolded `cybersin.yaml` (and the committed ic1-research-team
+    // fixture) write this spelling in `sandbox.backend`, which predates
+    // anything actually parsing that field (issue #50).
+    #[value(name = "docker-gvisor", alias = "docker+gvisor")]
     DockerGvisor,
 }
 

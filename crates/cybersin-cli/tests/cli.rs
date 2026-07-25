@@ -305,10 +305,16 @@ fn durable_session_cli_lists_shows_notifies_migrates_and_resumes() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("state.db");
 
+    // No `cybersin.yaml` lives above this tempdir, so `--dist` must be
+    // passed explicitly (issue #50): omitting it now errors rather than
+    // silently falling back to the bundled stub fixture.
+    let dist = cybersin_runtime::bundled_stub_dist_dir();
     cybersin()
         .args([
             "--db",
             db.to_str().unwrap(),
+            "--dist",
+            dist.to_str().unwrap(),
             "run",
             "--stub",
             "--session-id",

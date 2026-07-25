@@ -16,10 +16,15 @@ fn stub_run_then_trace_and_cost_show_real_data() {
     let db = dir.path().join("cybersin.db");
 
     // `cybersind` auto-starts here (spec §1): nothing was running before
-    // this command, and the db file doesn't exist yet.
+    // this command, and the db file doesn't exist yet. No `cybersin.yaml`
+    // lives above this tempdir, so `--dist` must be passed explicitly
+    // (issue #50): omitting it now errors rather than silently falling
+    // back to the bundled stub fixture.
     cybersin()
         .arg("--db")
         .arg(&db)
+        .arg("--dist")
+        .arg(cybersin_runtime::bundled_stub_dist_dir())
         .arg("run")
         .arg("--stub")
         .arg("--session-id")
@@ -135,6 +140,8 @@ fn run_without_stub_fails_with_a_clear_message() {
     cybersin()
         .arg("--db")
         .arg(&db)
+        .arg("--dist")
+        .arg(cybersin_runtime::bundled_stub_dist_dir())
         .arg("run")
         .assert()
         .failure()

@@ -20,13 +20,14 @@
 mod commands;
 mod git;
 mod harness_config;
+mod project;
 mod tool_executor;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
-use cybersin_runtime::bundled_stub_dist_dir;
 
 /// Cybersin: a prompt compiler and agent runtime in one binary (spec §1).
 #[derive(Parser)]
@@ -39,22 +40,32 @@ struct Cli {
     /// Path to `cybersind`'s SQLite state file (spec §8: Storage trait,
     /// SQLite in dev). Shared by every runtime subcommand, so `run --stub`
     /// followed by `trace`/`cost` in the same working directory sees the
-    /// same recorded data. Ignored by compile commands.
-    #[arg(long, global = true, default_value = ".cybersin/cybersin.db")]
-    db: PathBuf,
+    /// same recorded data. Ignored by compile commands. Defaults to
+    /// `<project root>/.cybersin/cybersin.db`, where the project root is
+    /// discovered by walking up from the current directory for a
+    /// `cybersin.yaml` (issue #50); falls back to plain
+    /// `.cybersin/cybersin.db` if none is found.
+    #[arg(long, global = true)]
+    db: Option<PathBuf>,
 
     /// Compiled project artifact directory used by runtime commands.
-    /// Defaults to the bundled stub fixture for backward compatibility.
+    /// Defaults to `<project root>/dist` if it exists; errors clearly if it
+    /// doesn't, rather than silently substituting the bundled stub fixture
+    /// (issue #50).
     #[arg(long, global = true)]
     dist: Option<PathBuf>,
 
-    /// Root directory for tool execution workspaces and snapshots.
-    #[arg(long, global = true, default_value = ".cybersin/sandbox")]
-    sandbox_root: PathBuf,
+    /// Root directory for tool execution workspaces and snapshots. Defaults
+    /// to `<project root>/.cybersin/sandbox` (issue #50); falls back to
+    /// plain `.cybersin/sandbox` if no project root is found.
+    #[arg(long, global = true)]
+    sandbox_root: Option<PathBuf>,
 
-    /// Container backend used for live tool execution.
-    #[arg(long, global = true, value_enum, default_value = "docker-gvisor")]
-    sandbox_backend: commands::sandbox::Backend,
+    /// Container backend used for live tool execution. Defaults to the
+    /// discovered `cybersin.yaml`'s `sandbox.backend` field when present
+    /// (issue #50), otherwise `docker-gvisor`.
+    #[arg(long, global = true, value_enum)]
+    sandbox_backend: Option<commands::sandbox::Backend>,
 
     #[command(subcommand)]
     command: Command,
@@ -200,7 +211,6 @@ async fn main() -> ExitCode {
         sandbox_backend,
         command,
     } = Cli::parse();
-    let dist = dist.unwrap_or_else(bundled_stub_dist_dir);
     match command {
         Command::Build {
             path,
@@ -223,24 +233,95 @@ async fn main() -> ExitCode {
         Command::Init { dir } => from_sync(commands::init::run(&dir)),
         Command::Fmt { path, check } => from_sync(commands::fmt::run(&path, check)),
         Command::Run(args) => {
+            let (db, sandbox_root, sandbox_backend, defaults) =
+                match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                    Ok(v) => v,
+                    Err(e) => return from_async(Err(e)),
+                };
+            let dist = match resolve_dist(dist, &defaults) {
+                Ok(v) => v,
+                Err(e) => return from_async(Err(e)),
+            };
             from_async(commands::run::execute(db, dist, sandbox_root, sandbox_backend, args).await)
         }
-        Command::Trace { command } => from_async(commands::trace::execute(db, command).await),
-        Command::Cost(args) => from_async(commands::cost::execute(db, args).await),
+        Command::Trace { command } => {
+            let (db, ..) = match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                Ok(v) => v,
+                Err(e) => return from_async(Err(e)),
+            };
+            from_async(commands::trace::execute(db, command).await)
+        }
+        Command::Cost(args) => {
+            let (db, ..) = match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                Ok(v) => v,
+                Err(e) => return from_async(Err(e)),
+            };
+            from_async(commands::cost::execute(db, args).await)
+        }
         Command::Eval { command } => from_async(commands::eval::execute(command).await),
-        Command::Explain(args) => from_async(commands::explain::execute(db, args).await),
+        Command::Explain(args) => {
+            let (db, ..) = match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                Ok(v) => v,
+                Err(e) => return from_async(Err(e)),
+            };
+            from_async(commands::explain::execute(db, args).await)
+        }
         Command::Daemon(args) => from_async(commands::daemon::execute(args).await),
-        Command::Dlq { command } => from_async(
-            commands::dlq::execute(db, dist, sandbox_root, sandbox_backend, command).await,
-        ),
-        Command::Approve { call_id } => from_async(
-            commands::approval::approve(db, dist, sandbox_root, sandbox_backend, call_id).await,
-        ),
-        Command::Deny { call_id } => from_async(
-            commands::approval::deny(db, dist, sandbox_root, sandbox_backend, call_id).await,
-        ),
-        Command::Sessions { command } => from_async(commands::sessions::execute(db, command).await),
+        Command::Dlq { command } => {
+            let (db, sandbox_root, sandbox_backend, defaults) =
+                match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                    Ok(v) => v,
+                    Err(e) => return from_async(Err(e)),
+                };
+            let dist = match resolve_dist(dist, &defaults) {
+                Ok(v) => v,
+                Err(e) => return from_async(Err(e)),
+            };
+            from_async(
+                commands::dlq::execute(db, dist, sandbox_root, sandbox_backend, command).await,
+            )
+        }
+        Command::Approve { call_id } => {
+            let (db, sandbox_root, sandbox_backend, defaults) =
+                match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                    Ok(v) => v,
+                    Err(e) => return from_async(Err(e)),
+                };
+            let dist = match resolve_dist(dist, &defaults) {
+                Ok(v) => v,
+                Err(e) => return from_async(Err(e)),
+            };
+            from_async(
+                commands::approval::approve(db, dist, sandbox_root, sandbox_backend, call_id)
+                    .await,
+            )
+        }
+        Command::Deny { call_id } => {
+            let (db, sandbox_root, sandbox_backend, defaults) =
+                match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                    Ok(v) => v,
+                    Err(e) => return from_async(Err(e)),
+                };
+            let dist = match resolve_dist(dist, &defaults) {
+                Ok(v) => v,
+                Err(e) => return from_async(Err(e)),
+            };
+            from_async(
+                commands::approval::deny(db, dist, sandbox_root, sandbox_backend, call_id).await,
+            )
+        }
+        Command::Sessions { command } => {
+            let (db, ..) = match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                Ok(v) => v,
+                Err(e) => return from_async(Err(e)),
+            };
+            from_async(commands::sessions::execute(db, command).await)
+        }
         Command::Notify { session, payload } => {
+            let (db, ..) = match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                Ok(v) => v,
+                Err(e) => return from_async(Err(e)),
+            };
             from_async(commands::notify::execute(db, session, payload).await)
         }
         Command::Sandbox { command } => match command {
@@ -249,7 +330,49 @@ async fn main() -> ExitCode {
             SandboxCommand::Diff(args) => from_sync(commands::sandbox::diff(args)),
             SandboxCommand::Restore(args) => from_sync(commands::sandbox::restore(args)),
         },
-        Command::Optimize(args) => from_async(commands::optimize::execute(db, args).await),
+        Command::Optimize(args) => {
+            let (db, ..) = match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                Ok(v) => v,
+                Err(e) => return from_async(Err(e)),
+            };
+            from_async(commands::optimize::execute(db, args).await)
+        }
+    }
+}
+
+/// Resolves the three infallible runtime globals (`--db`/`--sandbox-root`/
+/// `--sandbox-backend`) against the discovered project root (issue #50),
+/// applying an explicit flag over its corresponding discovered/config
+/// default. Also returns the `ProjectDefaults` so callers that need
+/// `--dist` (which can fail, see `resolve_dist`) can resolve it from the
+/// same discovery pass.
+fn resolve_runtime_globals(
+    db: Option<PathBuf>,
+    sandbox_root: Option<PathBuf>,
+    sandbox_backend: Option<commands::sandbox::Backend>,
+) -> anyhow::Result<(
+    PathBuf,
+    PathBuf,
+    commands::sandbox::Backend,
+    project::ProjectDefaults,
+)> {
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let defaults = project::ProjectDefaults::detect(&cwd)?;
+    Ok((
+        db.unwrap_or_else(|| defaults.db_default()),
+        sandbox_root.unwrap_or_else(|| defaults.sandbox_root_default()),
+        sandbox_backend.unwrap_or_else(|| defaults.sandbox_backend_default()),
+        defaults,
+    ))
+}
+
+/// Resolves `--dist`: an explicit flag wins, otherwise `<project
+/// root>/dist` if it exists, otherwise a clear error (issue #50) — no more
+/// silent fallback to the bundled stub fixture.
+fn resolve_dist(dist: Option<PathBuf>, defaults: &project::ProjectDefaults) -> anyhow::Result<PathBuf> {
+    match dist {
+        Some(dist) => Ok(dist),
+        None => defaults.dist_default(),
     }
 }
 
