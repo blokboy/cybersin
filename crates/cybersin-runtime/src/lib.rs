@@ -63,4 +63,4 @@ pub use storage::{
     StorageError, ToolCallRecord,
 };
 pub use supervisor::SessionSupervisor;
-pub use tool_caller::{StubToolCaller, ToolCaller, ToolOutput};
+pub use tool_caller::{StubToolCaller, ToolCallFailure, ToolCaller, ToolOutput};

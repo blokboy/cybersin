@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cybersin_gateway::ToolExecutor;
-use cybersin_runtime::DistFixture;
+use cybersin_gateway::{GatewayOutcome, RetryClass, ToolExecutor, ToolGateway};
+use cybersin_runtime::{DistFixture, Storage};
 use cybersin_sandbox::{
     DockerBackend, ExecRequest, GvisorBackend, SandboxBackend, SandboxScope, WorkspaceStore,
 };
@@ -57,23 +57,36 @@ pub(crate) fn configured_executor(
     )))
 }
 
-/// Bridges `cybersin_gateway::ToolExecutor` (session_id, call_id, tool,
-/// args) -> `cybersin_runtime::ToolCaller`, so `RuntimeDaemon` can drive
-/// live tool calls through the same `SandboxToolExecutor` dispatch
-/// `dlq`/`approve`/`deny` already use (issue #35 Phase 3), without
-/// `cybersin-runtime` depending on `cybersin-gateway` (the reverse of that
-/// crate's normal dependency direction — `cybersin-gateway` depends on
-/// `cybersin-runtime`, so only a crate that depends on both, like this
-/// one, can bridge them). One call per invocation: no retry-class-bounded
-/// loop, no `tool_calls` ledger row for this path (deliberately deferred,
-/// same pattern as this file's egress/`web_search` TODOs above).
+/// Bridges `cybersin_gateway::ToolGateway` -> `cybersin_runtime::ToolCaller`,
+/// so `RuntimeDaemon`'s ungated tool-call path (`session.rs::
+/// handle_tool_request`) runs through the same real, ledger-admitted,
+/// retry-class-bounded gateway `dlq retry`/`approve`/`deny` already use
+/// (issue #37), without `cybersin-runtime` depending on `cybersin-gateway`
+/// (the reverse of that crate's normal dependency direction —
+/// `cybersin-gateway` depends on `cybersin-runtime`, so only a crate that
+/// depends on both, like this one, can bridge them).
+///
+/// No `PolicyHook` is ever registered on `self.gateway`, so
+/// `ToolGateway::call` here can never return `GatewayOutcome::Parked` —
+/// approval-gating stays entirely `RuntimeDaemon`'s own concern (its
+/// `dist`-driven pre-check ahead of ever calling this bridge), independent
+/// of which `ToolCaller` is attached. See `session.rs::handle_tool_request`'s
+/// doc for why that decoupling matters.
 pub(crate) struct GatewayToolCaller {
-    executor: Arc<dyn ToolExecutor>,
+    gateway: ToolGateway,
+    dist: Arc<DistFixture>,
 }
 
 impl GatewayToolCaller {
-    pub(crate) fn new(executor: Arc<dyn ToolExecutor>) -> Self {
-        Self { executor }
+    pub(crate) fn new(
+        executor: Arc<dyn ToolExecutor>,
+        storage: Arc<dyn Storage>,
+        dist: Arc<DistFixture>,
+    ) -> Self {
+        Self {
+            gateway: ToolGateway::new(storage, executor),
+            dist,
+        }
     }
 }
 
@@ -85,23 +98,64 @@ impl cybersin_runtime::ToolCaller for GatewayToolCaller {
         call_id: &str,
         tool: &str,
         args: &Value,
-    ) -> Result<cybersin_runtime::ToolOutput, String> {
-        let value = self
-            .executor
-            .execute(session_id, call_id, tool, args)
-            .await?;
-        Ok(cybersin_runtime::ToolOutput {
-            value,
-            // No retry occurred — this bridge doesn't implement the
-            // retry-class engine, so 0 is the honest count rather than the
-            // stub's fabricated "1".
-            retries: 0,
-            // TODO(issue #35 follow-up): real per-tool cost metering.
-            // `cybersin_sandbox::ExecOutcome` carries no cost data today,
-            // so this mirrors the pre-Phase-3 stub's flat placeholder
-            // rather than inventing false precision.
-            usd_cost: 0.0008,
-        })
+    ) -> Result<cybersin_runtime::ToolOutput, cybersin_runtime::ToolCallFailure> {
+        let retry_class = self
+            .dist
+            .tool_policy(tool)
+            .and_then(|policy| RetryClass::parse(&policy.retry_class))
+            .unwrap_or(RetryClass::Write);
+        // Session-scoped so the harness's own local call ids (e.g.
+        // "call-2", not unique across sessions) can never collide in the
+        // `(tool, idem_key)`-keyed ledger.
+        let idem_key = format!("{session_id}:{call_id}");
+
+        let outcome = self
+            .gateway
+            .call(session_id, tool, args.clone(), Some(idem_key), retry_class)
+            .await
+            .map_err(|error| cybersin_runtime::ToolCallFailure {
+                // A gateway-level error (schema validation, storage) is
+                // genuinely unexpected plumbing trouble, not a normal tool
+                // failure — same "no basis to say don't retry" philosophy
+                // this bridge already used before issue #37.
+                reason: error.to_string(),
+                retriable: true,
+            })?;
+
+        match outcome {
+            GatewayOutcome::Resolved(cybersin_adapter::messages::CallOutcome::Ok { value }) => {
+                Ok(cybersin_runtime::ToolOutput {
+                    value,
+                    // The real attempt count lives in the ledger row
+                    // (`cybersin dlq show <call-id>`) but `GatewayOutcome`
+                    // doesn't carry it back here — 0 mirrors this bridge's
+                    // pre-issue-#37 behavior rather than inventing a
+                    // number this call site can't see.
+                    retries: 0,
+                    // TODO(issue #35 follow-up): real per-tool cost
+                    // metering. `cybersin_sandbox::ExecOutcome` carries no
+                    // cost data today, so this mirrors the pre-Phase-3
+                    // stub's flat placeholder rather than inventing false
+                    // precision.
+                    usd_cost: 0.0008,
+                })
+            }
+            GatewayOutcome::Resolved(cybersin_adapter::messages::CallOutcome::Failed {
+                reason,
+                retriable,
+            }) => Err(cybersin_runtime::ToolCallFailure { reason, retriable }),
+            GatewayOutcome::Parked { .. } => {
+                // Can't happen — see this struct's doc comment — but fail
+                // closed rather than panic if it ever does.
+                Err(cybersin_runtime::ToolCallFailure {
+                    reason: format!(
+                        "tool {tool:?} unexpectedly required approval on a live-session ungated \
+call path"
+                    ),
+                    retriable: false,
+                })
+            }
+        }
     }
 }
 
@@ -720,33 +774,86 @@ but egress allowlisting is not yet implemented — refusing to run with an ambig
         assert_eq!(std::fs::read_to_string(victim).unwrap(), "do not overwrite");
     }
 
-    #[tokio::test]
-    async fn gateway_tool_caller_maps_a_successful_execution() {
+    async fn in_memory_storage() -> Arc<dyn Storage> {
+        Arc::new(cybersin_runtime::SqliteStorage::in_memory().await.unwrap())
+    }
+
+    #[derive(Default)]
+    struct FlakyBackend {
+        /// Number of leading calls that fail before this backend starts
+        /// succeeding — lets a test prove the gateway's retry-class
+        /// budget actually runs the executor again in-line.
+        fails_first: usize,
+        calls: AtomicUsize,
+    }
+
+    impl SandboxBackend for FlakyBackend {
+        fn exec(&self, _request: ExecRequest) -> std::io::Result<ExecOutcome> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            if attempt < self.fails_first {
+                return Ok(ExecOutcome {
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: "transient failure".into(),
+                    termination: Termination::Exited,
+                });
+            }
+            Ok(ExecOutcome {
+                exit_code: Some(0),
+                stdout: serde_json::json!({"ok": true}).to_string(),
+                stderr: String::new(),
+                termination: Termination::Exited,
+            })
+        }
+    }
+
+    struct AlwaysFailBackend;
+
+    impl SandboxBackend for AlwaysFailBackend {
+        fn exec(&self, _request: ExecRequest) -> std::io::Result<ExecOutcome> {
+            Ok(ExecOutcome {
+                exit_code: Some(1),
+                stdout: String::new(),
+                stderr: "permanent failure".into(),
+                termination: Termination::Exited,
+            })
+        }
+    }
+
+    async fn gateway_tool_caller(
+        tool: &'static str,
+        tool_policy: ToolPolicy,
+        backend: impl SandboxBackend + Send + Sync + 'static,
+    ) -> (tempfile::TempDir, Arc<dyn Storage>, GatewayToolCaller) {
         let mut dist = DistFixture::load_dir(bundled_stub_dist_dir()).unwrap();
         dist.tools.clear();
-        dist.tools.insert(
-            "citation_lookup".into(),
-            policy(Some(vec!["python3", "citation_lookup.py"]), vec![]),
-        );
+        dist.tools.insert(tool.into(), tool_policy);
+        let dist = Arc::new(dist);
         let state = tempfile::tempdir().unwrap();
-        let outcome = ExecOutcome {
-            exit_code: Some(0),
-            stdout: serde_json::json!({"ok": true}).to_string(),
-            stderr: String::new(),
-            termination: Termination::Exited,
-        };
         let inner = SandboxToolExecutor::new(
-            Arc::new(dist),
+            dist.clone(),
             PathBuf::new(),
-            Arc::new(FixedBackend(outcome)),
+            Arc::new(backend),
             Arc::new(WorkspaceStore::new(state.path()).unwrap()),
         );
-        let bridge = GatewayToolCaller::new(Arc::new(inner));
+        let storage = in_memory_storage().await;
+        let bridge = GatewayToolCaller::new(Arc::new(inner), storage.clone(), dist);
+        (state, storage, bridge)
+    }
+
+    #[tokio::test]
+    async fn gateway_tool_caller_maps_a_successful_execution() {
+        let (_state, _storage, bridge) = gateway_tool_caller(
+            "citation_lookup",
+            policy(Some(vec!["python3", "citation_lookup.py"]), vec![]),
+            FlakyBackend::default(),
+        )
+        .await;
 
         let output = cybersin_runtime::ToolCaller::call(
             &bridge,
             "session-1",
-            "citation_lookup:k1",
+            "call-1",
             "citation_lookup",
             &serde_json::json!({}),
         )
@@ -754,19 +861,20 @@ but egress allowlisting is not yet implemented — refusing to run with an ambig
         .unwrap();
 
         assert_eq!(output.value, serde_json::json!({"ok": true}));
-        assert_eq!(output.retries, 0);
         assert_eq!(output.usd_cost, 0.0008);
     }
 
     #[tokio::test]
     async fn gateway_tool_caller_propagates_a_failure_reason_unchanged() {
         let (_root, executor) = executor([]);
-        let bridge = GatewayToolCaller::new(Arc::new(executor));
+        let storage = in_memory_storage().await;
+        let dist = Arc::new(DistFixture::load_dir(bundled_stub_dist_dir()).unwrap());
+        let bridge = GatewayToolCaller::new(Arc::new(executor), storage, dist);
 
         let error = cybersin_runtime::ToolCaller::call(
             &bridge,
             "session-1",
-            "missing:k1",
+            "call-1",
             "missing",
             &serde_json::json!({}),
         )
@@ -774,8 +882,76 @@ but egress allowlisting is not yet implemented — refusing to run with an ambig
         .unwrap_err();
 
         assert_eq!(
-            error,
+            error.reason,
             "unknown tool \"missing\" (not declared in any agent.yaml)"
         );
+        // A gateway-level error (this tool was never declared, so schema
+        // validation never even runs) — no basis to say don't retry.
+        assert!(error.retriable);
+    }
+
+    #[tokio::test]
+    async fn gateway_tool_caller_admits_a_ledger_row_and_retries_within_budget() {
+        let (_state, storage, bridge) = gateway_tool_caller(
+            "citation_lookup",
+            policy(Some(vec!["python3", "citation_lookup.py"]), vec![]),
+            FlakyBackend {
+                fails_first: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let output = cybersin_runtime::ToolCaller::call(
+            &bridge,
+            "session-1",
+            "call-1",
+            "citation_lookup",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.value, serde_json::json!({"ok": true}));
+
+        // `retry_class: "read"` (from `policy()`'s helper default) allows
+        // 3 auto-retries — the ledger row now exists (issue #37's whole
+        // point: ungated live-session calls used to write no row at all)
+        // and its attempt count proves the in-line retry loop actually
+        // ran the executor 3 times before succeeding.
+        let row = storage
+            .get_tool_call("citation_lookup:session-1:call-1")
+            .await
+            .unwrap()
+            .expect("gateway admitted a ledger row for this call");
+        assert_eq!(row.status, "succeeded");
+        assert_eq!(row.attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn gateway_tool_caller_marks_critical_failures_non_retriable() {
+        let mut critical = policy(Some(vec!["python3", "citation_lookup.py"]), vec![]);
+        critical.retry_class = "critical".into();
+        let (_state, storage, bridge) =
+            gateway_tool_caller("citation_lookup", critical, AlwaysFailBackend).await;
+
+        let error = cybersin_runtime::ToolCaller::call(
+            &bridge,
+            "session-1",
+            "call-1",
+            "citation_lookup",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.retriable);
+
+        let row = storage
+            .get_tool_call("citation_lookup:session-1:call-1")
+            .await
+            .unwrap()
+            .expect("gateway admitted a ledger row for this call");
+        assert_eq!(row.status, "failed");
+        // `critical` never auto-retries: exactly one attempt.
+        assert_eq!(row.attempts, 1);
     }
 }

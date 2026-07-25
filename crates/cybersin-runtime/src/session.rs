@@ -1059,12 +1059,15 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             }
         }
 
-        // No retry-class-bounded auto-retry loop or `tool_calls` ledger row
-        // here (issue #35 Phase 3, deliberately deferred, mirroring Phase
-        // 2's egress/web_search deferrals) — one real call through
-        // `self.tool_caller`, which defaults to `StubToolCaller`
-        // reproducing this method's pre-Phase-3 hardcoded fake result
-        // byte-for-byte when no live tool caller has been attached.
+        // Whether this call gets `tool_calls` ledger admission and a
+        // retry-class-bounded auto-retry budget is a property of the
+        // attached `ToolCaller` (issue #37): `StubToolCaller`, the
+        // default, reproduces this method's pre-Phase-3 hardcoded fake
+        // result byte-for-byte with neither; `GatewayToolCaller`
+        // (`cybersin-cli`, attached by real `cybersin run` sessions) backs
+        // this call with a real `cybersin_gateway::ToolGateway`, giving it
+        // the same ledger visibility and retry budget `dlq
+        // retry`/`approve`/`deny` already have.
         let call_result = self
             .tool_caller
             .call(&self.session_id, &call_id, &tool, &args)
@@ -1082,21 +1085,14 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 serde_json::json!({ "tool": tool, "retries": retries, "usd_cost": usd_cost }),
                 CallOutcome::Ok { value },
             ),
-            Err(reason) => (
+            Err(crate::tool_caller::ToolCallFailure { reason, retriable }) => (
                 0,
                 0.0,
                 SpanStatus::Error {
                     message: reason.clone(),
                 },
                 serde_json::json!({ "tool": tool, "error": reason }),
-                // No ledger exhaustion tracking on this single-shot bridge
-                // call, so there's no basis to ever claim "don't retry
-                // this" — `true` keeps the door open rather than asserting
-                // a guarantee this path can't back up.
-                CallOutcome::Failed {
-                    reason,
-                    retriable: true,
-                },
+                CallOutcome::Failed { reason, retriable },
             ),
         };
 

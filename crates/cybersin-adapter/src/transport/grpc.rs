@@ -7,6 +7,9 @@
 //! a loopback TCP socket (`127.0.0.1:0`, an ephemeral local port) — never
 //! a real external network service.
 
+use std::net::SocketAddr;
+use std::time::Duration;
+
 use crate::channel::{DaemonChannel, HarnessChannel, TransportError};
 use crate::messages::{DaemonMessage, HarnessMessage};
 use crate::pb::adapter_client::AdapterClient;
@@ -117,18 +120,70 @@ impl Adapter for AdapterService {
     }
 }
 
-/// Test/dev helper mirroring `transport::stdio::in_memory_pair`: stands up
-/// the gRPC service on an ephemeral loopback port, connects a client, and
-/// returns one connected (harness side, daemon side) channel pair. No
-/// external network access — `127.0.0.1` only, port 0 (OS-assigned).
-pub async fn in_memory_pair() -> (GrpcHarnessChannel, GrpcDaemonChannel) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind an ephemeral local port for the in-process gRPC test server");
-    let addr = listener.local_addr().expect("local addr of bound listener");
+/// Errors accepting the harness's first gRPC session connection
+/// (`cybersin run`'s `harness.adapter: grpc` path, issue #37) — distinct
+/// from [`TransportError`], which covers an already-established channel.
+#[derive(Debug, thiserror::Error)]
+pub enum GrpcAcceptError {
+    #[error("no harness connected within {0:?}")]
+    Timeout(Duration),
+    #[error("the gRPC adapter service stopped accepting connections")]
+    ServiceStopped,
+}
+
+/// Errors connecting to a running [`GrpcAdapterServer`] as a harness.
+#[derive(Debug, thiserror::Error)]
+pub enum GrpcConnectError {
+    #[error("connecting to {0}: {1}")]
+    Transport(String, #[source] tonic::transport::Error),
+    #[error("opening the Session stream: {0}")]
+    Rpc(#[source] Status),
+}
+
+/// A running gRPC adapter service (§10's "fast path" transport) bound to
+/// one local address. Each connecting harness's `Session` RPC becomes one
+/// [`GrpcDaemonChannel`], handed out in connection order via
+/// [`GrpcAdapterServer::accept`].
+pub struct GrpcAdapterServer {
+    addr: SocketAddr,
+    sessions: mpsc::UnboundedReceiver<GrpcDaemonChannel>,
+}
+
+impl GrpcAdapterServer {
+    /// The bound local address — pass this to whatever spawns the harness
+    /// process so it knows where to connect (`cybersin run`'s
+    /// `harness.adapter: grpc` path uses the `CYBERSIN_ADAPTER_ADDR`
+    /// environment variable for this).
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Waits up to `timeout` for one harness to connect, returning its
+    /// channel. A real caller (unlike this crate's own tests, which know a
+    /// client is about to connect) needs a bound wait: a harness process
+    /// that hangs or never speaks gRPC must not block `cybersin run`
+    /// forever.
+    pub async fn accept(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<GrpcDaemonChannel, GrpcAcceptError> {
+        tokio::time::timeout(timeout, self.sessions.recv())
+            .await
+            .map_err(|_| GrpcAcceptError::Timeout(timeout))?
+            .ok_or(GrpcAcceptError::ServiceStopped)
+    }
+}
+
+/// Starts the gRPC adapter service on `bind_addr` (`"127.0.0.1:0"` for an
+/// OS-assigned ephemeral port) in a background task and returns a handle
+/// to accept connecting harnesses from. No external network exposure is
+/// implied by this function itself — callers control `bind_addr`.
+pub async fn listen(bind_addr: &str) -> std::io::Result<GrpcAdapterServer> {
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let addr = listener.local_addr()?;
     let incoming = TcpListenerStream::new(listener);
 
-    let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+    let (session_tx, session_rx) = mpsc::unbounded_channel();
     let service = AdapterService {
         new_sessions: session_tx,
     };
@@ -140,25 +195,46 @@ pub async fn in_memory_pair() -> (GrpcHarnessChannel, GrpcDaemonChannel) {
             .await;
     });
 
+    Ok(GrpcAdapterServer {
+        addr,
+        sessions: session_rx,
+    })
+}
+
+/// Connects to a running [`GrpcAdapterServer`] as a harness, opening the
+/// `Session` bidi stream — the client-side counterpart of
+/// [`GrpcAdapterServer::accept`].
+pub async fn connect(addr: SocketAddr) -> Result<GrpcHarnessChannel, GrpcConnectError> {
     let mut client = AdapterClient::connect(format!("http://{addr}"))
         .await
-        .expect("connect to the in-process gRPC test server");
+        .map_err(|error| GrpcConnectError::Transport(addr.to_string(), error))?;
     let (out_tx, out_rx) = mpsc::channel(32);
     let outbound = ReceiverStream::new(out_rx);
     let response = client
         .session(outbound)
         .await
-        .expect("open the Session bidi stream");
-    let harness_side = GrpcHarnessChannel {
+        .map_err(GrpcConnectError::Rpc)?;
+    Ok(GrpcHarnessChannel {
         outgoing: out_tx,
         incoming: response.into_inner(),
-    };
+    })
+}
 
-    let daemon_side = session_rx
-        .recv()
+/// Test/dev helper mirroring `transport::stdio::in_memory_pair`: stands up
+/// the gRPC service on an ephemeral loopback port, connects a client, and
+/// returns one connected (harness side, daemon side) channel pair. No
+/// external network access — `127.0.0.1` only, port 0 (OS-assigned).
+pub async fn in_memory_pair() -> (GrpcHarnessChannel, GrpcDaemonChannel) {
+    let mut server = listen("127.0.0.1:0")
+        .await
+        .expect("bind an ephemeral local port for the in-process gRPC test server");
+    let harness_side = connect(server.addr())
+        .await
+        .expect("connect to the in-process gRPC test server");
+    let daemon_side = server
+        .accept(Duration::from_secs(5))
         .await
         .expect("daemon test double receives the new session handoff");
-
     (harness_side, daemon_side)
 }
 

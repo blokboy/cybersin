@@ -2,29 +2,41 @@
 //!
 //! Two paths: `--stub` drives the M1 stub agent against a hand-written
 //! `dist/` fixture (spec §14's M1 exit criterion); `<agent.yaml>` (issue
-//! #35 Phase 3) spawns the declared `harness: { adapter: process, command:
-//! [...] }` process and drives a real `RuntimeDaemon` session against it
-//! over the stdio adapter protocol (spec §10), with live OpenRouter model
-//! calling (Phase 1) and sandboxed tool execution (Phase 2) both wired in.
-//! gRPC transport and full retry-class-bounded tool-call ledger
-//! integration are out of scope for this issue — see
-//! `crate::tool_executor::GatewayToolCaller`'s doc comment for the latter.
+//! #35 Phase 3) spawns the declared `harness: { adapter, command: [...] }`
+//! process and drives a real `RuntimeDaemon` session against it, with live
+//! OpenRouter model calling (Phase 1), sandboxed tool execution (Phase 2),
+//! and gateway-backed ledger/retry semantics for ungated tool calls (issue
+//! #37) all wired in. `harness.adapter` selects the transport (spec §10):
+//! `process` speaks newline-JSON over the spawned process's own
+//! stdin/stdout; `grpc` spawns the process with its connect address in
+//! `CYBERSIN_ADAPTER_ADDR` and accepts its `Session` RPC instead.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use clap::Args;
+use cybersin_adapter::channel::DaemonChannel;
+use cybersin_adapter::transport::grpc;
 use cybersin_adapter::transport::stdio::StdioDaemonChannel;
 use cybersin_runtime::{
     stub_agent, DaemonHandle, DistFixture, ModelAllowlist, OpenRouterModelCaller,
 };
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 
 use crate::harness_config::AgentMeta;
 use crate::tool_executor::{self, GatewayToolCaller};
+
+/// How long `cybersin run`'s `harness.adapter: grpc` path waits for the
+/// spawned harness process to open its `Session` RPC before giving up —
+/// bounded so a harness that hangs or never speaks gRPC can't block
+/// forever. Internal plumbing, not exposed as a CLI flag (matches this
+/// codebase's existing `CYBERSIN_CONTAINER_RUNTIME`-style scope
+/// discipline for knobs nothing has asked to configure yet).
+const GRPC_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -154,30 +166,18 @@ async fn run_live(
 
     let executor = tool_executor::configured_executor(&dist_dir, &sandbox_root, sandbox_backend)
         .context("configuring live tool execution")?;
-    let tool_caller = GatewayToolCaller::new(executor);
+    let tool_caller = GatewayToolCaller::new(executor, daemon.storage(), dist.clone());
 
     let session_id = args
         .session_id
         .unwrap_or_else(|| format!("sess-{}", now_unix_ms()));
 
     println!(
-        "spawning harness: session={session_id} agent={agent_name} command={:?}",
-        meta.harness.command
+        "spawning harness: session={session_id} agent={agent_name} command={:?} (adapter={})",
+        meta.harness.command, meta.harness.adapter
     );
 
-    let mut child = Command::new(&meta.harness.command[0])
-        .args(&meta.harness.command[1..])
-        .current_dir(project_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| format!("spawning harness process {:?}", meta.harness.command))?;
-
-    let child_stdin = child.stdin.take().expect("stdin piped above");
-    let child_stdout = child.stdout.take().expect("stdout piped above");
-    let channel = StdioDaemonChannel::new(child_stdout, child_stdin);
+    let (mut child, channel) = spawn_harness(&meta.harness, project_dir).await?;
 
     let mut runtime_daemon = cybersin_runtime::RuntimeDaemon::new(
         channel,
@@ -198,23 +198,32 @@ async fn run_live(
     if let Err(err) = runtime_daemon.start_session(inputs).await {
         return Err(harness_crash_or(&mut child, err.into()).await);
     }
-    let mut daemon_task = tokio::spawn(runtime_daemon.run());
 
+    // `runtime_daemon.run()` is driven inline via `select!`, not
+    // `tokio::spawn`ed onto its own task: `GrpcDaemonChannel` (tonic's
+    // `Streaming<T>` inside it) is `Send` but not `Sync`, and
+    // `tokio::spawn`'s `Send`-future requirement — which flows through
+    // `&self`/`&mut self` held across this method's await points — needs
+    // `Sync` too. Polling both futures together in this same task via
+    // `select!` needs neither: losing branch is dropped automatically,
+    // taking the place of the old `daemon_task.abort()`.
     let summary = tokio::select! {
-        result = &mut daemon_task => {
+        result = runtime_daemon.run() => {
             // The daemon loop ended on its own (SessionComplete or a
             // closed channel) — reap the child now that its stdin (owned
             // by the dropped RuntimeDaemon's channel) has closed; a
             // well-behaved harness exits promptly once it sees EOF.
-            match result.context("daemon task panicked")? {
-                Ok(summary) => summary,
+            match result {
+                Ok(summary) => {
+                    let _ = child.wait().await;
+                    summary
+                }
                 Err(err) => return Err(harness_crash_or(&mut child, err.into()).await),
             }
         }
         status = child.wait() => {
             // The process exited before the daemon observed completion —
             // a crash, not a normal end of session.
-            daemon_task.abort();
             let status = status.context("waiting on harness process")?;
             anyhow::bail!(
                 "harness process exited unexpectedly ({}) before completing the session",
@@ -228,6 +237,77 @@ async fn run_live(
 
     print_summary(&summary);
     Ok(())
+}
+
+/// Spawns `harness.command` and returns its process handle plus a
+/// connected channel, wired up per `harness.adapter` (spec §10):
+/// `"process"` pipes the child's own stdin/stdout for the newline-JSON
+/// protocol; `"grpc"` starts a local gRPC listener, tells the child where
+/// to connect via `CYBERSIN_ADAPTER_ADDR`, and accepts its `Session` RPC
+/// — racing that accept against the child exiting early, so a harness
+/// that crashes before ever connecting produces a clear "exited
+/// unexpectedly" error instead of hanging until `GRPC_ACCEPT_TIMEOUT`.
+/// `harness_config::AgentMeta::from_agent_yaml` already restricts
+/// `adapter` to these two values, so anything else is unreachable here.
+async fn spawn_harness(
+    harness: &crate::harness_config::HarnessConfig,
+    project_dir: &Path,
+) -> anyhow::Result<(Child, Box<dyn DaemonChannel>)> {
+    match harness.adapter.as_str() {
+        "grpc" => {
+            let mut server = grpc::listen("127.0.0.1:0")
+                .await
+                .context("starting the gRPC adapter listener")?;
+            let addr: SocketAddr = server.addr();
+
+            let mut child = Command::new(&harness.command[0])
+                .args(&harness.command[1..])
+                .current_dir(project_dir)
+                .env("CYBERSIN_ADAPTER_ADDR", addr.to_string())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true)
+                .spawn()
+                .with_context(|| format!("spawning harness process {:?}", harness.command))?;
+
+            let channel = tokio::select! {
+                accepted = server.accept(GRPC_ACCEPT_TIMEOUT) => {
+                    accepted.with_context(|| {
+                        format!(
+                            "waiting for harness process {:?} to connect over gRPC",
+                            harness.command
+                        )
+                    })?
+                }
+                status = child.wait() => {
+                    let status = status.context("waiting on harness process")?;
+                    anyhow::bail!(
+                        "harness process exited unexpectedly ({}) before connecting over gRPC",
+                        status
+                            .code()
+                            .map(|code| format!("code {code}"))
+                            .unwrap_or_else(|| "killed by signal".to_string())
+                    );
+                }
+            };
+            Ok((child, Box::new(channel) as Box<dyn DaemonChannel>))
+        }
+        _ => {
+            let mut child = Command::new(&harness.command[0])
+                .args(&harness.command[1..])
+                .current_dir(project_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true)
+                .spawn()
+                .with_context(|| format!("spawning harness process {:?}", harness.command))?;
+            let child_stdin = child.stdin.take().expect("stdin piped above");
+            let child_stdout = child.stdout.take().expect("stdout piped above");
+            let channel = StdioDaemonChannel::new(child_stdout, child_stdin);
+            Ok((child, Box::new(channel) as Box<dyn DaemonChannel>))
+        }
+    }
 }
 
 /// Waits for `child` to exit and, if it exited non-zero, returns a clear
