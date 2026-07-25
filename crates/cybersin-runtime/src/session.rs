@@ -788,7 +788,20 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 .get_tool_call(&call_id)
                 .await?
                 .expect("ledger row exists: this method just admitted it");
-            if row.status != "pending" || !row.awaiting_approval {
+            // `status` transitioning away from `"pending"` is the only
+            // real completion signal -- `awaiting_approval` clears first,
+            // as a bookkeeping step, in both `ToolGateway::approve` (well
+            // before the tool it then actually runs finishes -- a
+            // Docker-backed call can take seconds) and `::deny` (a much
+            // smaller window, same ordering). Breaking on `!awaiting_approval`
+            // alone raced that gap and read a still-`"pending"` row with no
+            // `failure_reason` yet, which `finish_parked_tool_call` then
+            // reported to the harness as an empty-reason failure even
+            // though the ledger went on to record a genuine success --
+            // first surfaced live via a real `cybersin approve` resolving
+            // a Docker-sandboxed tool call from a second process while this
+            // loop was polling.
+            if row.status != "pending" {
                 break row;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -964,7 +977,31 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         };
 
         let spans_before = self.session_span_count().await?;
-        let response = self.route_executor.execute(&request).await?;
+        let response = match self.route_executor.execute(&request).await {
+            Ok(response) => response,
+            // A routing failure (every cascade step/fallback errored or
+            // missed its confidence bar, a missing prompt, a corrupt
+            // artifact) is a failure of *this call*, not of the session --
+            // report it back over the channel as an ordinary `call.result`
+            // failure, the same way a denied budget-ask or a failed tool
+            // call already does, rather than `?`-propagating it out of
+            // `run()` and dropping the channel out from under a harness
+            // still waiting on this exact reply (issue #48: that turned an
+            // ordinary, actionable model-call error into an unrelated
+            // "channel closed" panic on the harness side).
+            Err(error) => {
+                self.channel
+                    .send(DaemonMessage::CallResult {
+                        call_id,
+                        outcome: CallOutcome::Failed {
+                            reason: error.to_string(),
+                            retriable: false,
+                        },
+                    })
+                    .await?;
+                return Ok(0);
+            }
+        };
         let spans_recorded = self
             .session_span_count()
             .await?

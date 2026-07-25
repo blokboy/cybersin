@@ -207,8 +207,17 @@ async fn run_live(
     // `Sync` too. Polling both futures together in this same task via
     // `select!` needs neither: losing branch is dropped automatically,
     // taking the place of the old `daemon_task.abort()`.
+    //
+    // `run(self)` takes ownership, so its future is created once and
+    // pinned here rather than re-invoked per `select!` iteration — a
+    // clean-exit `child.wait()` win (below) needs to keep polling this
+    // exact future afterward, which `runtime_daemon.run()` a second time
+    // couldn't do (`runtime_daemon` is moved into it the first time).
+    let daemon_fut = runtime_daemon.run();
+    tokio::pin!(daemon_fut);
+
     let summary = tokio::select! {
-        result = runtime_daemon.run() => {
+        result = &mut daemon_fut => {
             // The daemon loop ended on its own (SessionComplete or a
             // closed channel) — reap the child now that its stdin (owned
             // by the dropped RuntimeDaemon's channel) has closed; a
@@ -222,16 +231,32 @@ async fn run_live(
             }
         }
         status = child.wait() => {
-            // The process exited before the daemon observed completion —
-            // a crash, not a normal end of session.
             let status = status.context("waiting on harness process")?;
-            anyhow::bail!(
-                "harness process exited unexpectedly ({}) before completing the session",
-                status
-                    .code()
-                    .map(|code| format!("code {code}"))
-                    .unwrap_or_else(|| "killed by signal".to_string())
-            );
+            if !status.success() {
+                anyhow::bail!(
+                    "harness process exited unexpectedly ({}) before completing the session",
+                    status
+                        .code()
+                        .map(|code| format!("code {code}"))
+                        .unwrap_or_else(|| "killed by signal".to_string())
+                );
+            }
+            // A clean exit winning this race only means this branch got
+            // polled before `daemon_fut` was polled again — the harness
+            // closes its pipe only *after* writing `session.complete`, so
+            // that message is already sitting in the channel's read
+            // buffer, not lost. Await the same daemon future through to
+            // its own completion instead of treating an ordinary,
+            // successful exit as a crash: first surfaced live as a fully
+            // successful scripted run (every step, including a
+            // Docker-sandboxed approval, resolved correctly) that still
+            // reported "exited unexpectedly (code 0)" purely because the
+            // OS happened to reap the harness before this task's next
+            // poll of the daemon loop.
+            match daemon_fut.await {
+                Ok(summary) => summary,
+                Err(err) => return Err(err.into()),
+            }
         }
     };
 

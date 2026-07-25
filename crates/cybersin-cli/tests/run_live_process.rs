@@ -50,3 +50,53 @@ tools: []
         .stderr(predicate::str::contains("exited unexpectedly"))
         .stderr(predicate::str::contains("code 3"));
 }
+
+/// Regression test: a harness that finishes every step and sends
+/// `session.complete` before exiting must be reported as a completed
+/// session, not a crash, even if the OS happens to reap the harness
+/// process before `runtime_daemon.run()` is next polled. `printf` (a
+/// direct exec, not `sh -c`, so there's no shell startup latency at all)
+/// writes the closing message and exits about as fast as an OS process
+/// can, which reliably wins that race in practice -- first surfaced live
+/// as a fully successful scripted run (every step, including a
+/// Docker-sandboxed approval, resolved correctly) that still printed
+/// "exited unexpectedly (code 0)".
+#[test]
+fn a_harness_process_that_completes_and_exits_immediately_is_reported_as_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("cybersin.db");
+    let agent_yaml = dir.path().join("fast-complete.agent.yaml");
+    std::fs::write(
+        &agent_yaml,
+        r#"
+name: fast-complete-agent
+harness:
+  adapter: process
+  command: ["printf", "%s\n", "{\"type\":\"session.complete\",\"session_id\":\"sess-race-test\",\"result\":{}}"]
+budget:
+  usd_per_session: 1.00
+  on_breach: degrade
+tools: []
+"#,
+    )
+    .unwrap();
+
+    let dist_dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/ic1-research-team/dist"
+    );
+
+    cybersin()
+        .env("OPENROUTER_API_KEY", "test-key-not-validated")
+        .arg("--db")
+        .arg(&db)
+        .arg("--dist")
+        .arg(dist_dir)
+        .arg("run")
+        .arg("--session-id")
+        .arg("sess-race-test")
+        .arg(&agent_yaml)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("completed"));
+}

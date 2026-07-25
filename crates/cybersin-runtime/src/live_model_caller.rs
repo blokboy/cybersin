@@ -229,6 +229,23 @@ impl ModelCaller for OpenRouterModelCaller {
         });
         if !rendered.tools.is_empty() {
             body["tools"] = Value::Array(rendered.tools.clone());
+            // This call is one-shot: it sends a request and returns
+            // whatever came back, with no follow-up turn to execute a
+            // tool call and feed its result back in (that loop lives at
+            // the harness level, over separate `tool.request` messages --
+            // spec §10 -- not nested inside a single model completion).
+            // Leaving `tool_choice` at its default lets a real model
+            // freely pick a tool over answering `response_format`
+            // directly, which capable models do -- first surfaced live as
+            // a cascade step's response having `finish_reason: "tool_calls"`
+            // and a null `message.content`, which this module then reports
+            // as "had no message content" and the cascade above treats as
+            // an ordinary call failure. Forcing `"none"` keeps the tool
+            // list available to the schema/prompt (a prompt may still
+            // reference its own declared tools in its body text) while
+            // guaranteeing this specific call always answers in the
+            // structured shape the cascade actually needs.
+            body["tool_choice"] = json!("none");
         }
 
         let http_response = self
@@ -305,7 +322,7 @@ mod tests {
     use cybersin_ir::{OutputContract, QualityTier, Section};
     use cybersin_router::{ModelKind, RoutingArtifact};
     use std::collections::BTreeMap as StdBTreeMap;
-    use wiremock::matchers::{body_json, method, path};
+    use wiremock::matchers::{body_json, body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn dist_with_prompt(prompt: PromptIr) -> Arc<DistFixture> {
@@ -616,5 +633,66 @@ accept at or above 0.90.",
         std::env::remove_var("OPENROUTER_API_KEY");
         let error = OpenRouterModelCaller::from_env(dist_with_prompt(researcher_prompt()));
         assert!(error.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_prompt_declaring_tools_forces_tool_choice_none() {
+        // Regression test: this `ModelCaller` makes exactly one call and
+        // returns -- it has no follow-up turn to execute a tool call and
+        // feed the result back in, so a real model offered both `tools`
+        // and a `response_format` is free to pick the tool instead, which
+        // it will (first surfaced live: a real cascade step came back with
+        // `finish_reason: "tool_calls"` and null `message.content`, which
+        // this module reported as "had no message content" and the
+        // cascade above treated as an ordinary call failure, exhausting
+        // every step). `tool_choice: "none"` must be sent whenever tools
+        // are, so the model always answers in the structured shape this
+        // call actually needs.
+        let prompt_with_tools = PromptIr::new(
+            "researcher",
+            QualityTier::High,
+            StdBTreeMap::new(),
+            vec!["web_search".into(), "web_fetch".into()],
+            vec![Section {
+                id: "assignment".into(),
+                priority: 90,
+                body: "Investigate {{ topic }}.".into(),
+                dedup_ref: None,
+            }],
+            Some(OutputContract {
+                contract_type: "json_schema".into(),
+                schema: r#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}"#.into(),
+            }),
+        );
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({"tool_choice": "none"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "{\"summary\": \"done\", \"__cascade_confidence\": 0.95}"
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let caller = OpenRouterModelCaller::new(dist_with_prompt(prompt_with_tools), "test-key")
+            .with_base_url(server.uri());
+
+        let output = caller
+            .call(
+                &model(),
+                "researcher",
+                &json!({"topic": "evidence quality"}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.confidence, 0.95);
     }
 }

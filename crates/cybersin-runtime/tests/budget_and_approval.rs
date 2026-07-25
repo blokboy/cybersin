@@ -16,16 +16,19 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use cybersin_adapter::messages::{AbortReason, CallOutcome};
 use cybersin_adapter::stub_harness::{CallOutcomeOrPark, StubHarness};
 use cybersin_adapter::transport::stdio::in_memory_pair;
-use cybersin_gateway::{EchoExecutor, ToolGateway};
+use cybersin_gateway::{EchoExecutor, ToolExecutor, ToolGateway};
+use cybersin_router::RouteModel;
 use cybersin_runtime::{
-    bundled_stub_dist_dir, BudgetConfig, DaemonHandle, DistFixture, OnBreach, RuntimeDaemon,
-    SessionSupervisor, Storage,
+    bundled_stub_dist_dir, BudgetConfig, DaemonHandle, DistFixture, ModelAllowlist, ModelCaller,
+    ModelOutput, OnBreach, RuntimeDaemon, SessionSupervisor, Storage,
 };
 use cybersin_trace::{SpanFilter, SpanKind, SpanStore};
 use serde_json::json;
+use serde_json::Value;
 
 fn researcher_inputs() -> serde_json::Value {
     json!({ "topic": "cybernetics", "depth": "quick", "documents": [] })
@@ -460,4 +463,177 @@ async fn approval_wait_survives_a_simulated_process_restart_for_free() {
         .unwrap()
         .unwrap();
     assert_eq!(session.status, "running");
+}
+
+/// An executor slow enough to hold the ledger row in `awaiting_approval:
+/// false, status: "pending"` for `delay` -- long enough that a poll loop
+/// racing that window on its 25ms tick would very likely observe it, the
+/// same shape a real Docker-backed tool call gives the race in practice.
+struct SlowExecutor {
+    delay: std::time::Duration,
+}
+
+#[async_trait]
+impl ToolExecutor for SlowExecutor {
+    async fn execute(
+        &self,
+        _session_id: &str,
+        _call_id: &str,
+        tool: &str,
+        args: &Value,
+    ) -> Result<Value, String> {
+        tokio::time::sleep(self.delay).await;
+        Ok(json!({"tool": tool, "echoed_args": args, "status": "ok"}))
+    }
+}
+
+/// Regression test: `ToolGateway::approve` clears `awaiting_approval`
+/// *before* it actually executes the tool and records a terminal status,
+/// so a concurrent `park_for_approval` poll loop (a completely different
+/// process in the real `cybersin approve` case) must key off `status`
+/// alone -- not `awaiting_approval` -- or it can observe that
+/// intermediate window and report a stale, still-`"pending"` row to the
+/// harness as an empty-reason failure, even though the ledger goes on to
+/// record a genuine success moments later (first surfaced live: a real
+/// `cybersin approve` resolving a Docker-sandboxed `publish_report` call
+/// from a second process).
+#[tokio::test]
+async fn approval_resolved_by_a_slow_tool_call_is_not_reported_as_a_premature_failure() {
+    let storage: Arc<dyn Storage> =
+        Arc::new(cybersin_runtime::SqliteStorage::in_memory().await.unwrap());
+    let spans = SpanStore::in_memory().await.unwrap();
+    let dist = Arc::new(DistFixture::load_dir(bundled_stub_dist_dir()).unwrap());
+    assert!(
+        dist.tool_policy("wire_transfer")
+            .unwrap()
+            .requires_approval(),
+        "fixture sanity: wire_transfer must be the approval-gated tool"
+    );
+
+    let (harness_io, daemon_io) = in_memory_pair();
+    let mut daemon = RuntimeDaemon::new(
+        daemon_io,
+        storage.clone(),
+        spans.clone(),
+        dist,
+        "sess-slow-approval",
+        "agent-a",
+    );
+    daemon.start_session(json!({})).await.unwrap();
+    let daemon_task = tokio::spawn(daemon.run());
+
+    let mut harness = StubHarness::new(harness_io);
+    harness.recv_session_start().await;
+
+    let (call_id, outcome) = harness
+        .tool_request("wire_transfer", json!({"amount": 10_000}), None)
+        .await;
+    let approval_id = match outcome {
+        CallOutcomeOrPark::Parked(approval_id) => approval_id,
+        other => panic!("expected the critical call to park, got {other:?}"),
+    };
+
+    // A separate `ToolGateway` instance over the same `Storage` -- exactly
+    // what a completely different `cybersin approve` process would be --
+    // resolving the call through an executor slow enough to guarantee the
+    // daemon's poll loop ticks at least once while `awaiting_approval` is
+    // already clear but `status` is still `"pending"`.
+    let gateway = ToolGateway::new(
+        storage.clone(),
+        Arc::new(SlowExecutor {
+            delay: std::time::Duration::from_millis(150),
+        }),
+    );
+    let approval_id_owned = approval_id.clone();
+    tokio::spawn(async move {
+        gateway.approve(&approval_id_owned).await.unwrap();
+    });
+
+    let resumed = harness.await_result(&call_id).await;
+    match resumed {
+        CallOutcomeOrPark::Result(CallOutcome::Ok { value }) => {
+            assert_eq!(value["status"], "ok");
+        }
+        other => panic!(
+            "expected the slow approval to resolve as a genuine success, not: {other:?}"
+        ),
+    }
+
+    harness
+        .session_complete("sess-slow-approval", json!({"status": "ok"}))
+        .await;
+    harness.wait_for_close().await;
+    let summary = daemon_task.await.unwrap().unwrap();
+    assert!(summary.completed);
+}
+
+/// Every candidate errors, so `RouteExecutor::execute` returns
+/// `RouteExecutorError::Exhausted`.
+struct AlwaysFailsModelCaller;
+
+#[async_trait]
+impl ModelCaller for AlwaysFailsModelCaller {
+    async fn call(
+        &self,
+        model: &RouteModel,
+        _prompt_name: &str,
+        _inputs: &Value,
+        _confidence_instruction: Option<&str>,
+    ) -> Result<ModelOutput, String> {
+        Err(format!("simulated provider outage for {}", model.name))
+    }
+}
+
+/// Issue #48 regression: a routing failure (every cascade step/fallback
+/// erroring, here) is a failure of *this call*, not of the whole session --
+/// it must come back as an ordinary `call.result` failure so a harness
+/// blocked on that reply gets an actionable answer, rather than the daemon
+/// `?`-propagating `RouteExecutorError` out of `run()` and dropping the
+/// channel out from under it (which is what used to turn this into an
+/// unrelated "channel closed while awaiting a call reply" panic on the
+/// harness side instead of a clean error).
+#[tokio::test]
+async fn exhausted_routing_fails_the_call_instead_of_dropping_the_channel() {
+    let storage: Arc<dyn Storage> =
+        Arc::new(cybersin_runtime::SqliteStorage::in_memory().await.unwrap());
+    let spans = SpanStore::in_memory().await.unwrap();
+    let dist = Arc::new(DistFixture::load_dir(bundled_stub_dist_dir()).unwrap());
+
+    let (harness_io, daemon_io) = in_memory_pair();
+    let mut daemon = RuntimeDaemon::new(
+        daemon_io,
+        storage.clone(),
+        spans.clone(),
+        dist,
+        "sess-exhausted",
+        "agent-a",
+    )
+    .with_models(AlwaysFailsModelCaller, ModelAllowlist::allow_all());
+    daemon.start_session(json!({})).await.unwrap();
+    let daemon_task = tokio::spawn(daemon.run());
+
+    let mut harness = StubHarness::new(harness_io);
+    harness.recv_session_start().await;
+
+    let (_call_id, outcome) = harness.llm_request("researcher", researcher_inputs()).await;
+    match outcome {
+        CallOutcomeOrPark::Result(CallOutcome::Failed { reason, retriable }) => {
+            assert!(
+                reason.contains("all route decisions were exhausted"),
+                "expected the exhausted-routing reason, got: {reason}"
+            );
+            assert!(!retriable);
+        }
+        other => panic!("expected a call.result failure, got {other:?}"),
+    }
+
+    // The session itself is still alive after the failed call -- it's the
+    // harness's decision what to do next, not the daemon's, so the harness
+    // can still end things cleanly.
+    harness
+        .session_complete("sess-exhausted", json!({"status": "ok"}))
+        .await;
+    harness.wait_for_close().await;
+    let summary = daemon_task.await.unwrap().unwrap();
+    assert!(summary.completed);
 }
