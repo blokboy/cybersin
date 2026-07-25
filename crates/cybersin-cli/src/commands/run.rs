@@ -194,12 +194,34 @@ async fn run_live(
 
     let summary = tokio::select! {
         result = &mut daemon_task => {
-            // The daemon loop ended on its own (SessionComplete or a
-            // closed channel) — reap the child now that its stdin (owned
-            // by the dropped RuntimeDaemon's channel) has closed; a
-            // well-behaved harness exits promptly once it sees EOF.
-            let _ = child.wait().await;
-            result.context("daemon task panicked")??
+            // The daemon loop ended on its own — reap the child now that
+            // its stdin (owned by the dropped RuntimeDaemon's channel) has
+            // closed; a well-behaved harness exits promptly once it sees
+            // EOF. If the daemon errored, check whether that's because the
+            // harness had already crashed: a crash closes the harness's
+            // stdin/stdout out from under the channel, and the daemon's
+            // next read or write can lose the race against child.wait()
+            // below, surfacing a raw transport error instead of the
+            // process's actual exit status. Prefer the exit status when
+            // it's available and non-zero — it's the more useful signal.
+            let child_status = child.wait().await.ok();
+            match result.context("daemon task panicked")? {
+                Ok(summary) => summary,
+                Err(err) => {
+                    if let Some(status) = child_status {
+                        if !status.success() {
+                            anyhow::bail!(
+                                "harness process exited unexpectedly ({}) before completing the session",
+                                status
+                                    .code()
+                                    .map(|code| format!("code {code}"))
+                                    .unwrap_or_else(|| "killed by signal".to_string())
+                            );
+                        }
+                    }
+                    return Err(err.into());
+                }
+            }
         }
         status = child.wait() => {
             // The process exited before the daemon observed completion —
