@@ -145,6 +145,8 @@ enum Command {
     },
     /// Explain a compiled prompt's tokens, routing, cost, and operations state.
     Explain(commands::explain::ExplainArgs),
+    /// Live-refreshing Sessions/Traces/Cost control room for a project.
+    Ops(commands::ops::OpsArgs),
     /// Run the daemon. `--server` enables Postgres-backed TCP+mTLS
     /// multi-worker mode.
     Daemon(commands::daemon::DaemonArgs),
@@ -266,6 +268,14 @@ async fn main() -> ExitCode {
             };
             from_async(commands::explain::execute(db, args).await)
         }
+        // Unlike every other runtime command, `ops` resolves `--db` from
+        // its own `path` argument rather than always from CWD (issue
+        // #51): its `path` might point at a different project than the
+        // one you're standing in, so `resolve_runtime_globals` (which is
+        // hardwired to CWD) would resolve the wrong project's db. `db`
+        // is passed through unresolved for `ops::execute` to resolve
+        // itself against `args.path`.
+        Command::Ops(args) => from_async(commands::ops::execute(db, args).await),
         Command::Daemon(args) => from_async(commands::daemon::execute(args).await),
         Command::Dlq { command } => {
             let (db, sandbox_root, sandbox_backend, defaults) =

@@ -47,7 +47,7 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time"] }
 
 [dev-dependencies]
 assert_cmd = "2"

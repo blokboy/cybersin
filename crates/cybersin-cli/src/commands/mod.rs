@@ -15,6 +15,7 @@ pub mod explain;
 pub mod fmt;
 pub mod init;
 pub mod notify;
+pub mod ops;
 pub mod optimize;
 pub mod run;
 pub mod sandbox;
