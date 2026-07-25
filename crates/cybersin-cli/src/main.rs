@@ -268,14 +268,19 @@ async fn main() -> ExitCode {
             };
             from_async(commands::explain::execute(db, args).await)
         }
-        // Unlike every other runtime command, `ops` resolves `--db` from
-        // its own `path` argument rather than always from CWD (issue
-        // #51): its `path` might point at a different project than the
-        // one you're standing in, so `resolve_runtime_globals` (which is
-        // hardwired to CWD) would resolve the wrong project's db. `db`
-        // is passed through unresolved for `ops::execute` to resolve
-        // itself against `args.path`.
-        Command::Ops(args) => from_async(commands::ops::execute(db, args).await),
+        // Unlike every other runtime command, `ops` resolves `--db` (and,
+        // since issue #52's Approvals tab needs a `ToolGateway` to
+        // approve/deny in place, `--dist`/`--sandbox-root`/
+        // `--sandbox-backend` too) from its own `path` argument rather
+        // than always from CWD: its `path` might point at a different
+        // project than the one you're standing in, so
+        // `resolve_runtime_globals` (which is hardwired to CWD) would
+        // resolve the wrong project's settings. All four are passed
+        // through unresolved for `ops::execute` to resolve itself against
+        // `args.path`.
+        Command::Ops(args) => {
+            from_async(commands::ops::execute(db, dist, sandbox_root, sandbox_backend, args).await)
+        }
         Command::Daemon(args) => from_async(commands::daemon::execute(args).await),
         Command::Dlq { command } => {
             let (db, sandbox_root, sandbox_backend, defaults) =

@@ -722,6 +722,16 @@ impl Storage for PgStorage {
                 .await?,
         )
     }
+
+    async fn list_awaiting_approval(&self) -> Result<Vec<ToolCallRecord>> {
+        let rows = sqlx::query(
+            "SELECT * FROM tool_calls WHERE status = 'pending' AND awaiting_approval = TRUE
+             ORDER BY updated_unix_ms DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Self::row_to_tool_call).collect())
+    }
 }
 
 impl PgStorage {

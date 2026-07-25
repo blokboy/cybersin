@@ -283,6 +283,14 @@ pub trait Storage: Send + Sync {
     /// recently updated first.
     async fn list_dead_letters(&self) -> Result<Vec<ToolCallRecord>>;
 
+    /// Every call currently parked behind an approval gate, across all
+    /// sessions, most recently updated first — the query behind `cybersin
+    /// ops`'s Approvals tab (issue #52). The pending-side analogue of
+    /// `list_dead_letters`: `WHERE status='pending' AND
+    /// awaiting_approval=1` instead of `WHERE status='failed' AND
+    /// dropped=0`.
+    async fn list_awaiting_approval(&self) -> Result<Vec<ToolCallRecord>>;
+
     /// How many tool calls this session has ever admitted to the ledger —
     /// `cybersin-gateway`'s input to auto-deriving `"session:seq"` idem
     /// keys (spec §8.2) when a caller doesn't supply one.
@@ -976,6 +984,16 @@ impl Storage for SqliteStorage {
             .await?;
         Ok(count)
     }
+
+    async fn list_awaiting_approval(&self) -> Result<Vec<ToolCallRecord>> {
+        let rows = sqlx::query(
+            "SELECT * FROM tool_calls WHERE status = 'pending' AND awaiting_approval = 1 \
+             ORDER BY updated_unix_ms DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Self::row_to_tool_call).collect()
+    }
 }
 
 pub(crate) fn now_unix_ms() -> i64 {
@@ -1264,6 +1282,45 @@ mod tests {
             .unwrap();
         let row = storage.get_tool_call("t:k1").await.unwrap().unwrap();
         assert!(!row.awaiting_approval);
+    }
+
+    #[tokio::test]
+    async fn list_awaiting_approval_returns_only_pending_and_flagged_rows() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        // Parked: pending + awaiting_approval — must show up.
+        storage
+            .begin_tool_call("t:k1", "sess-1", "t", "k1", "write", &serde_json::json!({}))
+            .await
+            .unwrap();
+        storage
+            .set_tool_call_awaiting_approval("t:k1", "t:k1")
+            .await
+            .unwrap();
+
+        // Plain pending, never gated — must not show up.
+        storage
+            .begin_tool_call("t:k2", "sess-1", "t", "k2", "write", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        // Was parked, but already resolved — must not show up even though
+        // nothing ever clears the flag on a terminal row.
+        storage
+            .begin_tool_call("t:k3", "sess-1", "t", "k3", "write", &serde_json::json!({}))
+            .await
+            .unwrap();
+        storage
+            .set_tool_call_awaiting_approval("t:k3", "t:k3")
+            .await
+            .unwrap();
+        storage
+            .resolve_tool_call_succeeded("t:k3", serde_json::json!({"ok": true}))
+            .await
+            .unwrap();
+
+        let rows = storage.list_awaiting_approval().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].call_id, "t:k1");
     }
 
     #[tokio::test]

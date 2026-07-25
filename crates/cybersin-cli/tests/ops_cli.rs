@@ -9,7 +9,10 @@
 //! input can't be driven from a piped-stdin `assert_cmd` process, which
 //! is why `explain`'s own tests are `--plain`-only too.
 
+use std::sync::Arc;
+
 use assert_cmd::Command;
+use cybersin_gateway::{ApprovalGate, EchoExecutor, RetryClass, ToolGateway};
 use cybersin_runtime::DaemonHandle;
 use cybersin_trace::{CacheStatus, Span, SpanKind, SpanStatus};
 use predicates::prelude::*;
@@ -137,6 +140,54 @@ async fn ops_plain_shows_sessions_traces_and_cost_together() {
         .stdout(predicate::str::contains("stub-medium"))
         .stdout(predicate::str::contains("Cost by model"))
         .stdout(predicate::str::contains("$0.250000"));
+}
+
+#[tokio::test]
+async fn ops_plain_lists_calls_awaiting_approval() {
+    // Issue #52's `Storage::list_awaiting_approval` query, surfaced
+    // through `ops`'s plain report the same way Sessions/Traces/Cost
+    // are — the interactive Approvals tab's row selection and a/d
+    // approve/deny confirmation are verified manually against the real
+    // compiled binary under `tmux`, same as the rest of this file's
+    // interactive-TUI disclaimer.
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("myagent");
+    let db = tmp.path().join("control-room.db");
+    cybersin().arg("init").arg(&project).assert().success();
+
+    {
+        let daemon = DaemonHandle::auto_start(&db).await.unwrap();
+        daemon
+            .storage()
+            .create_session("session-52", "hello-agent")
+            .await
+            .unwrap();
+        let gateway = ToolGateway::new(daemon.storage(), Arc::new(EchoExecutor))
+            .with_policy_hook(Arc::new(ApprovalGate::for_tools(["wire_transfer"])));
+        gateway
+            .call(
+                "session-52",
+                "wire_transfer",
+                serde_json::json!({"amount": 500}),
+                Some("wt-1".to_string()),
+                RetryClass::Write,
+            )
+            .await
+            .unwrap();
+    }
+
+    cybersin()
+        .arg("--db")
+        .arg(&db)
+        .arg("ops")
+        .arg(&project)
+        .arg("--plain")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Approvals (1)"))
+        .stdout(predicate::str::contains("wire_transfer:wt-1"))
+        .stdout(predicate::str::contains("session-52"))
+        .stdout(predicate::str::contains("parked"));
 }
 
 #[test]
