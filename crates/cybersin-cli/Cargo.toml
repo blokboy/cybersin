@@ -33,6 +33,7 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.28"
 ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
@@ -44,3 +45,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "pro
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+wiremock = "0.6"
