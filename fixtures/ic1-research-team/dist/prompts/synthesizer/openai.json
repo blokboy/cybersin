@@ -30,6 +30,7 @@
     "json_schema": {
       "name": "synthesizer",
       "schema": {
+        "additionalProperties": false,
         "properties": {
           "confidence": {
             "enum": [
@@ -41,6 +42,7 @@
           },
           "findings": {
             "items": {
+              "additionalProperties": false,
               "properties": {
                 "claim": {
                   "type": "string"
