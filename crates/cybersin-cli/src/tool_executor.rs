@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,11 +13,174 @@ use cybersin_sandbox::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+const DEFAULT_TAVILY_BASE_URL: &str = "https://api.tavily.com";
+
+/// One real implementation of a built-in tool (`web_search`, `web_fetch`,
+/// ...) — the promotion path `SandboxToolExecutor::execute`'s dispatch
+/// comment named ("deliberately not a trait-object registry, since there
+/// are zero real built-in implementations to justify one yet; promote it
+/// if/when one exists"). We now have two, so it's promoted.
+#[async_trait]
+trait BuiltinTool: Send + Sync {
+    async fn call(&self, args: &Value) -> Result<Value, String>;
+}
+
+/// Shared HTTP glue for Tavily-backed built-ins (`web_search` ->
+/// `/search`, `web_fetch` -> `/extract`) — same auth (`Bearer
+/// TAVILY_API_KEY`), same client, same missing-key handling.
+///
+/// The key is read once at construction (`from_env`), not per call, but
+/// its absence is deliberately *not* a construction-time error the way
+/// `OpenRouterModelCaller::from_env` fails eagerly — these are optional
+/// built-ins, not the model-calling backbone, so an agent that never
+/// calls `web_search`/`web_fetch` must be completely unaffected by a
+/// missing key. Each call site checks for the key itself via
+/// `require_key` and fails clearly, without ever attempting a request,
+/// when it's absent.
+struct TavilyClient {
+    http: reqwest::Client,
+    api_key: Option<String>,
+    base_url: String,
+}
+
+impl TavilyClient {
+    fn new(api_key: Option<String>) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            api_key,
+            base_url: DEFAULT_TAVILY_BASE_URL.to_string(),
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::new(std::env::var("TAVILY_API_KEY").ok())
+    }
+
+    #[cfg(test)]
+    fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
+    /// `"{tool}: no provider configured"` — the exact error shape this
+    /// crate used before either tool had a real implementation, preserved
+    /// so the absence of a key degrades exactly like it always did.
+    fn require_key(&self, tool: &str) -> Result<&str, String> {
+        self.api_key
+            .as_deref()
+            .ok_or_else(|| format!("{tool}: no provider configured"))
+    }
+}
+
+struct WebSearchTool(Arc<TavilyClient>);
+
+#[async_trait]
+impl BuiltinTool for WebSearchTool {
+    async fn call(&self, args: &Value) -> Result<Value, String> {
+        let api_key = self.0.require_key("web_search")?;
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "web_search: args.query must be a string".to_string())?;
+
+        let response = self
+            .0
+            .http
+            .post(format!("{}/search", self.0.base_url))
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({ "query": query }))
+            .send()
+            .await
+            .map_err(|error| format!("calling Tavily search: {error}"))?;
+        let status = response.status();
+        let payload: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("parsing Tavily search response: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("Tavily search returned {status}: {payload}"));
+        }
+
+        Ok(serde_json::json!({
+            "answer": payload.get("answer").cloned().unwrap_or(Value::Null),
+            "results": payload.get("results").cloned().unwrap_or(Value::Array(Vec::new())),
+        }))
+    }
+}
+
+struct WebFetchTool(Arc<TavilyClient>);
+
+#[async_trait]
+impl BuiltinTool for WebFetchTool {
+    async fn call(&self, args: &Value) -> Result<Value, String> {
+        let api_key = self.0.require_key("web_fetch")?;
+        let url = args
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "web_fetch: args.url must be a string".to_string())?;
+
+        let response = self
+            .0
+            .http
+            .post(format!("{}/extract", self.0.base_url))
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({ "urls": [url] }))
+            .send()
+            .await
+            .map_err(|error| format!("calling Tavily extract: {error}"))?;
+        let status = response.status();
+        let payload: Value = response
+            .json()
+            .await
+            .map_err(|error| format!("parsing Tavily extract response: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("Tavily extract returned {status}: {payload}"));
+        }
+
+        if let Some(failure) = payload
+            .get("failed_results")
+            .and_then(Value::as_array)
+            .and_then(|failures| failures.first())
+        {
+            let reason = failure
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
+            return Err(format!(
+                "web_fetch: Tavily failed to extract {url:?}: {reason}"
+            ));
+        }
+        let result = payload
+            .get("results")
+            .and_then(Value::as_array)
+            .and_then(|results| results.first())
+            .ok_or_else(|| format!("web_fetch: Tavily returned no result for {url:?}"))?;
+
+        Ok(serde_json::json!({
+            "url": result.get("url").cloned().unwrap_or(Value::String(url.to_string())),
+            "content": result.get("raw_content").cloned().unwrap_or(Value::Null),
+        }))
+    }
+}
+
+fn default_builtins() -> HashMap<&'static str, Arc<dyn BuiltinTool>> {
+    builtins_for(TavilyClient::from_env())
+}
+
+fn builtins_for(tavily: TavilyClient) -> HashMap<&'static str, Arc<dyn BuiltinTool>> {
+    let tavily = Arc::new(tavily);
+    let mut map: HashMap<&'static str, Arc<dyn BuiltinTool>> = HashMap::new();
+    map.insert("web_search", Arc::new(WebSearchTool(tavily.clone())));
+    map.insert("web_fetch", Arc::new(WebFetchTool(tavily)));
+    map
+}
+
 pub struct SandboxToolExecutor<B: ?Sized> {
     dist: Arc<DistFixture>,
     tool_assets: PathBuf,
     backend: Arc<B>,
     workspaces: Arc<WorkspaceStore>,
+    builtins: HashMap<&'static str, Arc<dyn BuiltinTool>>,
 }
 
 impl<B: ?Sized> SandboxToolExecutor<B> {
@@ -31,7 +195,17 @@ impl<B: ?Sized> SandboxToolExecutor<B> {
             tool_assets,
             backend,
             workspaces,
+            builtins: default_builtins(),
         }
+    }
+
+    /// Test-only override of the Tavily-backed built-ins, so unit tests
+    /// can point `web_search`/`web_fetch` at a `wiremock` server instead
+    /// of a real, unconfigured, or absent `TAVILY_API_KEY`.
+    #[cfg(test)]
+    fn with_tavily(mut self, tavily: TavilyClient) -> Self {
+        self.builtins = builtins_for(tavily);
+        self
     }
 }
 
@@ -184,10 +358,9 @@ implemented — refusing to run with an ambiguous network posture",
             ));
         }
         if policy.is_builtin() {
-            return match tool {
-                // TODO(issue #35): wire a real search provider.
-                "web_search" => Err("web_search: no provider configured".into()),
-                _ => Err(format!(
+            return match self.builtins.get(tool) {
+                Some(builtin) => builtin.call(args).await,
+                None => Err(format!(
                     "tool {tool:?} is declared without `run` and has no built-in implementation"
                 )),
             };
@@ -953,5 +1126,170 @@ but egress allowlisting is not yet implemented — refusing to run with an ambig
         assert_eq!(row.status, "failed");
         // `critical` never auto-retries: exactly one attempt.
         assert_eq!(row.attempts, 1);
+    }
+
+    fn executor_with_tavily(
+        tavily: TavilyClient,
+    ) -> (tempfile::TempDir, SandboxToolExecutor<PanicBackend>) {
+        let mut dist = DistFixture::load_dir(bundled_stub_dist_dir()).unwrap();
+        dist.tools.clear();
+        dist.tools.insert("web_search".into(), policy(None, vec![]));
+        dist.tools.insert("web_fetch".into(), policy(None, vec![]));
+        let root = tempfile::tempdir().unwrap();
+        let workspaces = Arc::new(WorkspaceStore::new(root.path()).unwrap());
+        (
+            root,
+            SandboxToolExecutor::new(
+                Arc::new(dist),
+                PathBuf::new(),
+                Arc::new(PanicBackend),
+                workspaces,
+            )
+            .with_tavily(tavily),
+        )
+    }
+
+    #[tokio::test]
+    async fn web_search_calls_tavily_and_returns_results() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/search"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "query": "evidence-backed cybernetics"
+            })))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "query": "evidence-backed cybernetics",
+                "answer": "Cybernetics studies control and communication.",
+                "results": [
+                    {"title": "Cybernetics", "url": "https://example.com/cyb", "content": "...", "score": 0.9}
+                ],
+                "response_time": 0.1,
+                "usage": {"credits": 1},
+                "request_id": "req-1"
+            })))
+            .mount(&server)
+            .await;
+
+        let (_root, executor) = executor_with_tavily(
+            TavilyClient::new(Some("test-key".into())).with_base_url(server.uri()),
+        );
+
+        let result = executor
+            .execute(
+                "session-1",
+                "web_search:k1",
+                "web_search",
+                &serde_json::json!({"query": "evidence-backed cybernetics"}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "answer": "Cybernetics studies control and communication.",
+                "results": [
+                    {"title": "Cybernetics", "url": "https://example.com/cyb", "content": "...", "score": 0.9}
+                ],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_calls_tavily_extract_and_returns_content() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/extract"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "urls": ["https://example.com/cyb"]
+            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [
+                        {"url": "https://example.com/cyb", "raw_content": "# Cybernetics\n..."}
+                    ],
+                    "failed_results": [],
+                    "response_time": 0.1,
+                    "usage": {"credits": 1},
+                    "request_id": "req-2"
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let (_root, executor) = executor_with_tavily(
+            TavilyClient::new(Some("test-key".into())).with_base_url(server.uri()),
+        );
+
+        let result = executor
+            .execute(
+                "session-1",
+                "web_fetch:k1",
+                "web_fetch",
+                &serde_json::json!({"url": "https://example.com/cyb"}),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "url": "https://example.com/cyb",
+                "content": "# Cybernetics\n...",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_surfaces_a_clear_error_when_tavily_extraction_fails() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/extract"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "results": [],
+                    "failed_results": [
+                        {"url": "https://example.com/gone", "error": "404: page not found"}
+                    ]
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let (_root, executor) = executor_with_tavily(
+            TavilyClient::new(Some("test-key".into())).with_base_url(server.uri()),
+        );
+
+        let error = executor
+            .execute(
+                "session-1",
+                "web_fetch:k1",
+                "web_fetch",
+                &serde_json::json!({"url": "https://example.com/gone"}),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "web_fetch: Tavily failed to extract \"https://example.com/gone\": 404: page not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_without_a_tavily_key_fails_clearly_before_any_network_call() {
+        let (_root, executor) = executor_with_tavily(TavilyClient::new(None));
+
+        let error = executor
+            .execute(
+                "session-1",
+                "web_fetch:k1",
+                "web_fetch",
+                &serde_json::json!({"url": "https://example.com"}),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "web_fetch: no provider configured");
     }
 }
