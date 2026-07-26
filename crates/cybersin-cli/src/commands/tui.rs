@@ -39,7 +39,7 @@ use crate::commands::convert::{
     self, ConvertReport, OpenRouterPromptConversionModel, PromptConversionModel,
 };
 use crate::commands::ops;
-#[cfg(test)]
+use crate::commands::run::{self, RunArgs};
 use crate::project::ProjectDefaults;
 use crate::project::{self};
 
@@ -50,8 +50,10 @@ enum Screen {
 }
 
 /// The tab selected inside `Screen::Workspace`. `Convert` is the only
-/// one with editable fields, so `Focus` only ever varies while this is
-/// `Convert` — `Build`/`Ops` always sit at `Focus::Navigation`.
+/// one with editable fields; `Build` always sits at `Focus::Navigation`.
+/// `Ops` sits at `Focus::Navigation` too except when Tab has moved focus
+/// into the adjacent Builds list (`Focus::OpsBuildsList`), which only
+/// happens while its "Builds" row is selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceTab {
     Convert,
@@ -94,6 +96,7 @@ enum Focus {
     Model,
     Out,
     ConvertAction,
+    OpsBuildsList,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +148,17 @@ struct OpsEntry {
     body: String,
 }
 
+/// Outcome of running a build from the Ops tab's Builds list — separate
+/// from `BuildStatus`, which tracks the `Build` tab's *compile* action;
+/// this tracks *executing* an already-compiled agent session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpsRunStatus {
+    Idle,
+    Running,
+    Success(String),
+    Failure(String),
+}
+
 #[derive(Debug)]
 struct App {
     project_start: PathBuf,
@@ -159,6 +173,9 @@ struct App {
     selected_build_source: usize,
     ops_status: OpsStatus,
     selected_ops_entry: usize,
+    ops_builds: Vec<ops::OpsBuild>,
+    selected_ops_build: usize,
+    ops_run_status: OpsRunStatus,
     show_help: bool,
     should_quit: bool,
 }
@@ -186,6 +203,9 @@ impl App {
             selected_build_source: 0,
             ops_status: OpsStatus::Idle,
             selected_ops_entry: 0,
+            ops_builds: Vec::new(),
+            selected_ops_build: 0,
+            ops_run_status: OpsRunStatus::Idle,
             show_help: false,
             should_quit: false,
         }
@@ -245,11 +265,13 @@ fn should_skip_project_scan_dir(path: &Path) -> bool {
     name.starts_with('.') || matches!(name, "target" | "node_modules" | "dist")
 }
 
+#[derive(Debug)]
 enum AppAction {
     None,
     Convert,
     Build,
     RefreshOps,
+    RunOpsBuild(PathBuf),
 }
 
 impl App {
@@ -309,6 +331,11 @@ impl App {
                 AppAction::None
             }
             KeyCode::Enter if self.workspace_tab == WorkspaceTab::Build => self.request_action(),
+            KeyCode::Enter
+                if self.workspace_tab == WorkspaceTab::Ops && self.focus == Focus::OpsBuildsList =>
+            {
+                self.request_run_selected_build()
+            }
             KeyCode::Enter if self.workspace_tab == WorkspaceTab::Ops => self.request_action(),
             KeyCode::Enter if self.focus == Focus::ConvertAction => self.request_action(),
             KeyCode::Enter if self.focus == Focus::Prompt => {
@@ -374,6 +401,37 @@ impl App {
         }
     }
 
+    /// `Enter` while focus has tabbed onto the Ops tab's Builds list —
+    /// runs whichever build is currently highlighted there.
+    fn request_run_selected_build(&mut self) -> AppAction {
+        match self.ops_builds.get(self.selected_ops_build) {
+            Some(build) => AppAction::RunOpsBuild(build.path.clone()),
+            None => AppAction::None,
+        }
+    }
+
+    /// Whether the Ops tab's left-hand entry list currently has "Builds"
+    /// highlighted — the only row Tab is allowed to move focus off of,
+    /// into the adjacent Builds list.
+    fn selected_ops_entry_is_builds(&self) -> bool {
+        matches!(&self.ops_status, OpsStatus::Success(entries) if entries
+            .get(self.selected_ops_entry)
+            .is_some_and(|entry| entry.title == "Builds"))
+    }
+
+    /// Toggles focus between the Ops tab's entry list and its Builds
+    /// list — the only two focus stops on that tab, so `Tab` and
+    /// `Shift-Tab` behave identically here.
+    fn ops_toggle_focus(&mut self) {
+        self.focus = if self.focus == Focus::OpsBuildsList {
+            Focus::Navigation
+        } else if self.selected_ops_entry_is_builds() {
+            Focus::OpsBuildsList
+        } else {
+            Focus::Navigation
+        };
+    }
+
     fn go_back(&mut self) {
         match self.screen {
             Screen::Home => self.should_quit = true,
@@ -385,27 +443,39 @@ impl App {
     }
 
     fn focus_next(&mut self) {
-        if self.screen != Screen::Workspace || self.workspace_tab != WorkspaceTab::Convert {
+        if self.screen != Screen::Workspace {
             return;
         }
-        self.focus = match self.focus {
-            Focus::Prompt => Focus::Model,
-            Focus::Model => Focus::Out,
-            Focus::Out => Focus::ConvertAction,
-            _ => Focus::Prompt,
-        };
+        match self.workspace_tab {
+            WorkspaceTab::Convert => {
+                self.focus = match self.focus {
+                    Focus::Prompt => Focus::Model,
+                    Focus::Model => Focus::Out,
+                    Focus::Out => Focus::ConvertAction,
+                    _ => Focus::Prompt,
+                };
+            }
+            WorkspaceTab::Ops => self.ops_toggle_focus(),
+            WorkspaceTab::Build => {}
+        }
     }
 
     fn focus_previous(&mut self) {
-        if self.screen != Screen::Workspace || self.workspace_tab != WorkspaceTab::Convert {
+        if self.screen != Screen::Workspace {
             return;
         }
-        self.focus = match self.focus {
-            Focus::Prompt => Focus::ConvertAction,
-            Focus::Model => Focus::Prompt,
-            Focus::Out => Focus::Model,
-            _ => Focus::Out,
-        };
+        match self.workspace_tab {
+            WorkspaceTab::Convert => {
+                self.focus = match self.focus {
+                    Focus::Prompt => Focus::ConvertAction,
+                    Focus::Model => Focus::Prompt,
+                    Focus::Out => Focus::Model,
+                    _ => Focus::Out,
+                };
+            }
+            WorkspaceTab::Ops => self.ops_toggle_focus(),
+            WorkspaceTab::Build => {}
+        }
     }
 
     fn insert_char(&mut self, ch: char) {
@@ -435,30 +505,41 @@ impl App {
     }
 
     fn move_selection_up(&mut self) {
-        if self.workspace_tab != WorkspaceTab::Build {
-            if self.workspace_tab == WorkspaceTab::Ops {
+        match self.workspace_tab {
+            WorkspaceTab::Build => {
+                self.selected_build_source = self.selected_build_source.saturating_sub(1);
+            }
+            WorkspaceTab::Ops if self.focus == Focus::OpsBuildsList => {
+                self.selected_ops_build = self.selected_ops_build.saturating_sub(1);
+            }
+            WorkspaceTab::Ops => {
                 self.selected_ops_entry = self.selected_ops_entry.saturating_sub(1);
             }
-            return;
+            WorkspaceTab::Convert => {}
         }
-        self.selected_build_source = self.selected_build_source.saturating_sub(1);
     }
 
     fn move_selection_down(&mut self) {
-        if self.workspace_tab != WorkspaceTab::Build {
-            if self.workspace_tab == WorkspaceTab::Ops {
+        match self.workspace_tab {
+            WorkspaceTab::Build => {
+                let max_index = build_sources(&self.project_start)
+                    .map(|sources| sources.len().saturating_sub(1))
+                    .unwrap_or(0);
+                self.selected_build_source = (self.selected_build_source + 1).min(max_index);
+            }
+            WorkspaceTab::Ops if self.focus == Focus::OpsBuildsList => {
+                let max_index = self.ops_builds.len().saturating_sub(1);
+                self.selected_ops_build = (self.selected_ops_build + 1).min(max_index);
+            }
+            WorkspaceTab::Ops => {
                 let max_index = match &self.ops_status {
                     OpsStatus::Success(entries) => entries.len().saturating_sub(1),
                     _ => 0,
                 };
                 self.selected_ops_entry = (self.selected_ops_entry + 1).min(max_index);
             }
-            return;
+            WorkspaceTab::Convert => {}
         }
-        let max_index = build_sources(&self.project_start)
-            .map(|sources| sources.len().saturating_sub(1))
-            .unwrap_or(0);
-        self.selected_build_source = (self.selected_build_source + 1).min(max_index);
     }
 
     fn conversion_out(&self) -> Option<PathBuf> {
@@ -506,6 +587,17 @@ async fn run_terminal(app: &mut App) -> Result<()> {
                         Err(error) => OpsStatus::Failure(error),
                     };
                     clamp_selected_ops_entry(app);
+                    app.ops_builds = load_ops_builds(&app.project_start).unwrap_or_default();
+                    clamp_selected_ops_build(app);
+                }
+                AppAction::RunOpsBuild(agent_yaml) => {
+                    app.ops_run_status = OpsRunStatus::Running;
+                    terminal.draw(|frame| render(frame, app))?;
+                    let result = run_ops_build(&app.project_start, agent_yaml).await;
+                    app.ops_run_status = match result {
+                        Ok(message) => OpsRunStatus::Success(message),
+                        Err(error) => OpsRunStatus::Failure(error),
+                    };
                 }
                 AppAction::None => {}
             }
@@ -579,6 +671,50 @@ fn clamp_selected_ops_entry(app: &mut App) {
         _ => 0,
     };
     app.selected_ops_entry = app.selected_ops_entry.min(max_index);
+}
+
+fn clamp_selected_ops_build(app: &mut App) {
+    let max_index = app.ops_builds.len().saturating_sub(1);
+    app.selected_ops_build = app.selected_ops_build.min(max_index);
+}
+
+/// The Ops tab's Builds list — same discovery `cybersin ops`'s own
+/// Builds tab uses (`commands::ops::discover_ops_builds`), so both
+/// surfaces agree on what counts as a build.
+fn load_ops_builds(project_start: &Path) -> Result<Vec<ops::OpsBuild>, String> {
+    let project_root = resolve_project_root(project_start)?;
+    ops::discover_ops_builds(&project_root).map_err(|error| error.to_string())
+}
+
+/// Runs an already-compiled agent (an Ops Builds list row) as a real
+/// session — the same `run::run_session` path `cybersin run` and
+/// `cybersin ops`'s own Builds tab use, wired to this project's default
+/// db/dist/sandbox paths since the bare TUI has no flags to override them.
+async fn run_ops_build(project_start: &Path, agent_yaml: PathBuf) -> Result<String, String> {
+    let project_root = resolve_project_root(project_start)?;
+    let defaults = ProjectDefaults::detect(&project_root).map_err(|error| error.to_string())?;
+    let dist = defaults.dist_default().map_err(|error| error.to_string())?;
+    let summary = run::run_session(
+        defaults.db_default(),
+        dist,
+        defaults.sandbox_root_default(),
+        defaults.sandbox_backend_default(),
+        RunArgs {
+            agent_yaml: Some(agent_yaml),
+            stub: false,
+            session_id: None,
+            agent: None,
+            input: None,
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "{} {}: {} span(s)",
+        summary.session_id,
+        if summary.completed { "completed" } else { "aborted" },
+        summary.spans_recorded
+    ))
 }
 
 /// Resolves the project the bare shell is standing inside of — shared
@@ -1320,27 +1456,97 @@ fn render_ops(frame: &mut Frame, app: &App, area: Rect) {
                 ListState::default().with_selected((!entries.is_empty()).then_some(selected));
             frame.render_stateful_widget(
                 List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title(" Ops "))
+                    .block(focused_block(" Ops ", app.focus != Focus::OpsBuildsList))
                     .highlight_symbol("> ")
                     .highlight_style(Style::default().fg(Color::Yellow)),
                 chunks[0],
                 &mut state,
             );
-            let detail = entries
-                .get(selected)
-                .map(|entry| entry.body.clone())
-                .unwrap_or_else(|| "No Ops entries available.".to_string());
-            let title = entries
-                .get(selected)
-                .map(|entry| format!(" {} ", entry.title))
-                .unwrap_or_else(|| " Detail ".to_string());
-            frame.render_widget(
-                Paragraph::new(detail)
-                    .block(Block::default().borders(Borders::ALL).title(title))
-                    .wrap(Wrap { trim: false }),
-                chunks[1],
-            );
+            if entries.get(selected).is_some_and(|entry| entry.title == "Builds") {
+                render_ops_builds_panel(frame, app, chunks[1]);
+            } else {
+                let detail = entries
+                    .get(selected)
+                    .map(|entry| entry.body.clone())
+                    .unwrap_or_else(|| "No Ops entries available.".to_string());
+                let title = entries
+                    .get(selected)
+                    .map(|entry| format!(" {} ", entry.title))
+                    .unwrap_or_else(|| " Detail ".to_string());
+                frame.render_widget(
+                    Paragraph::new(detail)
+                        .block(Block::default().borders(Borders::ALL).title(title))
+                        .wrap(Wrap { trim: false }),
+                    chunks[1],
+                );
+            }
         }
+    }
+}
+
+/// The Ops tab's "Builds" row detail panel — an interactive list of
+/// compiled agents (rather than the other rows' plain text body) so a
+/// build can be selected and, once focus tabs onto it, run directly
+/// from the bare TUI.
+fn render_ops_builds_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .split(area);
+
+    let selected = app
+        .selected_ops_build
+        .min(app.ops_builds.len().saturating_sub(1));
+    let items: Vec<ListItem> = if app.ops_builds.is_empty() {
+        vec![ListItem::new(
+            "no agents found in agents/**/*.agent.yaml",
+        )]
+    } else {
+        app.ops_builds
+            .iter()
+            .map(|build| {
+                ListItem::new(format!(
+                    "{:<24} {:<12} {}",
+                    build.name,
+                    build.build_hash_short.as_deref().unwrap_or("unbuilt"),
+                    build.path.display()
+                ))
+            })
+            .collect()
+    };
+    let mut state = ListState::default();
+    if !app.ops_builds.is_empty() {
+        state.select(Some(selected));
+    }
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(focused_block(
+                " Builds \u{00b7} Tab to select \u{00b7} Enter to run ",
+                app.focus == Focus::OpsBuildsList,
+            ))
+            .highlight_symbol("> ")
+            .highlight_style(Style::default().fg(Color::Yellow)),
+        rows[0],
+        &mut state,
+    );
+
+    frame.render_widget(ops_run_status_widget(&app.ops_run_status), rows[1]);
+}
+
+fn ops_run_status_widget(status: &OpsRunStatus) -> Paragraph<'static> {
+    match status {
+        OpsRunStatus::Idle => Paragraph::new("Select a build and press Enter to run it.")
+            .block(Block::default().borders(Borders::ALL).title(" Run ")),
+        OpsRunStatus::Running => Paragraph::new("Running...")
+            .block(Block::default().borders(Borders::ALL).title(" Run ")),
+        OpsRunStatus::Success(message) => Paragraph::new(message.clone())
+            .block(Block::default().borders(Borders::ALL).title(" Run "))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::Green)),
+        OpsRunStatus::Failure(error) => Paragraph::new(error.clone())
+            .block(Block::default().borders(Borders::ALL).title(" Run "))
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(Color::Red)),
     }
 }
 
@@ -1596,7 +1802,10 @@ fn footer_text(app: &App) -> String {
             WorkspaceTab::Build => {
                 "Ctrl+R/F5 build \u{00b7} \u{2190}/\u{2192} tab \u{00b7} Esc back \u{00b7} ? help \u{00b7} q quit".to_string()
             }
-            WorkspaceTab::Ops => "Enter/Ctrl+R/F5 refresh \u{00b7} \u{2191}/\u{2193} select \u{00b7} \u{2190}/\u{2192} tab \u{00b7} Esc back \u{00b7} ? help \u{00b7} q quit".to_string(),
+            WorkspaceTab::Ops if app.focus == Focus::OpsBuildsList => {
+                "\u{2191}/\u{2193} select build \u{00b7} Enter run build \u{00b7} Tab back to Ops list \u{00b7} \u{2190}/\u{2192} tab \u{00b7} Esc back \u{00b7} ? help \u{00b7} q quit".to_string()
+            }
+            WorkspaceTab::Ops => "Enter/Ctrl+R/F5 refresh \u{00b7} \u{2191}/\u{2193} select \u{00b7} Tab to Builds list \u{00b7} \u{2190}/\u{2192} tab \u{00b7} Esc back \u{00b7} ? help \u{00b7} q quit".to_string(),
         },
     }
 }
@@ -1613,7 +1822,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(
-            "Ctrl+R or F5 runs the active tab's primary action\n\u{2190}/\u{2192} switches Convert/Build/Ops tabs\n\u{2191}/\u{2193} selects rows in Build/Ops\nTab / Shift-Tab moves focus inside Convert\nEnter starts converting from Home, runs the focused Convert action, builds, or refreshes Ops\nEsc goes back or dismisses overlays\nq quits when focus is outside the prompt editor\n-help, -h, and --help print CLI help",
+            "Ctrl+R or F5 runs the active tab's primary action\n\u{2190}/\u{2192} switches Convert/Build/Ops tabs\n\u{2191}/\u{2193} selects rows in Build/Ops\nTab / Shift-Tab moves focus inside Convert, or, on Ops's Builds row, into its build list\nEnter starts converting from Home, runs the focused Convert action, builds, refreshes Ops, or runs the selected Ops build\nEsc goes back or dismisses overlays\nq quits when focus is outside the prompt editor\n-help, -h, and --help print CLI help",
         )
         .block(Block::default().borders(Borders::ALL).title(" Help "))
         .wrap(Wrap { trim: false }),
@@ -1802,6 +2011,62 @@ mod tests {
         let action = app.handle_key(ctrl_key('r'));
 
         assert!(matches!(action, AppAction::RefreshOps));
+    }
+
+    /// The flow this feature is for: land on Ops, arrow down to the
+    /// "Builds" row, Tab over into the adjacent Builds list, arrow down
+    /// to a build, then Enter to run it.
+    #[test]
+    fn ops_builds_row_tabs_into_an_adjacent_list_and_enter_runs_the_selection() {
+        let mut app = App::default();
+        app.enter_convert();
+        app.switch_tab(WorkspaceTab::Ops);
+        app.ops_status = OpsStatus::Success(vec![
+            OpsEntry {
+                title: "dist/build.log".to_string(),
+                body: "log body".to_string(),
+            },
+            OpsEntry {
+                title: "Builds".to_string(),
+                body: "Builds (2)".to_string(),
+            },
+        ]);
+        app.ops_builds = vec![
+            ops::OpsBuild {
+                name: "first-agent".to_string(),
+                path: PathBuf::from("agents/first.agent.yaml"),
+                build_hash_short: Some("abc123".to_string()),
+            },
+            ops::OpsBuild {
+                name: "second-agent".to_string(),
+                path: PathBuf::from("agents/second.agent.yaml"),
+                build_hash_short: None,
+            },
+        ];
+
+        // Tab does nothing while a non-Builds row is selected.
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Navigation);
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.selected_ops_entry, 1);
+
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::OpsBuildsList);
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.selected_ops_build, 1);
+
+        let action = app.handle_key(key(KeyCode::Enter));
+        match action {
+            AppAction::RunOpsBuild(path) => {
+                assert_eq!(path, PathBuf::from("agents/second.agent.yaml"));
+            }
+            other => panic!("expected AppAction::RunOpsBuild, got {other:?}"),
+        }
+
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.focus, Focus::Navigation);
     }
 
     #[tokio::test]
@@ -2101,5 +2366,49 @@ mod tests {
         assert!(rendered.contains("dist/build.log"));
         assert!(rendered.contains("success: built"));
         assert!(!rendered.contains("Project state"));
+    }
+
+    #[test]
+    fn render_ops_shows_an_interactive_builds_list_when_builds_row_selected() {
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::default();
+        app.enter_convert();
+        app.switch_tab(WorkspaceTab::Ops);
+        app.ops_status = OpsStatus::Success(vec![
+            OpsEntry {
+                title: "dist/build.log".to_string(),
+                body: "success: built".to_string(),
+            },
+            OpsEntry {
+                title: "Builds".to_string(),
+                body: "Builds (2)".to_string(),
+            },
+        ]);
+        app.selected_ops_entry = 1;
+        app.ops_builds = vec![
+            ops::OpsBuild {
+                name: "first-agent".to_string(),
+                path: PathBuf::from("agents/first.agent.yaml"),
+                build_hash_short: Some("abc123".to_string()),
+            },
+            ops::OpsBuild {
+                name: "second-agent".to_string(),
+                path: PathBuf::from("agents/second.agent.yaml"),
+                build_hash_short: None,
+            },
+        ];
+        app.focus = Focus::OpsBuildsList;
+        app.selected_ops_build = 1;
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("first-agent"));
+        assert!(rendered.contains("second-agent"));
+        assert!(rendered.contains("abc123"));
+        assert!(rendered.contains("Select a build and press Enter to run it."));
+        assert!(!rendered.contains("Builds (2)"));
     }
 }

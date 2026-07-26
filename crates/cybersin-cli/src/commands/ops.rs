@@ -271,13 +271,13 @@ impl OpsModel {
 }
 
 #[derive(Debug, Clone, Default)]
-struct OpsBuild {
-    name: String,
-    path: PathBuf,
-    build_hash_short: Option<String>,
+pub(crate) struct OpsBuild {
+    pub(crate) name: String,
+    pub(crate) path: PathBuf,
+    pub(crate) build_hash_short: Option<String>,
 }
 
-fn discover_ops_builds(project_root: &Path) -> Result<Vec<OpsBuild>> {
+pub(crate) fn discover_ops_builds(project_root: &Path) -> Result<Vec<OpsBuild>> {
     let build_hash_short = read_dist_build_hash(project_root).ok().map(short_hash);
     let mut builds = Vec::new();
     for path in discover_agent_sources(project_root).map_err(anyhow::Error::msg)? {
