@@ -22,3 +22,4 @@ pub mod run;
 pub mod sandbox;
 pub mod sessions;
 pub mod trace;
+pub mod tui;
