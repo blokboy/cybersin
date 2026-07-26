@@ -67,7 +67,8 @@ Run `cybersin` with no arguments from an interactive terminal to open the
 Ratatui application shell. The first workflow is prompt conversion: enter
 a multiline raw prompt, keep or change the standalone conversion model,
 optionally set an output path, and run the same conversion pipeline used
-by `cybersin convert`.
+by `cybersin convert`. Live conversion uses OpenRouter and requires
+`OPENROUTER_API_KEY`.
 
 Use `cybersin -help`, `cybersin -h`, or `cybersin --help` to print CLI
 help and exit. Bare `cybersin` in a non-interactive context fails clearly

@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::json;
-use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn cybersin() -> Command {
@@ -13,6 +13,7 @@ async fn convert_discovers_the_project_and_writes_a_valid_draft() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key"))
         .and(body_partial_json(json!({"model": "test-converter"})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "choices": [{
@@ -31,8 +32,8 @@ async fn convert_discovers_the_project_and_writes_a_valid_draft() {
 
     cybersin()
         .current_dir(&nested)
-        .env("OPENAI_API_KEY", "test-key")
-        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENROUTER_API_KEY", "Bearer test-key")
+        .env("OPENROUTER_BASE_URL", server.uri())
         .arg("convert")
         .arg("--model")
         .arg("test-converter")
@@ -62,6 +63,21 @@ fn convert_reports_a_missing_project_with_a_nonzero_exit() {
         .stderr(predicate::str::contains("cybersin.yaml"));
 }
 
+#[test]
+fn convert_reports_missing_openrouter_key() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("cybersin.yaml"), "name: test\n").unwrap();
+
+    cybersin()
+        .current_dir(project.path())
+        .env_remove("OPENROUTER_API_KEY")
+        .arg("convert")
+        .arg("A raw prompt")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("OPENROUTER_API_KEY"));
+}
+
 #[tokio::test]
 async fn convert_validation_failure_is_nonzero_and_keeps_the_file() {
     let server = MockServer::start().await;
@@ -82,8 +98,8 @@ async fn convert_validation_failure_is_nonzero_and_keeps_the_file() {
 
     cybersin()
         .current_dir(project.path())
-        .env("OPENAI_API_KEY", "test-key")
-        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENROUTER_API_KEY", "test-key")
+        .env("OPENROUTER_BASE_URL", server.uri())
         .arg("convert")
         .arg("Keep this draft for review.")
         .assert()
@@ -117,8 +133,8 @@ async fn convert_invalid_output_contract_schema_is_nonzero_and_writes_no_file() 
 
     cybersin()
         .current_dir(project.path())
-        .env("OPENAI_API_KEY", "test-key")
-        .env("OPENAI_BASE_URL", server.uri())
+        .env("OPENROUTER_API_KEY", "test-key")
+        .env("OPENROUTER_BASE_URL", server.uri())
         .arg("convert")
         .arg("Return JSON with a summary field.")
         .assert()
