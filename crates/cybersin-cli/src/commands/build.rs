@@ -29,9 +29,9 @@ use cybersin_frontend::{compile_prompt_source, discover_prompt_sources};
 use cybersin_gateway::RetryClass;
 use cybersin_ir::PromptIr;
 use cybersin_passes::{
-    build_pipeline_with_compress_and_targets, build_pipeline_with_targets, run_pipeline,
-    write_budget_artifact, Compress, CompressError, CompressMode, CompressionLock,
-    CompressionProvider, Profile, TargetBudget,
+    build_pipeline_with_compress_and_targets, build_pipeline_with_targets, write_budget_artifact,
+    Compress, CompressError, CompressMode, CompressionLock, CompressionProvider, Diagnostic,
+    PassContext, Profile, Severity, TargetBudget,
 };
 use cybersin_router::{
     compile_from_yaml, emit_routing_json, ObservedRoutingStats, WorkloadEstimate,
@@ -97,6 +97,19 @@ pub fn run(project: &Path, profile: BuildProfile, frozen: bool) -> Result<Option
     run_into(project, &project.join("dist"), profile, frozen, None)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildProgress {
+    DiscoveredPrompts(Vec<PathBuf>),
+    ClearingDist(PathBuf),
+    PromptStarted { name: String, source: PathBuf },
+    PassFinished { prompt: String, pass: String },
+    PromptWritten(String),
+    Routing,
+    Cache,
+    Tools,
+    Manifest,
+}
+
 /// Build `project`'s sources into `dist_dir`, which need not be
 /// `project/dist` — `cybersin diff` builds two git refs into throwaway
 /// directories this way, to compare them without touching either
@@ -110,6 +123,17 @@ pub fn run_into(
     profile: BuildProfile,
     frozen: bool,
     observed: Option<&ObservedRoutingStats>,
+) -> Result<Option<String>, String> {
+    run_into_with_progress(project, dist_dir, profile, frozen, observed, |_| {})
+}
+
+pub fn run_into_with_progress(
+    project: &Path,
+    dist_dir: &Path,
+    profile: BuildProfile,
+    frozen: bool,
+    observed: Option<&ObservedRoutingStats>,
+    mut on_progress: impl FnMut(BuildProgress),
 ) -> Result<Option<String>, String> {
     let project_yaml_path = project.join("cybersin.yaml");
     let project_yaml = fs::read_to_string(&project_yaml_path)
@@ -167,12 +191,14 @@ pub fn run_into(
     if sources.is_empty() {
         return Err("error: no *.prompt.yaml sources found".into());
     }
+    on_progress(BuildProgress::DiscoveredPrompts(sources.clone()));
 
     // Every build fully determines dist/ from sources + lockfile (spec
     // §7); starting from a clean directory means a renamed/removed
     // prompt, or a target dropped from `cybersin.yaml`, can't leave a
     // stale artifact behind.
     if dist_dir.exists() {
+        on_progress(BuildProgress::ClearingDist(dist_dir.to_path_buf()));
         fs::remove_dir_all(dist_dir)
             .map_err(|e| format!("error: failed to clear {}: {e}", dist_dir.display()))?;
     }
@@ -183,7 +209,16 @@ pub fn run_into(
     let mut compiled: Vec<PromptIr> = Vec::new();
     for source in &sources {
         let ir = compile_prompt_source(source).map_err(|e| format!("error: {e}"))?;
-        let outcome = run_pipeline(&pipeline, ir, None);
+        on_progress(BuildProgress::PromptStarted {
+            name: ir.name.clone(),
+            source: source.clone(),
+        });
+        let outcome = run_pipeline_with_progress(&pipeline, ir, None, |prompt, pass| {
+            on_progress(BuildProgress::PassFinished {
+                prompt: prompt.to_string(),
+                pass: pass.to_string(),
+            });
+        });
         if outcome.has_error() {
             let messages = outcome
                 .diagnostics
@@ -200,6 +235,7 @@ pub fn run_into(
             &prompt_json,
         )
         .map_err(|e| format!("error: failed to write prompt: {e}"))?;
+        on_progress(BuildProgress::PromptWritten(outcome.ir.name.clone()));
 
         if let Some(budget) = &outcome.budget {
             write_budget_artifact(dist_dir, budget)
@@ -241,10 +277,13 @@ pub fn run_into(
         WorkloadEstimate::default(),
     )
     .map_err(|e| format!("error: {e}"))?;
+    on_progress(BuildProgress::Routing);
     emit_routing_json(&dist_dir.join("routing.json"), &routing)
         .map_err(|e| format!("error: failed to write routing.json: {e}"))?;
 
+    on_progress(BuildProgress::Cache);
     write_cache_json(dist_dir)?;
+    on_progress(BuildProgress::Tools);
     write_tools_json(project, dist_dir)?;
     copy_tool_assets(project, dist_dir)?;
 
@@ -254,6 +293,7 @@ pub fn run_into(
     fs::create_dir_all(&evals_dir)
         .map_err(|e| format!("error: failed to create {}: {e}", evals_dir.display()))?;
 
+    on_progress(BuildProgress::Manifest);
     write_manifest(project, dist_dir, &project_yaml, &lock_text, &sources)?;
 
     lockfile.passes = compression_lock.lock().unwrap().clone();
@@ -264,6 +304,37 @@ pub fn run_into(
             .map_err(|e| format!("error: failed to write {}: {e}", lock_path.display()))?;
     }
     Ok(Some(format!("built {}", project.display())))
+}
+
+fn run_pipeline_with_progress(
+    pipeline: &[Box<dyn cybersin_passes::Pass>],
+    ir: PromptIr,
+    budget: Option<cybersin_ir::BudgetArtifact>,
+    mut on_pass_finished: impl FnMut(&str, &str),
+) -> cybersin_passes::PipelineOutcome {
+    let mut ctx = PassContext {
+        ir,
+        budget,
+        diagnostics: Vec::new(),
+    };
+    for pass in pipeline {
+        pass.run(&mut ctx);
+        on_pass_finished(&ctx.ir.name, pass.name());
+        if diagnostics_have_error(&ctx.diagnostics) {
+            break;
+        }
+    }
+    cybersin_passes::PipelineOutcome {
+        ir: ctx.ir,
+        budget: ctx.budget,
+        diagnostics: ctx.diagnostics,
+    }
+}
+
+fn diagnostics_have_error(diagnostics: &[Diagnostic]) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Error)
 }
 
 fn to_pretty_json<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {

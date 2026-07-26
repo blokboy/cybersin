@@ -16,6 +16,7 @@
 
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -33,7 +34,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 use serde_json::Value;
 
-use crate::commands::build::{self, BuildProfile};
+use crate::commands::build::{self, BuildProfile, BuildProgress};
 use crate::commands::convert::{
     self, ConvertReport, OpenRouterPromptConversionModel, PromptConversionModel,
 };
@@ -149,13 +150,14 @@ impl From<ConvertReport> for ConvertSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BuildStatus {
     Idle,
-    Running,
+    Running(Vec<String>),
     Success(String),
     Failure(String),
 }
 
 #[derive(Debug)]
 struct App {
+    project_start: PathBuf,
     screen: Screen,
     workspace_tab: WorkspaceTab,
     focus: Focus,
@@ -171,7 +173,16 @@ struct App {
 
 impl Default for App {
     fn default() -> Self {
+        let project_start = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::new(project_start)
+    }
+}
+
+impl App {
+    fn new(project_start: PathBuf) -> Self {
+        let project_start = resolve_tui_project_start(&project_start);
         Self {
+            project_start,
             screen: Screen::Home,
             workspace_tab: WorkspaceTab::Convert,
             focus: Focus::Navigation,
@@ -185,6 +196,59 @@ impl Default for App {
             should_quit: false,
         }
     }
+}
+
+fn resolve_tui_project_start(project_start: &Path) -> PathBuf {
+    project::discover_project_root(project_start)
+        .or_else(|| discover_single_descendant_project(project_start))
+        .unwrap_or_else(|| project_start.to_path_buf())
+}
+
+fn discover_single_descendant_project(start: &Path) -> Option<PathBuf> {
+    let mut found = Vec::new();
+    collect_descendant_projects(start, 0, &mut found);
+    found.sort();
+    found.dedup();
+    if found.len() == 1 {
+        found.pop()
+    } else {
+        None
+    }
+}
+
+fn collect_descendant_projects(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    const MAX_DEPTH: usize = 4;
+    const MAX_FOUND: usize = 2;
+    if depth > MAX_DEPTH || found.len() >= MAX_FOUND {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if found.len() >= MAX_FOUND {
+            return;
+        }
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || should_skip_project_scan_dir(&path) {
+            continue;
+        }
+        if path.join("cybersin.yaml").is_file() {
+            found.push(path);
+        } else {
+            collect_descendant_projects(&path, depth + 1, found);
+        }
+    }
+}
+
+fn should_skip_project_scan_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with('.') || matches!(name, "target" | "node_modules" | "dist")
 }
 
 enum AppAction {
@@ -378,13 +442,13 @@ impl App {
     }
 }
 
-pub async fn execute() -> Result<()> {
+pub async fn execute(project_start: PathBuf) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!(
             "bare `cybersin` requires an interactive terminal; use `cybersin -help` or an explicit subcommand for non-interactive use"
         );
     }
-    let mut app = App::default();
+    let mut app = App::new(project_start);
     run_terminal(&mut app).await
 }
 
@@ -407,13 +471,7 @@ async fn run_terminal(app: &mut App) -> Result<()> {
                     };
                 }
                 AppAction::Build => {
-                    app.build_status = BuildStatus::Running;
-                    terminal.draw(|frame| render(frame, app))?;
-                    let result = run_build().await;
-                    app.build_status = match result {
-                        Ok(message) => BuildStatus::Success(message),
-                        Err(error) => BuildStatus::Failure(error),
-                    };
+                    run_build_interactive(&mut terminal, app)?;
                 }
                 AppAction::None => {}
             }
@@ -427,19 +485,17 @@ async fn run_terminal(app: &mut App) -> Result<()> {
 /// display panels, so all four agree on the exact same discovery rule
 /// (issue #50's walk-up-for-`cybersin.yaml`) instead of each hand-rolling
 /// their own `current_dir` + ancestors search.
-fn resolve_project_root() -> Result<PathBuf, String> {
-    let cwd =
-        std::env::current_dir().map_err(|e| format!("error: reading current directory: {e}"))?;
-    project::discover_project_root(&cwd).ok_or_else(|| {
+fn resolve_project_root(project_start: &Path) -> Result<PathBuf, String> {
+    project::discover_project_root(project_start).ok_or_else(|| {
         format!(
             "error: no cybersin.yaml found in {} or any parent directory",
-            cwd.display()
+            project_start.display()
         )
     })
 }
 
 async fn run_conversion(app: &App) -> Result<ConvertReport, String> {
-    let project_root = resolve_project_root()?;
+    let project_root = resolve_project_root(&app.project_start)?;
     let converter = OpenRouterPromptConversionModel::from_env(app.model.trim().to_string())?;
     run_conversion_with_model(&converter, &project_root, app).await
 }
@@ -458,18 +514,81 @@ async fn run_conversion_with_model(
     .await
 }
 
+enum BuildThreadMessage {
+    Progress(BuildProgress),
+    Done(Result<String, String>),
+}
+
 /// Runs a real build from the `Build` tab. Deliberately hardcodes
 /// `BuildProfile::Dev` (no model-assisted compression, no network call)
 /// rather than matching plain `cybersin build`'s `release` default —
 /// this trigger has no flags for a user to opt into `release`/`frozen`
 /// explicitly, and a landing-screen action silently making network
 /// calls would be a bad surprise.
-async fn run_build() -> Result<String, String> {
-    let project_root = resolve_project_root()?;
-    tokio::task::spawn_blocking(move || build::run(&project_root, BuildProfile::Dev, false))
-        .await
-        .map_err(|e| format!("error: build task panicked: {e}"))?
-        .map(|message| message.unwrap_or_else(|| "build complete".to_string()))
+fn run_build_interactive(terminal: &mut TerminalSession, app: &mut App) -> Result<()> {
+    app.build_status = BuildStatus::Running(vec!["starting dev build".to_string()]);
+    terminal.draw(|frame| render(frame, app))?;
+
+    let project_start = app.project_start.clone();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = run_build_from(project_start, |progress| {
+            let _ = tx.send(BuildThreadMessage::Progress(progress));
+        });
+        let _ = tx.send(BuildThreadMessage::Done(result));
+    });
+
+    loop {
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                BuildThreadMessage::Progress(progress) => push_build_progress(app, progress),
+                BuildThreadMessage::Done(result) => {
+                    app.build_status = match result {
+                        Ok(message) => BuildStatus::Success(message),
+                        Err(error) => BuildStatus::Failure(error),
+                    };
+                    terminal.draw(|frame| render(frame, app))?;
+                    return Ok(());
+                }
+            }
+        }
+
+        terminal.draw(|frame| render(frame, app))?;
+        if event::poll(Duration::from_millis(50)).context("polling terminal input")? {
+            if let Event::Key(key) = event::read().context("reading terminal input")? {
+                app.handle_key(key);
+            }
+        }
+    }
+}
+
+fn run_build_from(
+    project_start: PathBuf,
+    on_progress: impl FnMut(BuildProgress),
+) -> Result<String, String> {
+    let project_root = resolve_project_root(&project_start)?;
+    build::run_into_with_progress(
+        &project_root,
+        &project_root.join("dist"),
+        BuildProfile::Dev,
+        false,
+        None,
+        on_progress,
+    )
+    .map(|message| message.unwrap_or_else(|| "build complete".to_string()))
+}
+
+fn push_build_progress(app: &mut App, progress: BuildProgress) {
+    let line = format_build_progress(&app.project_start, progress);
+    let BuildStatus::Running(lines) = &mut app.build_status else {
+        return;
+    };
+    lines.push(line);
+    const MAX_PROGRESS_LINES: usize = 12;
+    if lines.len() > MAX_PROGRESS_LINES {
+        let overflow = lines.len() - MAX_PROGRESS_LINES;
+        lines.drain(0..overflow);
+    }
 }
 
 struct TerminalSession {
@@ -704,7 +823,7 @@ fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
     match app.workspace_tab {
         WorkspaceTab::Convert => render_convert(frame, app, chunks[1]),
         WorkspaceTab::Build => render_build(frame, app, chunks[1]),
-        WorkspaceTab::Ops => render_ops(frame, chunks[1]),
+        WorkspaceTab::Ops => render_ops(frame, app, chunks[1]),
     }
 }
 
@@ -761,13 +880,13 @@ fn render_build(frame: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     frame.render_widget(
-        Paragraph::new(build_info_text())
+        Paragraph::new(build_info_text(&app.project_start))
             .block(Block::default().borders(Borders::ALL).title(" dist/ "))
             .wrap(Wrap { trim: false }),
         chunks[0],
     );
 
-    let action = if app.build_status == BuildStatus::Running {
+    let action = if matches!(app.build_status, BuildStatus::Running(_)) {
         "Building..."
     } else {
         "Build (profile: dev)  Ctrl+R / F5"
@@ -779,14 +898,14 @@ fn render_build(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(build_status_widget(&app.build_status), chunks[2]);
 }
 
-fn render_ops(frame: &mut Frame, area: Rect) {
+fn render_ops(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(6), Constraint::Min(3)])
         .split(area);
 
     frame.render_widget(
-        Paragraph::new(ops_info_text())
+        Paragraph::new(ops_info_text(&app.project_start))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -844,7 +963,7 @@ fn build_status_widget(status: &BuildStatus) -> Paragraph<'static> {
     match status {
         BuildStatus::Idle => Paragraph::new("No build run yet this session.")
             .block(Block::default().borders(Borders::ALL).title(" Outcome ")),
-        BuildStatus::Running => Paragraph::new("Building...")
+        BuildStatus::Running(lines) => Paragraph::new(lines.join("\n"))
             .block(Block::default().borders(Borders::ALL).title(" Outcome ")),
         BuildStatus::Failure(error) => Paragraph::new(error.clone())
             .block(Block::default().borders(Borders::ALL).title(" Failure "))
@@ -859,20 +978,45 @@ fn build_status_widget(status: &BuildStatus) -> Paragraph<'static> {
 
 /// `Build` tab's info panel: which project this shell is standing
 /// inside of, plus what `dist/manifest.json` (if any) says about it.
-fn build_info_text() -> String {
-    match resolve_project_root() {
+fn build_info_text(project_start: &Path) -> String {
+    match resolve_project_root(project_start) {
         Ok(root) => match dist_snapshot(&root) {
-            Ok(snapshot) => format!("project: {}\n\n{}", root.display(), snapshot),
-            Err(error) => format!("project: {}\n\n{}", root.display(), error),
+            Ok(snapshot) => format!(
+                "project: {}\n\n{}\n\n{}",
+                root.display(),
+                prompt_sources_snapshot(&root),
+                snapshot
+            ),
+            Err(error) => format!(
+                "project: {}\n\n{}\n\n{}",
+                root.display(),
+                prompt_sources_snapshot(&root),
+                error
+            ),
         },
         Err(error) => error,
     }
 }
 
+fn prompt_sources_snapshot(project_root: &Path) -> String {
+    match cybersin_frontend::discover_prompt_sources(project_root) {
+        Ok(sources) if sources.is_empty() => "prompts: none found".to_string(),
+        Ok(sources) => {
+            let mut lines = vec![format!("prompts: {}", sources.len())];
+            lines.extend(sources.into_iter().map(|source| {
+                let relative = source.strip_prefix(project_root).unwrap_or(&source);
+                format!("  {}", relative.display())
+            }));
+            lines.join("\n")
+        }
+        Err(error) => format!("prompts: error discovering sources: {error}"),
+    }
+}
+
 /// `Ops` tab's info panel — see this module's doc for why it never
 /// touches the daemon.
-fn ops_info_text() -> String {
-    match resolve_project_root() {
+fn ops_info_text(project_start: &Path) -> String {
+    match resolve_project_root(project_start) {
         Ok(root) => match ops_snapshot(&root) {
             Ok(snapshot) => format!("project: {}\n\n{}", root.display(), snapshot),
             Err(error) => format!("project: {}\n\n{}", root.display(), error),
@@ -944,6 +1088,33 @@ fn format_age(age: Duration) -> String {
 
 fn short_hash(hash: &str) -> &str {
     hash.get(..12).unwrap_or(hash)
+}
+
+fn format_build_progress(project_start: &Path, progress: BuildProgress) -> String {
+    let project_root = resolve_project_root(project_start).ok();
+    let display_path = |path: PathBuf| {
+        project_root
+            .as_deref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(&path)
+            .display()
+            .to_string()
+    };
+    match progress {
+        BuildProgress::DiscoveredPrompts(sources) => {
+            format!("discovered {} prompt source(s)", sources.len())
+        }
+        BuildProgress::ClearingDist(path) => format!("clearing {}", display_path(path)),
+        BuildProgress::PromptStarted { name, source } => {
+            format!("prompt {name}: {}", display_path(source))
+        }
+        BuildProgress::PassFinished { prompt, pass } => format!("pass {pass}: {prompt}"),
+        BuildProgress::PromptWritten(prompt) => format!("wrote prompt artifact: {prompt}"),
+        BuildProgress::Routing => "compiled routing.json".to_string(),
+        BuildProgress::Cache => "seeded cache.json".to_string(),
+        BuildProgress::Tools => "compiled tool policy/assets".to_string(),
+        BuildProgress::Manifest => "wrote manifest.json".to_string(),
+    }
 }
 
 fn footer_text(app: &App) -> String {
@@ -1174,14 +1345,68 @@ mod tests {
             .contains("Summarize /tmp/looks-like-a-path."));
     }
 
+    #[tokio::test]
+    async fn conversion_finds_a_single_descendant_project_from_repo_root_like_cwd() {
+        let repo = tempfile::tempdir().unwrap();
+        let project = repo.path().join("fixtures/ic1-research-team");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("cybersin.yaml"), "name: test\n").unwrap();
+
+        let mut app = App::new(repo.path().to_path_buf());
+        app.raw_prompt = "Convert this from the repository root.".to_string();
+
+        let report = run_conversion_with_model(&FakeConverter, &app.project_start, &app)
+            .await
+            .unwrap();
+
+        assert_eq!(app.project_start, project);
+        assert_eq!(
+            report.path,
+            app.project_start.join("prompts/draft.prompt.yaml")
+        );
+        assert!(std::fs::read_to_string(report.path)
+            .unwrap()
+            .contains("Convert this from the repository root."));
+    }
+
     #[test]
     fn dist_snapshot_reports_not_built_when_dist_missing() {
         let project = tempfile::tempdir().unwrap();
         std::fs::write(project.path().join("cybersin.yaml"), "name: test\n").unwrap();
+        std::fs::create_dir_all(project.path().join("prompts")).unwrap();
+        std::fs::write(
+            project.path().join("prompts/hello.prompt.yaml"),
+            "name: hello\nquality: medium\nsections:\n- id: prompt\n  priority: 100\n  body: Hello.\n",
+        )
+        .unwrap();
 
         let error = dist_snapshot(project.path()).unwrap_err();
 
         assert!(error.contains("no dist/ found"));
+
+        let info = build_info_text(project.path());
+        assert!(info.contains("prompts: 1"));
+        assert!(info.contains("prompts/hello.prompt.yaml"));
+    }
+
+    #[test]
+    fn info_panels_resolve_from_the_app_project_anchor() {
+        let outside_project = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("cybersin.yaml"), "name: test\n").unwrap();
+        let nested = project.path().join("nested/path");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let outside_text = build_info_text(outside_project.path());
+        assert!(outside_text.contains("cybersin.yaml"));
+
+        let anchored_text = build_info_text(&nested);
+        assert!(anchored_text.contains(&format!("project: {}", project.path().display())));
+        assert!(anchored_text.contains("no dist/ found"));
+
+        let ops_text = ops_info_text(&nested);
+        assert!(ops_text.contains(&format!("project: {}", project.path().display())));
+        assert!(ops_text.contains("state db:"));
     }
 
     #[test]
@@ -1199,6 +1424,26 @@ mod tests {
         let text = dist_snapshot(project.path()).unwrap();
 
         assert!(text.contains("artifacts: 2"));
+    }
+
+    #[test]
+    fn build_tab_progress_lists_prompt_passes() {
+        let project = tempfile::tempdir().unwrap();
+        crate::commands::init::run(project.path()).unwrap();
+        let mut lines = Vec::new();
+
+        let result = run_build_from(project.path().to_path_buf(), |progress| {
+            lines.push(format_build_progress(project.path(), progress));
+        })
+        .unwrap();
+
+        assert!(result.contains("built"));
+        assert!(lines.iter().any(|line| line.contains("prompt hello")));
+        assert!(lines.iter().any(|line| line.contains("pass lint-fast")));
+        assert!(lines.iter().any(|line| line.contains("pass budget")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("wrote manifest.json")));
     }
 
     #[test]
