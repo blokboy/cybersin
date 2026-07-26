@@ -8,18 +8,16 @@
 //! `go_back` case.
 //!
 //! `Build` and `Ops` are read-only info panels — `Build` also runs a
-//! real, Dev-profile build on demand. Neither touches the daemon that
-//! `cybersin ops`'s live Sessions/Traces/Cost/Approvals view owns
-//! (`crates/cybersin-cli/src/commands/ops.rs`): the `Ops` tab here only
-//! `stat()`s `.cybersin/cybersin.db` for a last-activity timestamp, so
-//! landing on this screen never starts a daemon for a project that
-//! hasn't been run yet.
+//! real, Dev-profile build on demand. The Ops tab shows a cached
+//! snapshot of the same Builds/Sessions/Traces/Cost/Approvals sections
+//! that `cybersin ops --plain` prints, plus any `dist/*.log` files from
+//! local TUI builds.
 
 use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::cursor::Show;
@@ -34,13 +32,15 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
-use serde_json::Value;
 
 use crate::commands::build::{self, BuildProfile, BuildProgress};
 use crate::commands::convert::{
     self, ConvertReport, OpenRouterPromptConversionModel, PromptConversionModel,
 };
-use crate::project::{self, ProjectDefaults};
+use crate::commands::ops;
+#[cfg(test)]
+use crate::project::ProjectDefaults;
+use crate::project::{self};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -130,6 +130,20 @@ enum BuildStatus {
     Failure(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpsStatus {
+    Idle,
+    Running,
+    Success(Vec<OpsEntry>),
+    Failure(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpsEntry {
+    title: String,
+    body: String,
+}
+
 #[derive(Debug)]
 struct App {
     project_start: PathBuf,
@@ -142,6 +156,8 @@ struct App {
     convert_status: ConversionStatus,
     build_status: BuildStatus,
     selected_build_source: usize,
+    ops_status: OpsStatus,
+    selected_ops_entry: usize,
     show_help: bool,
     should_quit: bool,
 }
@@ -167,6 +183,8 @@ impl App {
             convert_status: ConversionStatus::Idle,
             build_status: BuildStatus::Idle,
             selected_build_source: 0,
+            ops_status: OpsStatus::Idle,
+            selected_ops_entry: 0,
             show_help: false,
             should_quit: false,
         }
@@ -230,6 +248,7 @@ enum AppAction {
     None,
     Convert,
     Build,
+    RefreshOps,
 }
 
 impl App {
@@ -257,12 +276,12 @@ impl App {
             KeyCode::Left if self.screen == Screen::Workspace => {
                 let tab = self.workspace_tab.previous();
                 self.switch_tab(tab);
-                AppAction::None
+                self.post_switch_action()
             }
             KeyCode::Right if self.screen == Screen::Workspace => {
                 let tab = self.workspace_tab.next();
                 self.switch_tab(tab);
-                AppAction::None
+                self.post_switch_action()
             }
             KeyCode::Tab => {
                 self.focus_next();
@@ -289,6 +308,7 @@ impl App {
                 AppAction::None
             }
             KeyCode::Enter if self.workspace_tab == WorkspaceTab::Build => self.request_action(),
+            KeyCode::Enter if self.workspace_tab == WorkspaceTab::Ops => self.request_action(),
             KeyCode::Enter if self.focus == Focus::ConvertAction => self.request_action(),
             KeyCode::Enter if self.focus == Focus::Prompt => {
                 self.raw_prompt.push('\n');
@@ -326,6 +346,14 @@ impl App {
         };
     }
 
+    fn post_switch_action(&mut self) -> AppAction {
+        if self.workspace_tab == WorkspaceTab::Ops && self.ops_status == OpsStatus::Idle {
+            AppAction::RefreshOps
+        } else {
+            AppAction::None
+        }
+    }
+
     fn request_action(&mut self) -> AppAction {
         if self.screen != Screen::Workspace {
             return AppAction::None;
@@ -341,7 +369,7 @@ impl App {
                 }
             }
             WorkspaceTab::Build => AppAction::Build,
-            WorkspaceTab::Ops => AppAction::None,
+            WorkspaceTab::Ops => AppAction::RefreshOps,
         }
     }
 
@@ -407,6 +435,9 @@ impl App {
 
     fn move_selection_up(&mut self) {
         if self.workspace_tab != WorkspaceTab::Build {
+            if self.workspace_tab == WorkspaceTab::Ops {
+                self.selected_ops_entry = self.selected_ops_entry.saturating_sub(1);
+            }
             return;
         }
         self.selected_build_source = self.selected_build_source.saturating_sub(1);
@@ -414,6 +445,13 @@ impl App {
 
     fn move_selection_down(&mut self) {
         if self.workspace_tab != WorkspaceTab::Build {
+            if self.workspace_tab == WorkspaceTab::Ops {
+                let max_index = match &self.ops_status {
+                    OpsStatus::Success(entries) => entries.len().saturating_sub(1),
+                    _ => 0,
+                };
+                self.selected_ops_entry = (self.selected_ops_entry + 1).min(max_index);
+            }
             return;
         }
         let max_index = build_sources(&self.project_start)
@@ -459,11 +497,87 @@ async fn run_terminal(app: &mut App) -> Result<()> {
                 AppAction::Build => {
                     run_build_interactive(&mut terminal, app)?;
                 }
+                AppAction::RefreshOps => {
+                    app.ops_status = OpsStatus::Running;
+                    terminal.draw(|frame| render(frame, app))?;
+                    app.ops_status = match load_ops_entries(&app.project_start).await {
+                        Ok(entries) => OpsStatus::Success(entries),
+                        Err(error) => OpsStatus::Failure(error),
+                    };
+                    clamp_selected_ops_entry(app);
+                }
                 AppAction::None => {}
             }
         }
     }
     Ok(())
+}
+
+async fn load_ops_entries(project_start: &Path) -> Result<Vec<OpsEntry>, String> {
+    let project_root = resolve_project_root(project_start)?;
+    let sections = ops::plain_sections_for_path(&project_root)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut entries = ops_log_entries(&project_root);
+    entries.extend([
+        OpsEntry {
+            title: "Builds".to_string(),
+            body: sections.builds,
+        },
+        OpsEntry {
+            title: "Sessions".to_string(),
+            body: sections.sessions,
+        },
+        OpsEntry {
+            title: "Traces".to_string(),
+            body: sections.traces,
+        },
+        OpsEntry {
+            title: "Cost".to_string(),
+            body: sections.cost,
+        },
+        OpsEntry {
+            title: "Approvals".to_string(),
+            body: sections.approvals,
+        },
+    ]);
+    Ok(entries)
+}
+
+fn ops_log_entries(project_root: &Path) -> Vec<OpsEntry> {
+    let dist = project_root.join("dist");
+    let Ok(entries) = fs::read_dir(&dist) else {
+        return Vec::new();
+    };
+    let mut logs = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("log")
+        })
+        .collect::<Vec<_>>();
+    logs.sort();
+    logs.into_iter()
+        .map(|path| {
+            let title = path
+                .strip_prefix(project_root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let body = fs::read_to_string(&path)
+                .map(|text| tail_lines(&text, 24))
+                .unwrap_or_else(|error| format!("error: reading {}: {error}", path.display()));
+            OpsEntry { title, body }
+        })
+        .collect()
+}
+
+fn clamp_selected_ops_entry(app: &mut App) {
+    let max_index = match &app.ops_status {
+        OpsStatus::Success(entries) => entries.len().saturating_sub(1),
+        _ => 0,
+    };
+    app.selected_ops_entry = app.selected_ops_entry.min(max_index);
 }
 
 /// Resolves the project the bare shell is standing inside of — shared
@@ -1009,26 +1123,64 @@ fn render_build_sources(frame: &mut Frame, app: &App, area: Rect) {
 
 fn render_ops(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(6), Constraint::Min(3)])
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(28), Constraint::Min(10)])
         .split(area);
-
-    frame.render_widget(
-        Paragraph::new(ops_info_text(&app.project_start))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Project state "),
-            )
-            .wrap(Wrap { trim: false }),
-        chunks[0],
-    );
-    frame.render_widget(
-        Paragraph::new(ops_build_log_text(&app.project_start))
-            .block(Block::default().borders(Borders::ALL).title(" Ops "))
-            .wrap(Wrap { trim: false }),
-        chunks[1],
-    );
+    match &app.ops_status {
+        OpsStatus::Idle => {
+            frame.render_widget(
+                Paragraph::new("Press Enter, Ctrl+R, or F5 to load Ops.")
+                    .block(Block::default().borders(Borders::ALL).title(" Ops ")),
+                area,
+            );
+        }
+        OpsStatus::Running => {
+            frame.render_widget(
+                Paragraph::new("Loading Ops...")
+                    .block(Block::default().borders(Borders::ALL).title(" Ops ")),
+                area,
+            );
+        }
+        OpsStatus::Failure(error) => {
+            frame.render_widget(
+                Paragraph::new(error.clone())
+                    .block(Block::default().borders(Borders::ALL).title(" Ops "))
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(Color::Red)),
+                area,
+            );
+        }
+        OpsStatus::Success(entries) => {
+            let selected = app.selected_ops_entry.min(entries.len().saturating_sub(1));
+            let items = entries
+                .iter()
+                .map(|entry| ListItem::new(entry.title.as_str()));
+            let mut state =
+                ListState::default().with_selected((!entries.is_empty()).then_some(selected));
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(Block::default().borders(Borders::ALL).title(" Ops "))
+                    .highlight_symbol("> ")
+                    .highlight_style(Style::default().fg(Color::Yellow)),
+                chunks[0],
+                &mut state,
+            );
+            let detail = entries
+                .get(selected)
+                .map(|entry| entry.body.clone())
+                .unwrap_or_else(|| "No Ops entries available.".to_string());
+            let title = entries
+                .get(selected)
+                .map(|entry| format!(" {} ", entry.title))
+                .unwrap_or_else(|| " Detail ".to_string());
+            frame.render_widget(
+                Paragraph::new(detail)
+                    .block(Block::default().borders(Borders::ALL).title(title))
+                    .wrap(Wrap { trim: false }),
+                chunks[1],
+            );
+        }
+    }
 }
 
 fn focused_block(title: &'static str, focused: bool) -> Block<'static> {
@@ -1125,6 +1277,7 @@ fn prompt_sources_snapshot(project_root: &Path) -> String {
 
 /// `Ops` tab's info panel — see this module's doc for why it never
 /// touches the daemon.
+#[cfg(test)]
 fn ops_info_text(project_start: &Path) -> String {
     match resolve_project_root(project_start) {
         Ok(root) => {
@@ -1147,6 +1300,7 @@ fn ops_info_text(project_start: &Path) -> String {
     }
 }
 
+#[cfg(test)]
 fn ops_build_log_text(project_start: &Path) -> String {
     match resolve_project_root(project_start) {
         Ok(root) => {
@@ -1168,25 +1322,26 @@ fn tail_lines(text: &str, max_lines: usize) -> String {
     lines[start..].join("\n")
 }
 
+#[cfg(test)]
 fn dist_snapshot(project_root: &Path) -> Result<String, String> {
     let defaults = ProjectDefaults::detect(project_root).map_err(|e| e.to_string())?;
     let dist = defaults.dist_default().map_err(|e| e.to_string())?;
     let manifest_path = dist.join("manifest.json");
     let text = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("error: reading {}: {e}", manifest_path.display()))?;
-    let manifest: Value = serde_json::from_str(&text)
+    let manifest: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| format!("error: invalid {}: {e}", manifest_path.display()))?;
     let git_sha = manifest
         .get("git_sha")
-        .and_then(Value::as_str)
+        .and_then(serde_json::Value::as_str)
         .unwrap_or("-");
     let build_hash = manifest
         .get("build_hash")
-        .and_then(Value::as_str)
+        .and_then(serde_json::Value::as_str)
         .unwrap_or("-");
     let artifact_count = manifest
         .get("artifacts")
-        .and_then(Value::as_object)
+        .and_then(serde_json::Value::as_object)
         .map_or(0, |artifacts| artifacts.len());
     Ok(format!(
         "dist/ at {}\n  git sha: {}\n  build hash: {}\n  artifacts: {}",
@@ -1197,6 +1352,7 @@ fn dist_snapshot(project_root: &Path) -> Result<String, String> {
     ))
 }
 
+#[cfg(test)]
 fn ops_snapshot(project_root: &Path) -> Result<String, String> {
     let defaults = ProjectDefaults::detect(project_root).map_err(|e| e.to_string())?;
     let db_path = defaults.db_default();
@@ -1205,7 +1361,7 @@ fn ops_snapshot(project_root: &Path) -> Result<String, String> {
             let age = meta
                 .modified()
                 .ok()
-                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
                 .map(format_age)
                 .unwrap_or_else(|| "unknown".to_string());
             format!("state db: {}\n  last activity: {}", db_path.display(), age)
@@ -1225,6 +1381,7 @@ fn display_project_path(project_root: &Path, path: &Path) -> String {
         .to_string()
 }
 
+#[cfg(test)]
 fn format_age(age: Duration) -> String {
     let secs = age.as_secs();
     if secs < 60 {
@@ -1236,6 +1393,7 @@ fn format_age(age: Duration) -> String {
     }
 }
 
+#[cfg(test)]
 fn short_hash(hash: &str) -> &str {
     hash.get(..12).unwrap_or(hash)
 }
@@ -1277,7 +1435,7 @@ fn footer_text(app: &App) -> String {
             WorkspaceTab::Build => {
                 "Ctrl+R/F5 build \u{00b7} \u{2190}/\u{2192} tab \u{00b7} Esc back \u{00b7} ? help \u{00b7} q quit".to_string()
             }
-            WorkspaceTab::Ops => "\u{2190}/\u{2192} tab \u{00b7} Esc back \u{00b7} ? help \u{00b7} q quit".to_string(),
+            WorkspaceTab::Ops => "Enter/Ctrl+R/F5 refresh \u{00b7} \u{2191}/\u{2193} select \u{00b7} \u{2190}/\u{2192} tab \u{00b7} Esc back \u{00b7} ? help \u{00b7} q quit".to_string(),
         },
     }
 }
@@ -1294,7 +1452,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(
-            "Ctrl+R or F5 runs the active tab's primary action (convert or build)\n\u{2190}/\u{2192} switches Convert/Build/Ops tabs\nTab / Shift-Tab moves focus inside Convert\nEnter starts converting from Home, or runs the focused Convert action\nEsc goes back or dismisses overlays\nq quits when focus is outside the prompt editor\n-help, -h, and --help print CLI help",
+            "Ctrl+R or F5 runs the active tab's primary action\n\u{2190}/\u{2192} switches Convert/Build/Ops tabs\n\u{2191}/\u{2193} selects rows in Build/Ops\nTab / Shift-Tab moves focus inside Convert\nEnter starts converting from Home, runs the focused Convert action, builds, or refreshes Ops\nEsc goes back or dismisses overlays\nq quits when focus is outside the prompt editor\n-help, -h, and --help print CLI help",
         )
         .block(Block::default().borders(Borders::ALL).title(" Help "))
         .wrap(Wrap { trim: false }),
@@ -1475,14 +1633,14 @@ mod tests {
     }
 
     #[test]
-    fn ops_tab_has_no_primary_action() {
+    fn ops_tab_primary_action_refreshes_ops() {
         let mut app = App::default();
         app.enter_convert();
         app.switch_tab(WorkspaceTab::Ops);
 
         let action = app.handle_key(ctrl_key('r'));
 
-        assert!(matches!(action, AppAction::None));
+        assert!(matches!(action, AppAction::RefreshOps));
     }
 
     #[tokio::test]
@@ -1707,5 +1865,32 @@ mod tests {
         assert!(rendered.contains("Convert"));
         assert!(rendered.contains("Build"));
         assert!(rendered.contains("Ops"));
+    }
+
+    #[test]
+    fn render_ops_shows_selectable_list_without_project_state_panel() {
+        let backend = TestBackend::new(72, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::default();
+        app.enter_convert();
+        app.switch_tab(WorkspaceTab::Ops);
+        app.ops_status = OpsStatus::Success(vec![
+            OpsEntry {
+                title: "dist/build.log".to_string(),
+                body: "success: built".to_string(),
+            },
+            OpsEntry {
+                title: "Sessions".to_string(),
+                body: "Sessions (0)".to_string(),
+            },
+        ]);
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("dist/build.log"));
+        assert!(rendered.contains("success: built"));
+        assert!(!rendered.contains("Project state"));
     }
 }

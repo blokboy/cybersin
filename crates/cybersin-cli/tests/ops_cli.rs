@@ -92,6 +92,36 @@ fn ops_explicit_db_flag_overrides_the_discovered_default() {
     assert!(!project.join(".cybersin/cybersin.db").exists());
 }
 
+#[test]
+fn ops_plain_lists_runnable_builds_by_agent_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("myagent");
+    cybersin().arg("init").arg(&project).assert().success();
+    cybersin()
+        .arg("build")
+        .arg(&project)
+        .arg("--profile")
+        .arg("dev")
+        .arg("--frozen")
+        .assert()
+        .success();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(project.join("dist/manifest.json")).unwrap())
+            .unwrap();
+    let build_hash = manifest["build_hash"].as_str().unwrap();
+    let build_hash_short = &build_hash[..12];
+
+    cybersin()
+        .arg("ops")
+        .arg(&project)
+        .arg("--plain")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Builds (1)"))
+        .stdout(predicate::str::contains("hello-agent"))
+        .stdout(predicate::str::contains(build_hash_short));
+}
+
 #[tokio::test]
 async fn ops_plain_shows_sessions_traces_and_cost_together() {
     let tmp = tempfile::tempdir().unwrap();

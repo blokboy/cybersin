@@ -24,6 +24,7 @@ use cybersin_adapter::transport::grpc;
 use cybersin_adapter::transport::stdio::StdioDaemonChannel;
 use cybersin_runtime::{
     stub_agent, DaemonHandle, DistFixture, ModelAllowlist, OpenRouterModelCaller,
+    RuntimeSessionSummary,
 };
 use tokio::process::{Child, Command};
 
@@ -75,6 +76,18 @@ pub async fn execute(
     sandbox_backend: crate::commands::sandbox::Backend,
     args: RunArgs,
 ) -> anyhow::Result<()> {
+    let summary = run_session(db_path, dist_dir, sandbox_root, sandbox_backend, args).await?;
+    print_summary(&summary);
+    Ok(())
+}
+
+pub async fn run_session(
+    db_path: PathBuf,
+    dist_dir: PathBuf,
+    sandbox_root: PathBuf,
+    sandbox_backend: crate::commands::sandbox::Backend,
+    args: RunArgs,
+) -> anyhow::Result<RuntimeSessionSummary> {
     match (args.stub, args.agent_yaml.clone()) {
         (true, _) => run_stub(db_path, dist_dir, args).await,
         (false, Some(agent_yaml)) => {
@@ -92,7 +105,11 @@ pub async fn execute(
     }
 }
 
-async fn run_stub(db_path: PathBuf, dist_dir: PathBuf, args: RunArgs) -> anyhow::Result<()> {
+async fn run_stub(
+    db_path: PathBuf,
+    dist_dir: PathBuf,
+    args: RunArgs,
+) -> anyhow::Result<RuntimeSessionSummary> {
     let dist = Arc::new(DistFixture::load_dir(&dist_dir)?);
 
     // `cybersind` auto-starts here: this is the first point a runtime
@@ -113,17 +130,15 @@ async fn run_stub(db_path: PathBuf, dist_dir: PathBuf, args: RunArgs) -> anyhow:
         dist_dir.display()
     );
 
-    let summary = stub_agent::run_stub_session(
+    stub_agent::run_stub_session(
         daemon.storage(),
         daemon.spans(),
         dist,
         session_id.clone(),
         agent_name,
     )
-    .await?;
-
-    print_summary(&summary);
-    Ok(())
+    .await
+    .map_err(Into::into)
 }
 
 async fn run_live(
@@ -133,7 +148,7 @@ async fn run_live(
     sandbox_backend: crate::commands::sandbox::Backend,
     agent_yaml: PathBuf,
     args: RunArgs,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RuntimeSessionSummary> {
     let dist = Arc::new(DistFixture::load_dir(&dist_dir)?);
 
     let yaml_source = std::fs::read_to_string(&agent_yaml)
@@ -260,8 +275,7 @@ async fn run_live(
         }
     };
 
-    print_summary(&summary);
-    Ok(())
+    Ok(summary)
 }
 
 /// Spawns `harness.command` and returns its process handle plus a
