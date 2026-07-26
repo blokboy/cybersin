@@ -217,7 +217,7 @@ fn split_messages(prompt: &PromptIr, tags: bool) -> Vec<Message> {
 /// mirroring `cybersin_runtime::live_model_caller`'s
 /// `CASCADE_CONFIDENCE_KEY` precedent of never clobbering a schema
 /// author's own explicit intent.
-fn enforce_additional_properties_false(schema: &mut Value) {
+pub fn enforce_additional_properties_false(schema: &mut Value) {
     let Value::Object(obj) = schema else {
         return;
     };

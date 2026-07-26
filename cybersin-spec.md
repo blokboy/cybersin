@@ -191,7 +191,7 @@ Versioned with the product, documented in-repo, conformance-tested. Transport: n
 ## 11. CLI surface (v1)
 
 ```
-cybersin init | fmt | check | build [--frozen|--watch] | diff <ref> | explain <prompt>
+cybersin init | fmt | check | convert [--out path] [--model id] <input> | build [--frozen|--watch] | diff <ref> | explain <prompt>
 cybersin lock update
 cybersin run <agent.yaml> [--input f]
 cybersin sessions ls|show|resume|kill|migrate

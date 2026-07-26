@@ -6,6 +6,7 @@
 pub mod approval;
 pub mod build;
 pub mod check;
+pub mod convert;
 pub mod cost;
 pub mod daemon;
 pub mod diff;

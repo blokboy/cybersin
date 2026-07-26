@@ -112,6 +112,17 @@ enum Command {
         /// A `*.prompt.yaml` file, or a project (or `prompts/`) directory.
         path: PathBuf,
     },
+    /// Convert a raw natural-language prompt into a buildable prompt source.
+    Convert {
+        /// Output path. Relative paths resolve from the project root.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Standalone OpenAI model used only for this conversion.
+        #[arg(long, default_value = commands::convert::DEFAULT_MODEL)]
+        model: String,
+        /// `-` for stdin, an existing file path, or literal prompt text.
+        input: String,
+    },
     /// Scaffold a new project layout (spec §5): `cybersin.yaml`,
     /// `cybersin.lock`, `prompts/`, `fragments/`, `evals/`, `agents/`,
     /// `dist/`, plus one working example prompt.
@@ -232,6 +243,9 @@ async fn main() -> ExitCode {
             profile,
         } => from_sync(commands::diff::run(&path, &reference, profile)),
         Command::Check { path } => from_sync(commands::check::run(&path)),
+        Command::Convert { out, model, input } => {
+            from_async(commands::convert::execute(input, out, model).await)
+        }
         Command::Init { dir } => from_sync(commands::init::run(&dir)),
         Command::Fmt { path, check } => from_sync(commands::fmt::run(&path, check)),
         Command::Run(args) => {
