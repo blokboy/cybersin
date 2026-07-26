@@ -16,9 +16,9 @@ path = "src/main.rs"
 name = "grpc_stub_harness"
 path = "src/bin/grpc_stub_harness.rs"
 
-# Reusable, transport-agnostic scripted test harness (issue #41): drives
-# any compiled agent's live session from a YAML script instead of a
-# bespoke per-agent program. Not part of the `cybersin` product surface.
+# Reusable, transport-agnostic scripted harness (issue #41): drives any
+# compiled agent's live session from a YAML script instead of a bespoke
+# per-agent program. The TUI's generated prompt agents use this binary.
 [[bin]]
 name = "scripted_harness"
 path = "src/bin/scripted_harness.rs"
