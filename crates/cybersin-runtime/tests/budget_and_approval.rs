@@ -554,9 +554,9 @@ async fn approval_resolved_by_a_slow_tool_call_is_not_reported_as_a_premature_fa
         CallOutcomeOrPark::Result(CallOutcome::Ok { value }) => {
             assert_eq!(value["status"], "ok");
         }
-        other => panic!(
-            "expected the slow approval to resolve as a genuine success, not: {other:?}"
-        ),
+        other => {
+            panic!("expected the slow approval to resolve as a genuine success, not: {other:?}")
+        }
     }
 
     harness

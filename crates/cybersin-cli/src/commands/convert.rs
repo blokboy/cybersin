@@ -312,13 +312,16 @@ pub async fn run_raw_with(
     })
 }
 
-pub async fn execute(input: String, out: Option<PathBuf>, model: String) -> anyhow::Result<()> {
-    let cwd =
-        std::env::current_dir().map_err(|e| anyhow::anyhow!("reading current directory: {e}"))?;
-    let project_root = crate::project::discover_project_root(&cwd).ok_or_else(|| {
+pub async fn execute(
+    project_start: &Path,
+    input: String,
+    out: Option<PathBuf>,
+    model: String,
+) -> anyhow::Result<()> {
+    let project_root = crate::project::discover_project_root(project_start).ok_or_else(|| {
         anyhow::anyhow!(
             "no cybersin.yaml found in {} or any parent directory",
-            cwd.display()
+            project_start.display()
         )
     })?;
     let converter = OpenRouterPromptConversionModel::from_env(model).map_err(anyhow::Error::msg)?;

@@ -69,6 +69,11 @@ struct Cli {
     #[arg(long, global = true, value_enum)]
     sandbox_backend: Option<commands::sandbox::Backend>,
 
+    /// Project directory, or a path inside one, used for project discovery
+    /// when the shell's current directory is somewhere else.
+    #[arg(long, global = true)]
+    project: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -225,8 +230,13 @@ async fn main() -> ExitCode {
         dist,
         sandbox_root,
         sandbox_backend,
+        project,
         command,
     } = Cli::parse_from(args);
+    let project_start = match resolve_project_start(project) {
+        Ok(path) => path,
+        Err(err) => return from_async(Err(err)),
+    };
     let Some(command) = command else {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             eprintln!(
@@ -234,7 +244,7 @@ async fn main() -> ExitCode {
             );
             return ExitCode::FAILURE;
         }
-        return from_async(commands::tui::execute().await);
+        return from_async(commands::tui::execute(project_start).await);
     };
     match command {
         Command::Build {
@@ -256,13 +266,13 @@ async fn main() -> ExitCode {
         } => from_sync(commands::diff::run(&path, &reference, profile)),
         Command::Check { path } => from_sync(commands::check::run(&path)),
         Command::Convert { out, model, input } => {
-            from_async(commands::convert::execute(input, out, model).await)
+            from_async(commands::convert::execute(&project_start, input, out, model).await)
         }
         Command::Init { dir } => from_sync(commands::init::run(&dir)),
         Command::Fmt { path, check } => from_sync(commands::fmt::run(&path, check)),
         Command::Run(args) => {
             let (db, sandbox_root, sandbox_backend, defaults) =
-                match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
                     Ok(v) => v,
                     Err(e) => return from_async(Err(e)),
                 };
@@ -273,25 +283,28 @@ async fn main() -> ExitCode {
             from_async(commands::run::execute(db, dist, sandbox_root, sandbox_backend, args).await)
         }
         Command::Trace { command } => {
-            let (db, ..) = match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
-                Ok(v) => v,
-                Err(e) => return from_async(Err(e)),
-            };
+            let (db, ..) =
+                match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
+                    Ok(v) => v,
+                    Err(e) => return from_async(Err(e)),
+                };
             from_async(commands::trace::execute(db, command).await)
         }
         Command::Cost(args) => {
-            let (db, ..) = match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
-                Ok(v) => v,
-                Err(e) => return from_async(Err(e)),
-            };
+            let (db, ..) =
+                match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
+                    Ok(v) => v,
+                    Err(e) => return from_async(Err(e)),
+                };
             from_async(commands::cost::execute(db, args).await)
         }
         Command::Eval { command } => from_async(commands::eval::execute(command).await),
         Command::Explain(args) => {
-            let (db, ..) = match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
-                Ok(v) => v,
-                Err(e) => return from_async(Err(e)),
-            };
+            let (db, ..) =
+                match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
+                    Ok(v) => v,
+                    Err(e) => return from_async(Err(e)),
+                };
             from_async(commands::explain::execute(db, args).await)
         }
         // Unlike every other runtime command, `ops` resolves `--db` (and,
@@ -310,7 +323,7 @@ async fn main() -> ExitCode {
         Command::Daemon(args) => from_async(commands::daemon::execute(args).await),
         Command::Dlq { command } => {
             let (db, sandbox_root, sandbox_backend, defaults) =
-                match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
                     Ok(v) => v,
                     Err(e) => return from_async(Err(e)),
                 };
@@ -324,7 +337,7 @@ async fn main() -> ExitCode {
         }
         Command::Approve { call_id } => {
             let (db, sandbox_root, sandbox_backend, defaults) =
-                match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
                     Ok(v) => v,
                     Err(e) => return from_async(Err(e)),
                 };
@@ -338,7 +351,7 @@ async fn main() -> ExitCode {
         }
         Command::Deny { call_id } => {
             let (db, sandbox_root, sandbox_backend, defaults) =
-                match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
+                match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
                     Ok(v) => v,
                     Err(e) => return from_async(Err(e)),
                 };
@@ -351,17 +364,19 @@ async fn main() -> ExitCode {
             )
         }
         Command::Sessions { command } => {
-            let (db, ..) = match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
-                Ok(v) => v,
-                Err(e) => return from_async(Err(e)),
-            };
+            let (db, ..) =
+                match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
+                    Ok(v) => v,
+                    Err(e) => return from_async(Err(e)),
+                };
             from_async(commands::sessions::execute(db, command).await)
         }
         Command::Notify { session, payload } => {
-            let (db, ..) = match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
-                Ok(v) => v,
-                Err(e) => return from_async(Err(e)),
-            };
+            let (db, ..) =
+                match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
+                    Ok(v) => v,
+                    Err(e) => return from_async(Err(e)),
+                };
             from_async(commands::notify::execute(db, session, payload).await)
         }
         Command::Sandbox { command } => match command {
@@ -371,10 +386,11 @@ async fn main() -> ExitCode {
             SandboxCommand::Restore(args) => from_sync(commands::sandbox::restore(args)),
         },
         Command::Optimize(args) => {
-            let (db, ..) = match resolve_runtime_globals(db, sandbox_root, sandbox_backend) {
-                Ok(v) => v,
-                Err(e) => return from_async(Err(e)),
-            };
+            let (db, ..) =
+                match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
+                    Ok(v) => v,
+                    Err(e) => return from_async(Err(e)),
+                };
             from_async(commands::optimize::execute(db, args).await)
         }
     }
@@ -389,6 +405,23 @@ where
         .collect()
 }
 
+fn resolve_project_start(project: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let Some(project) = project else {
+        return Ok(cwd);
+    };
+    let path = if project.is_absolute() {
+        project
+    } else {
+        cwd.join(project)
+    };
+    if path.is_file() {
+        Ok(path.parent().unwrap_or(&path).to_path_buf())
+    } else {
+        Ok(path)
+    }
+}
+
 /// Resolves the three infallible runtime globals (`--db`/`--sandbox-root`/
 /// `--sandbox-backend`) against the discovered project root (issue #50),
 /// applying an explicit flag over its corresponding discovered/config
@@ -396,6 +429,7 @@ where
 /// `--dist` (which can fail, see `resolve_dist`) can resolve it from the
 /// same discovery pass.
 fn resolve_runtime_globals(
+    project_start: &std::path::Path,
     db: Option<PathBuf>,
     sandbox_root: Option<PathBuf>,
     sandbox_backend: Option<commands::sandbox::Backend>,
@@ -405,8 +439,7 @@ fn resolve_runtime_globals(
     commands::sandbox::Backend,
     project::ProjectDefaults,
 )> {
-    let cwd = std::env::current_dir().context("reading current directory")?;
-    let defaults = project::ProjectDefaults::detect(&cwd)?;
+    let defaults = project::ProjectDefaults::detect(project_start)?;
     Ok((
         db.unwrap_or_else(|| defaults.db_default()),
         sandbox_root.unwrap_or_else(|| defaults.sandbox_root_default()),

@@ -85,7 +85,10 @@ fn ops_explicit_db_flag_overrides_the_discovered_default() {
         .assert()
         .success();
 
-    assert!(explicit_db.exists(), "explicit --db must win over discovery");
+    assert!(
+        explicit_db.exists(),
+        "explicit --db must win over discovery"
+    );
     assert!(!project.join(".cybersin/cybersin.db").exists());
 }
 

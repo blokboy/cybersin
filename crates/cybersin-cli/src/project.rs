@@ -165,7 +165,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let defaults = ProjectDefaults::detect(dir.path()).unwrap();
 
-        assert_eq!(defaults.db_default(), dir.path().join(".cybersin/cybersin.db"));
+        assert_eq!(
+            defaults.db_default(),
+            dir.path().join(".cybersin/cybersin.db")
+        );
         assert_eq!(
             defaults.sandbox_root_default(),
             dir.path().join(".cybersin/sandbox")
@@ -218,9 +221,16 @@ mod tests {
     #[test]
     fn plain_docker_backend_from_yaml() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("cybersin.yaml"), "sandbox:\n  backend: docker\n").unwrap();
+        std::fs::write(
+            dir.path().join("cybersin.yaml"),
+            "sandbox:\n  backend: docker\n",
+        )
+        .unwrap();
         let defaults = ProjectDefaults::detect(dir.path()).unwrap();
 
-        assert!(matches!(defaults.sandbox_backend_default(), Backend::Docker));
+        assert!(matches!(
+            defaults.sandbox_backend_default(),
+            Backend::Docker
+        ));
     }
 }

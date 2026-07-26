@@ -1,10 +1,11 @@
-//! Bare `cybersin`: a reusable Ratatui application shell. `Home` lists
-//! the available workflows behind a real `ListState` cursor (arrow keys
-//! move it, `Enter` opens the highlighted one). Every workflow opens the
-//! same `Workspace` screen, which multiplexes `Convert`/`Build`/`Ops`
-//! behind a `Tabs` bar (arrow keys switch tabs) rather than adding a new
-//! top-level `Screen` per workflow — a later workflow joins as another
-//! tab instead of another screen plus another `go_back` case.
+//! Bare `cybersin`: a reusable Ratatui application shell. `Home` is just
+//! the control-room backdrop plus a one-line hint — `Enter` drops
+//! straight into the `Workspace` screen on its `Convert` tab, the
+//! lowest-friction path into the shell. `Workspace` multiplexes
+//! `Convert`/`Build`/`Ops` behind a `Tabs` bar (arrow keys switch tabs)
+//! rather than adding a new top-level `Screen` per workflow — a later
+//! workflow joins as another tab instead of another screen plus another
+//! `go_back` case.
 //!
 //! `Build` and `Ops` are read-only info panels — `Build` also runs a
 //! real, Dev-profile build on demand. Neither touches the daemon that
@@ -27,10 +28,10 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
 use serde_json::Value;
 
@@ -84,33 +85,6 @@ impl WorkspaceTab {
     }
 }
 
-struct HomeItem {
-    title: &'static str,
-    description: &'static str,
-    tab: WorkspaceTab,
-}
-
-/// `Home`'s list, in cursor order. Each entry opens `Workspace` on its
-/// paired tab, so adding a fourth workflow later means adding both a
-/// `WorkspaceTab` variant and a row here — never a new `Screen`.
-const HOME_ITEMS: [HomeItem; 3] = [
-    HomeItem {
-        title: "Convert prompt",
-        description: "raw prompt to buildable *.prompt.yaml",
-        tab: WorkspaceTab::Convert,
-    },
-    HomeItem {
-        title: "Build",
-        description: "compile prompts + tools into dist/",
-        tab: WorkspaceTab::Build,
-    },
-    HomeItem {
-        title: "Ops",
-        description: "project state at a glance — dist/ and recorded sessions",
-        tab: WorkspaceTab::Ops,
-    },
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Navigation,
@@ -161,7 +135,6 @@ struct App {
     screen: Screen,
     workspace_tab: WorkspaceTab,
     focus: Focus,
-    home_cursor: usize,
     raw_prompt: String,
     model: String,
     out: String,
@@ -186,7 +159,6 @@ impl App {
             screen: Screen::Home,
             workspace_tab: WorkspaceTab::Convert,
             focus: Focus::Navigation,
-            home_cursor: 0,
             raw_prompt: String::new(),
             model: convert::DEFAULT_MODEL.to_string(),
             out: String::new(),
@@ -289,14 +261,6 @@ impl App {
                 self.switch_tab(tab);
                 AppAction::None
             }
-            KeyCode::Up if self.screen == Screen::Home => {
-                self.move_home_cursor(-1);
-                AppAction::None
-            }
-            KeyCode::Down if self.screen == Screen::Home => {
-                self.move_home_cursor(1);
-                AppAction::None
-            }
             KeyCode::Tab => {
                 self.focus_next();
                 AppAction::None
@@ -310,7 +274,7 @@ impl App {
                 AppAction::None
             }
             KeyCode::Enter if self.screen == Screen::Home => {
-                self.open_selected();
+                self.enter_convert();
                 AppAction::None
             }
             KeyCode::Enter if self.focus == Focus::ConvertAction => self.request_action(),
@@ -337,16 +301,9 @@ impl App {
         }
     }
 
-    fn move_home_cursor(&mut self, delta: isize) {
-        let len = HOME_ITEMS.len() as isize;
-        let next = (self.home_cursor as isize + delta).rem_euclid(len);
-        self.home_cursor = next as usize;
-    }
-
-    fn open_selected(&mut self) {
-        let tab = HOME_ITEMS[self.home_cursor].tab;
+    fn enter_convert(&mut self) {
         self.screen = Screen::Workspace;
-        self.switch_tab(tab);
+        self.switch_tab(WorkspaceTab::Convert);
     }
 
     fn switch_tab(&mut self, tab: WorkspaceTab) {
@@ -658,37 +615,22 @@ fn render(frame: &mut Frame, app: &App) {
     }
 }
 
-fn render_home(frame: &mut Frame, app: &App, area: Rect) {
+fn render_home(frame: &mut Frame, _app: &App, area: Rect) {
     render_control_room_backdrop(frame, area);
 
-    let panel = centered_rect(area, 64, HOME_ITEMS.len() as u16 + 2);
+    let panel = centered_rect(area, 46, 3);
     frame.render_widget(Clear, pad_rect(panel, 1, area));
-
-    let items: Vec<ListItem> = HOME_ITEMS
-        .iter()
-        .map(|item| {
-            ListItem::new(Line::from(vec![
-                Span::styled(item.title, Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(format!("  {}", item.description)),
-            ]))
-        })
-        .collect();
-    let mut state = ListState::default();
-    state.select(Some(app.home_cursor));
-    let list = List::new(items)
-        .style(Style::default().bg(Color::Black))
-        .block(focused_block(" Workflows ", true))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
-    frame.render_stateful_widget(list, panel, &mut state);
+    frame.render_widget(
+        Paragraph::new("Press Enter to start converting a prompt")
+            .alignment(Alignment::Center)
+            .style(Style::default().bg(Color::Black))
+            .block(focused_block(" Cybersin ", true)),
+        panel,
+    );
 }
 
 /// A procedurally generated wall of glowing "monitors" behind the
-/// `Workflows` panel — an original, terminal-native stand-in for
+/// landing hint panel — an original, terminal-native stand-in for
 /// `assets/pixel-art-hacker-computer-control-room-*.jpg` (a watermarked
 /// stock preview, not a licensed asset, so not something to embed
 /// directly). Generated from `(x, y)` rather than a fixed string so it
@@ -758,7 +700,7 @@ fn backdrop_cell(x: u16, y: u16) -> (char, Color) {
 
 /// A `width`x`height` rect centered inside `area`, clamped to fit —
 /// the standard Ratatui "floating panel over a full-screen backdrop"
-/// layout, also used to keep the `Workflows` panel a fixed, readable
+/// layout, also used to keep the landing hint panel a fixed, readable
 /// size regardless of how large the backdrop around it is.
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let height = height.min(area.height);
@@ -783,7 +725,7 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 /// `rect` expanded by `padding` cells on every side, clamped to `bounds`
-/// — a blank "halo" cleared around the `Workflows` panel so it reads as
+/// — a blank "halo" cleared around the landing hint panel so it reads as
 /// a floating console separated from the backdrop's monitor grid,
 /// rather than the two visually colliding edge-to-edge.
 fn pad_rect(rect: Rect, padding: u16, bounds: Rect) -> Rect {
@@ -1132,7 +1074,7 @@ fn format_build_progress(project_start: &Path, progress: BuildProgress) -> Strin
 
 fn footer_text(app: &App) -> String {
     match app.screen {
-        Screen::Home => "Enter open \u{00b7} \u{2191}/\u{2193} select \u{00b7} ? help \u{00b7} q quit".to_string(),
+        Screen::Home => "Enter convert \u{00b7} ? help \u{00b7} q quit".to_string(),
         Screen::Workspace => match app.workspace_tab {
             WorkspaceTab::Convert => {
                 "Ctrl+R/F5 convert \u{00b7} Tab/Shift-Tab focus \u{00b7} \u{2190}/\u{2192} tab \u{00b7} Enter type/act \u{00b7} Esc back \u{00b7} ? help \u{00b7} q quit".to_string()
@@ -1157,7 +1099,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(
-            "Ctrl+R or F5 runs the active tab's primary action (convert or build)\n\u{2191}/\u{2193} moves the Home cursor \u{00b7} \u{2190}/\u{2192} switches Convert/Build/Ops tabs\nTab / Shift-Tab moves focus inside Convert\nEnter opens the highlighted Home item or runs the focused Convert action\nEsc goes back or dismisses overlays\nq quits when focus is outside the prompt editor\n-help, -h, and --help print CLI help",
+            "Ctrl+R or F5 runs the active tab's primary action (convert or build)\n\u{2190}/\u{2192} switches Convert/Build/Ops tabs\nTab / Shift-Tab moves focus inside Convert\nEnter starts converting from Home, or runs the focused Convert action\nEsc goes back or dismisses overlays\nq quits when focus is outside the prompt editor\n-help, -h, and --help print CLI help",
         )
         .block(Block::default().borders(Borders::ALL).title(" Help "))
         .wrap(Wrap { trim: false }),
@@ -1224,31 +1166,18 @@ mod tests {
     }
 
     #[test]
-    fn home_cursor_wraps_with_up_and_down() {
+    fn enter_from_home_always_opens_convert() {
         let mut app = App::default();
-        assert_eq!(app.home_cursor, 0);
-
-        app.handle_key(key(KeyCode::Up));
-        assert_eq!(app.home_cursor, HOME_ITEMS.len() - 1);
-
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.home_cursor, 0);
-    }
-
-    #[test]
-    fn enter_opens_the_highlighted_home_item() {
-        let mut app = App::default();
-        app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Enter));
 
         assert_eq!(app.screen, Screen::Workspace);
-        assert_eq!(app.workspace_tab, WorkspaceTab::Build);
+        assert_eq!(app.workspace_tab, WorkspaceTab::Convert);
     }
 
     #[test]
     fn left_right_cycle_workspace_tabs_and_wrap() {
         let mut app = App::default();
-        app.open_selected();
+        app.enter_convert();
         assert_eq!(app.workspace_tab, WorkspaceTab::Convert);
 
         app.handle_key(key(KeyCode::Right));
@@ -1265,7 +1194,7 @@ mod tests {
     #[test]
     fn conversion_focus_cycles_through_fields() {
         let mut app = App::default();
-        app.open_selected();
+        app.enter_convert();
 
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Model);
@@ -1280,7 +1209,7 @@ mod tests {
     #[test]
     fn q_does_not_quit_inside_prompt_editor() {
         let mut app = App::default();
-        app.open_selected();
+        app.enter_convert();
 
         app.handle_key(key(KeyCode::Char('q')));
 
@@ -1291,7 +1220,7 @@ mod tests {
     #[test]
     fn ctrl_r_converts_from_the_prompt_editor() {
         let mut app = App::default();
-        app.open_selected();
+        app.enter_convert();
         app.raw_prompt = "Turn this into a prompt source.".to_string();
 
         let action = app.handle_key(ctrl_key('r'));
@@ -1303,7 +1232,7 @@ mod tests {
     #[test]
     fn empty_prompt_conversion_is_rejected_before_model_call() {
         let mut app = App::default();
-        app.open_selected();
+        app.enter_convert();
 
         let action = app.handle_key(ctrl_key('r'));
 
@@ -1317,8 +1246,8 @@ mod tests {
     #[test]
     fn build_tab_ctrl_r_requests_build_without_validation() {
         let mut app = App::default();
-        app.home_cursor = 1;
-        app.open_selected();
+        app.enter_convert();
+        app.switch_tab(WorkspaceTab::Build);
 
         let action = app.handle_key(ctrl_key('r'));
 
@@ -1328,8 +1257,8 @@ mod tests {
     #[test]
     fn ops_tab_has_no_primary_action() {
         let mut app = App::default();
-        app.home_cursor = 2;
-        app.open_selected();
+        app.enter_convert();
+        app.switch_tab(WorkspaceTab::Ops);
 
         let action = app.handle_key(ctrl_key('r'));
 
@@ -1480,7 +1409,7 @@ mod tests {
         let mut app = App::default();
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
-        app.open_selected();
+        app.enter_convert();
         app.raw_prompt = "Line one\nLine two".to_string();
         app.convert_status = ConversionStatus::Failure("network failed".to_string());
         terminal.draw(|frame| render(frame, &app)).unwrap();
@@ -1492,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn home_backdrop_surrounds_the_workflows_panel_without_hiding_it() {
+    fn home_backdrop_surrounds_the_hint_panel_without_hiding_it() {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let app = App::default();
@@ -1501,8 +1430,7 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let rendered = format!("{buffer:?}");
-        assert!(rendered.contains("Workflows"));
-        assert!(rendered.contains("Convert prompt"));
+        assert!(rendered.contains("Press Enter to start converting a prompt"));
         assert!(rendered.contains('┌'));
     }
 
@@ -1520,7 +1448,7 @@ mod tests {
         let backend = TestBackend::new(48, 14);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::default();
-        app.open_selected();
+        app.enter_convert();
 
         terminal.draw(|frame| render(frame, &app)).unwrap();
 

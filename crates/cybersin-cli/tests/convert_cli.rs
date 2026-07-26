@@ -50,6 +50,48 @@ async fn convert_discovers_the_project_and_writes_a_valid_draft() {
         .contains("Write from a nested directory."));
 }
 
+#[tokio::test]
+async fn convert_project_flag_anchors_discovery_from_outside_the_project() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key"))
+        .and(body_partial_json(json!({"model": "test-converter"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"name\":\"anchored-draft\",\"quality\":\"medium\",\"sections\":[{\"id\":\"prompt\",\"priority\":100,\"body\":\"ignored\"}]}"
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let outside_project = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("cybersin.yaml"), "name: test\n").unwrap();
+
+    cybersin()
+        .current_dir(outside_project.path())
+        .env("OPENROUTER_API_KEY", "Bearer test-key")
+        .env("OPENROUTER_BASE_URL", server.uri())
+        .arg("--project")
+        .arg(project.path())
+        .arg("convert")
+        .arg("--model")
+        .arg("test-converter")
+        .arg("I would really like to know more about Otto Von Bismarck's strategy for unifying Germany.")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("self-validation passed"));
+
+    let written = project.path().join("prompts/anchored-draft.prompt.yaml");
+    assert!(written.exists());
+    assert!(std::fs::read_to_string(written)
+        .unwrap()
+        .contains("Otto Von Bismarck"));
+}
+
 #[test]
 fn convert_reports_a_missing_project_with_a_nonzero_exit() {
     let outside_project = tempfile::tempdir().unwrap();
