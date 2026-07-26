@@ -860,13 +860,16 @@ fn render_control_room_backdrop(frame: &mut Frame, area: Rect) {
             let spans: Vec<Span<'static>> = (0..area.width)
                 .map(|x| {
                     let (ch, color) = backdrop_cell(x, y);
-                    Span::styled(ch.to_string(), Style::default().fg(color))
+                    Span::styled(ch.to_string(), Style::default().fg(color).bg(Color::Black))
                 })
                 .collect();
             Line::from(spans)
         })
         .collect();
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(Color::Black)),
+        area,
+    );
 }
 
 /// One character of the control-room backdrop at column `x`, row `y`:
