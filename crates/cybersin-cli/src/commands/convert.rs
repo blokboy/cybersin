@@ -1,6 +1,6 @@
 //! `cybersin convert`: turns a raw prompt into a buildable prompt source.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -102,6 +102,7 @@ impl OpenRouterPromptConversionModel {
         let api_key = std::env::var("OPENROUTER_API_KEY").map_err(|_| {
             "error: OPENROUTER_API_KEY is required for `cybersin convert`".to_string()
         })?;
+        let api_key = normalize_openrouter_api_key(&api_key)?;
         let base_url =
             std::env::var("OPENROUTER_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         Ok(Self {
@@ -110,6 +111,22 @@ impl OpenRouterPromptConversionModel {
             base_url: base_url.trim_end_matches('/').to_string(),
             model,
         })
+    }
+}
+
+fn normalize_openrouter_api_key(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let key = trimmed
+        .strip_prefix("Bearer ")
+        .or_else(|| trimmed.strip_prefix("bearer "))
+        .or_else(|| trimmed.strip_prefix("Bearer"))
+        .or_else(|| trimmed.strip_prefix("bearer"))
+        .unwrap_or(trimmed)
+        .trim();
+    if key.is_empty() {
+        Err("error: OPENROUTER_API_KEY is empty".to_string())
+    } else {
+        Ok(key.to_string())
     }
 }
 
@@ -220,6 +237,7 @@ pub async fn run_raw_with(
     {
         draft.sections[0].body = raw_prompt.to_string();
     }
+    repair_inferred_inputs(&mut draft.inputs, &draft.sections);
     if !raw_prompt_implies_structured_output(&raw_prompt) {
         draft.output_contract = None;
     }
@@ -356,6 +374,185 @@ fn normalize_input_types(inputs: &mut [PromptInput]) {
             _ => default_input_type(),
         };
     }
+}
+
+fn repair_inferred_inputs(inputs: &mut Vec<PromptInput>, sections: &[PromptSection]) {
+    for _ in 0..5 {
+        if !repair_inferred_inputs_once(inputs, sections) {
+            break;
+        }
+    }
+}
+
+fn repair_inferred_inputs_once(inputs: &mut Vec<PromptInput>, sections: &[PromptSection]) -> bool {
+    let refs = template_input_refs(sections);
+    let mut changed = false;
+
+    let before_len = inputs.len();
+    inputs.retain(|input| refs.contains_key(&input.name));
+    changed |= inputs.len() != before_len;
+
+    let mut declared = inputs
+        .iter()
+        .map(|input| input.name.clone())
+        .collect::<BTreeSet<_>>();
+    for (name, kind) in &refs {
+        if declared.insert(name.clone()) {
+            inputs.push(PromptInput {
+                name: name.clone(),
+                input_type: kind.default_input_type().to_string(),
+            });
+            changed = true;
+        }
+    }
+
+    for input in inputs.iter_mut() {
+        let Some(kind) = refs.get(&input.name) else {
+            continue;
+        };
+        let desired = kind.default_input_type();
+        let is_list = input.input_type.starts_with("list[");
+        if (kind.collection && !is_list) || (!kind.collection && is_list) {
+            input.input_type = desired.to_string();
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TemplateRefKind {
+    collection: bool,
+}
+
+impl TemplateRefKind {
+    fn default_input_type(self) -> &'static str {
+        if self.collection {
+            "list[string]"
+        } else {
+            "string"
+        }
+    }
+}
+
+fn template_input_refs(sections: &[PromptSection]) -> BTreeMap<String, TemplateRefKind> {
+    let mut refs = BTreeMap::new();
+    for section in sections {
+        for chunk in template_chunks(&section.body, "{{", "}}") {
+            record_mustache_refs(chunk, &mut refs);
+        }
+        for chunk in template_chunks(&section.body, "{%", "%}") {
+            record_statement_refs(chunk, &mut refs);
+        }
+    }
+    refs
+}
+
+fn template_chunks<'a>(
+    body: &'a str,
+    open: &'static str,
+    close: &'static str,
+) -> impl Iterator<Item = &'a str> {
+    body.split(open).skip(1).filter_map(move |rest| {
+        let (chunk, _) = rest.split_once(close)?;
+        Some(chunk)
+    })
+}
+
+fn record_mustache_refs(chunk: &str, refs: &mut BTreeMap<String, TemplateRefKind>) {
+    let tokens = identifier_tokens(chunk);
+    if tokens.first().map(String::as_str) == Some("each") {
+        if let Some(name) = tokens.get(1) {
+            refs.entry(name.clone()).or_default().collection = true;
+        }
+        return;
+    }
+    for mention in identifier_mentions(chunk) {
+        if !mention.dotted && !is_template_keyword(&mention.token) {
+            let token = mention.token;
+            refs.entry(token).or_default();
+        }
+    }
+}
+
+fn record_statement_refs(chunk: &str, refs: &mut BTreeMap<String, TemplateRefKind>) {
+    let tokens = identifier_tokens(chunk);
+    for window in tokens.windows(2) {
+        if window[0] == "in" {
+            refs.entry(window[1].clone()).or_default().collection = true;
+        }
+    }
+    if tokens.first().map(String::as_str) != Some("for") {
+        for token in tokens {
+            if !is_template_keyword(&token) {
+                refs.entry(token).or_default();
+            }
+        }
+    }
+}
+
+fn identifier_tokens(chunk: &str) -> Vec<String> {
+    identifier_mentions(chunk)
+        .into_iter()
+        .map(|mention| mention.token)
+        .collect()
+}
+
+#[derive(Debug)]
+struct IdentifierMention {
+    token: String,
+    dotted: bool,
+}
+
+fn identifier_mentions(chunk: &str) -> Vec<IdentifierMention> {
+    let chars = chunk.chars().collect::<Vec<_>>();
+    let mut mentions = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if !is_identifier_char(chars[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < chars.len() && is_identifier_char(chars[index]) {
+            index += 1;
+        }
+        let token = chars[start..index]
+            .iter()
+            .collect::<String>()
+            .trim_start_matches('#')
+            .to_string();
+        if !token.is_empty() {
+            let dotted = start.checked_sub(1).is_some_and(|i| chars[i] == '.')
+                || chars.get(index).is_some_and(|ch| *ch == '.');
+            mentions.push(IdentifierMention { token, dotted });
+        }
+    }
+    mentions
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '#'
+}
+
+fn is_template_keyword(token: &str) -> bool {
+    matches!(
+        token,
+        "and"
+            | "as"
+            | "else"
+            | "endfor"
+            | "endif"
+            | "false"
+            | "for"
+            | "if"
+            | "in"
+            | "none"
+            | "not"
+            | "or"
+            | "true"
+    )
 }
 
 fn is_supported_input_type(raw: &str) -> bool {
@@ -531,6 +728,28 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_api_key_allows_optional_bearer_prefix() {
+        assert_eq!(
+            normalize_openrouter_api_key("Bearer test-key").unwrap(),
+            "test-key"
+        );
+        assert_eq!(
+            normalize_openrouter_api_key(" bearer test-key \n").unwrap(),
+            "test-key"
+        );
+        assert_eq!(
+            normalize_openrouter_api_key("  test-key  ").unwrap(),
+            "test-key"
+        );
+    }
+
+    #[test]
+    fn openrouter_api_key_rejects_empty_values() {
+        assert!(normalize_openrouter_api_key("  ").is_err());
+        assert!(normalize_openrouter_api_key("Bearer ").is_err());
+    }
+
+    #[test]
     fn conversion_schema_is_strict_at_every_object_node() {
         let schema = conversion_schema();
 
@@ -682,6 +901,120 @@ mod tests {
         assert!(yaml.contains(
             "inputs:\n  audience: string\n  depth: enum[quick, thorough]\n  topic: string\n"
         ));
+    }
+
+    #[tokio::test]
+    async fn repair_loop_prunes_unreferenced_model_inferred_inputs_before_validation() {
+        let project = tempfile::tempdir().unwrap();
+        let converter = FakeConverter {
+            response: json!({
+                "name": "bismarck-unification",
+                "quality": "medium",
+                "inputs": [
+                    {"name": "historical_figure", "type": "string"},
+                    {"name": "strategy_topic", "type": "string"}
+                ],
+                "tools": [],
+                "sections": [
+                    {
+                        "id": "strategy",
+                        "priority": 100,
+                        "body": "Explain Otto von Bismarck's strategy for unifying Germany."
+                    }
+                ],
+                "output_contract": null
+            }),
+        };
+        let mut stdin = "".as_bytes();
+
+        let report = run_with(
+            &converter,
+            project.path(),
+            "I would really like to know more about Otto Von Bismarck's strategy for unifying Germany.",
+            &mut stdin,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(report.inputs.is_empty());
+        let yaml = std::fs::read_to_string(report.path).unwrap();
+        assert!(!yaml.contains("inputs:"));
+        assert!(yaml.contains("Otto von Bismarck"));
+    }
+
+    #[test]
+    fn repair_loop_reference_detection_is_template_scoped() {
+        let prose_refs = template_input_refs(&[PromptSection {
+            id: "body".to_string(),
+            priority: 100,
+            body: "Discuss the historical_figure in prose.".to_string(),
+            unmapped: false,
+        }]);
+        assert!(!prose_refs.contains_key("historical_figure"));
+
+        let scalar_refs = template_input_refs(&[PromptSection {
+            id: "body".to_string(),
+            priority: 100,
+            body: "Discuss {{ historical_figure }} in prose.".to_string(),
+            unmapped: false,
+        }]);
+        assert!(scalar_refs.contains_key("historical_figure"));
+
+        let loop_refs = template_input_refs(&[PromptSection {
+            id: "body".to_string(),
+            priority: 100,
+            body: "{% for item in documents %}{{ item.title }}{% endfor %}".to_string(),
+            unmapped: false,
+        }]);
+        assert!(loop_refs.get("documents").unwrap().collection);
+        assert!(!loop_refs.contains_key("item"));
+        assert!(!loop_refs.contains_key("title"));
+    }
+
+    #[tokio::test]
+    async fn repair_loop_infers_missing_template_inputs_before_validation() {
+        let project = tempfile::tempdir().unwrap();
+        let converter = FakeConverter {
+            response: json!({
+                "name": "research-missing-inputs",
+                "quality": "medium",
+                "inputs": [],
+                "tools": [],
+                "sections": [
+                    {
+                        "id": "topic",
+                        "priority": 100,
+                        "body": "Research {{ topic }}."
+                    },
+                    {
+                        "id": "documents",
+                        "priority": 90,
+                        "body": "{% for item in documents %}- {{ item.title }}\n{% endfor %}"
+                    }
+                ],
+                "output_contract": null
+            }),
+        };
+        let mut stdin = "".as_bytes();
+
+        let report = run_with(
+            &converter,
+            project.path(),
+            "Research a topic with documents.",
+            &mut stdin,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            report.inputs,
+            vec!["documents:list[string]", "topic:string"]
+        );
+        let yaml = std::fs::read_to_string(report.path).unwrap();
+        assert!(yaml.contains("documents: list[string]\n"));
+        assert!(yaml.contains("topic: string\n"));
     }
 
     #[tokio::test]

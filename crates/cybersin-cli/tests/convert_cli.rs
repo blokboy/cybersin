@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::json;
-use wiremock::matchers::{body_partial_json, method, path};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn cybersin() -> Command {
@@ -13,6 +13,7 @@ async fn convert_discovers_the_project_and_writes_a_valid_draft() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key"))
         .and(body_partial_json(json!({"model": "test-converter"})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "choices": [{
@@ -31,7 +32,7 @@ async fn convert_discovers_the_project_and_writes_a_valid_draft() {
 
     cybersin()
         .current_dir(&nested)
-        .env("OPENROUTER_API_KEY", "test-key")
+        .env("OPENROUTER_API_KEY", "Bearer test-key")
         .env("OPENROUTER_BASE_URL", server.uri())
         .arg("convert")
         .arg("--model")
