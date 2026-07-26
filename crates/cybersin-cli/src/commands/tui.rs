@@ -948,10 +948,53 @@ fn render(frame: &mut Frame, app: &App) {
     }
 }
 
+/// Block-letter "CYBERSIN" wordmark drawn above the landing hint panel.
+const CYBERSIN_TITLE: &str = concat!(
+    " ###  #   # ####  ##### ####   #### ##### #   #\n",
+    "#      # #  #   # #     #   # #       #   ##  #\n",
+    "#       #   ####  ####  ####   ###    #   # # #\n",
+    "#       #   #   # #     #  #      #   #   #  ##\n",
+    " ###    #   ####  ##### #   # ####  ##### #   #",
+);
+
 fn render_home(frame: &mut Frame, _app: &App, area: Rect) {
     render_control_room_backdrop(frame, area);
 
-    let panel = centered_rect(area, 46, 3);
+    let title_lines: Vec<&str> = CYBERSIN_TITLE.lines().collect();
+    let title_height = title_lines.len() as u16;
+    let title_width = title_lines.iter().map(|line| line.len()).max().unwrap_or(0) as u16;
+
+    let gap = 1;
+    let panel_width = 46;
+    let panel_height = 3;
+    let block_width = title_width.max(panel_width);
+    let block_height = title_height + gap + panel_height;
+
+    let block = centered_rect(area, block_width, block_height);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(title_height),
+            Constraint::Length(gap),
+            Constraint::Length(panel_height),
+        ])
+        .split(block);
+
+    let title_rect = centered_rect(rows[0], title_width, title_height);
+    frame.render_widget(Clear, pad_rect(title_rect, 1, area));
+    frame.render_widget(
+        Paragraph::new(CYBERSIN_TITLE)
+            .alignment(Alignment::Center)
+            .style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .bg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        title_rect,
+    );
+
+    let panel = centered_rect(rows[2], panel_width, panel_height);
     frame.render_widget(Clear, pad_rect(panel, 1, area));
     frame.render_widget(
         Paragraph::new("Press Enter to start converting a prompt")
