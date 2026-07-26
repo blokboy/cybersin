@@ -517,28 +517,36 @@ struct CompiledToolPolicy {
     wall_s: u64,
 }
 
-/// Every `agents/*.agent.yaml` in `project`, sorted for deterministic
-/// builds (spec §7). Flat, unlike `discover_prompt_sources`: the
-/// scaffolded convention (spec §11) keeps agent definitions directly
-/// under `agents/`, with no nested-fragment equivalent to walk.
-fn discover_agent_sources(project: &Path) -> Result<Vec<PathBuf>, String> {
+/// Every `*.agent.yaml` under `project/agents`, sorted for deterministic
+/// builds (spec §7). Ops uses the same helper so the build hash and the
+/// Builds tab agree even when a project organizes agents into subfolders.
+pub(crate) fn discover_agent_sources(project: &Path) -> Result<Vec<PathBuf>, String> {
     let agents_dir = project.join("agents");
     if !agents_dir.is_dir() {
         return Ok(Vec::new());
     }
     let mut found = Vec::new();
-    for entry in fs::read_dir(&agents_dir)
-        .map_err(|e| format!("error: failed to read {}: {e}", agents_dir.display()))?
-    {
-        let entry =
-            entry.map_err(|e| format!("error: failed to read {}: {e}", agents_dir.display()))?;
+    discover_agent_sources_in(&agents_dir, &mut found)?;
+    found.sort();
+    Ok(found)
+}
+
+fn discover_agent_sources_in(dir: &Path, found: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries =
+        fs::read_dir(dir).map_err(|e| format!("error: failed to read {}: {e}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("error: failed to read {}: {e}", dir.display()))?;
         let path = entry.path();
-        if path.is_file() && path.to_string_lossy().ends_with(".agent.yaml") {
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("error: failed to inspect {}: {e}", path.display()))?;
+        if file_type.is_dir() {
+            discover_agent_sources_in(&path, found)?;
+        } else if file_type.is_file() && path.to_string_lossy().ends_with(".agent.yaml") {
             found.push(path);
         }
     }
-    found.sort();
-    Ok(found)
+    Ok(())
 }
 
 fn discover_tool_asset_sources(project: &Path) -> Result<Vec<PathBuf>, String> {

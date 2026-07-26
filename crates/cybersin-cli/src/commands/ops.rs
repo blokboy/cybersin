@@ -56,6 +56,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tab
 use ratatui::Terminal;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+use crate::commands::build::discover_agent_sources;
 use crate::commands::run::{self, RunArgs};
 use crate::commands::sandbox::Backend;
 use crate::harness_config::AgentMeta;
@@ -170,7 +171,7 @@ impl OpsModel {
     fn builds_text(&self) -> String {
         let mut out = format!("Builds ({})\n", self.builds.len());
         if self.builds.is_empty() {
-            out.push_str("  no agents found in agents/*.agent.yaml\n");
+            out.push_str("  no agents found in agents/**/*.agent.yaml\n");
         }
         for build in &self.builds {
             out.push_str(&format!(
@@ -278,19 +279,8 @@ struct OpsBuild {
 
 fn discover_ops_builds(project_root: &Path) -> Result<Vec<OpsBuild>> {
     let build_hash_short = read_dist_build_hash(project_root).ok().map(short_hash);
-    let agents_dir = project_root.join("agents");
-    if !agents_dir.is_dir() {
-        return Ok(Vec::new());
-    }
     let mut builds = Vec::new();
-    for entry in std::fs::read_dir(&agents_dir)
-        .with_context(|| format!("reading {}", agents_dir.display()))?
-    {
-        let entry = entry.with_context(|| format!("reading {}", agents_dir.display()))?;
-        let path = entry.path();
-        if !path.is_file() || !path.to_string_lossy().ends_with(".agent.yaml") {
-            continue;
-        }
+    for path in discover_agent_sources(project_root).map_err(anyhow::Error::msg)? {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         let meta = AgentMeta::from_agent_yaml(&text)
@@ -684,7 +674,7 @@ fn tui_loop(
                     state.select(Some(build_cursor));
                 }
                 let items: Vec<ListItem> = if builds.is_empty() {
-                    vec![ListItem::new("no agents found in agents/*.agent.yaml")]
+                    vec![ListItem::new("no agents found in agents/**/*.agent.yaml")]
                 } else {
                     builds
                         .iter()

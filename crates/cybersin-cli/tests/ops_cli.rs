@@ -122,6 +122,38 @@ fn ops_plain_lists_runnable_builds_by_agent_name() {
         .stdout(predicate::str::contains(build_hash_short));
 }
 
+#[test]
+fn ops_plain_lists_runnable_builds_from_nested_agent_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("myagent");
+    cybersin().arg("init").arg(&project).assert().success();
+
+    let nested_agents = project.join("agents/fleet");
+    std::fs::create_dir_all(&nested_agents).unwrap();
+    let nested_agent = nested_agents.join("bismarck.agent.yaml");
+    std::fs::rename(project.join("agents/hello.agent.yaml"), &nested_agent).unwrap();
+    let yaml = std::fs::read_to_string(&nested_agent).unwrap();
+    std::fs::write(&nested_agent, yaml.replace("hello-agent", "bismarck-agent")).unwrap();
+
+    cybersin()
+        .arg("build")
+        .arg(&project)
+        .arg("--profile")
+        .arg("dev")
+        .arg("--frozen")
+        .assert()
+        .success();
+
+    cybersin()
+        .arg("ops")
+        .arg(&project)
+        .arg("--plain")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Builds (1)"))
+        .stdout(predicate::str::contains("bismarck-agent"));
+}
+
 #[tokio::test]
 async fn ops_plain_shows_sessions_traces_and_cost_together() {
     let tmp = tempfile::tempdir().unwrap();
