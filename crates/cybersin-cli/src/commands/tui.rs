@@ -21,7 +21,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use crate::commands::convert::{
-    self, ConvertReport, OpenAiPromptConversionModel, PromptConversionModel,
+    self, ConvertReport, OpenRouterPromptConversionModel, PromptConversionModel,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,7 +276,7 @@ async fn run_conversion(app: &App) -> Result<ConvertReport, String> {
     let cwd =
         std::env::current_dir().map_err(|e| format!("error: reading current directory: {e}"))?;
     let project_root = conversion_root(&cwd);
-    let converter = OpenAiPromptConversionModel::from_env(app.model.trim().to_string())?;
+    let converter = OpenRouterPromptConversionModel::from_env(app.model.trim().to_string())?;
     run_conversion_with_model(&converter, &project_root, app).await
 }
 

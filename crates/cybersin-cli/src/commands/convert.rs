@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
-pub const DEFAULT_MODEL: &str = "gpt-4.1-mini";
+pub const DEFAULT_MODEL: &str = "openai/gpt-4.1-mini";
+const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 #[async_trait]
 pub trait PromptConversionModel: Send + Sync {
@@ -89,19 +90,20 @@ struct PromptYaml {
     output_contract: Option<PromptOutputContract>,
 }
 
-pub struct OpenAiPromptConversionModel {
+pub struct OpenRouterPromptConversionModel {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
     model: String,
 }
 
-impl OpenAiPromptConversionModel {
+impl OpenRouterPromptConversionModel {
     pub fn from_env(model: String) -> Result<Self, String> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| "error: OPENAI_API_KEY is required for `cybersin convert`".to_string())?;
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+        let api_key = std::env::var("OPENROUTER_API_KEY").map_err(|_| {
+            "error: OPENROUTER_API_KEY is required for `cybersin convert`".to_string()
+        })?;
+        let base_url =
+            std::env::var("OPENROUTER_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         Ok(Self {
             client: reqwest::Client::new(),
             api_key,
@@ -112,7 +114,7 @@ impl OpenAiPromptConversionModel {
 }
 
 #[async_trait]
-impl PromptConversionModel for OpenAiPromptConversionModel {
+impl PromptConversionModel for OpenRouterPromptConversionModel {
     async fn convert(&self, raw_prompt: &str, schema: &Value) -> Result<Value, String> {
         let body = json!({
             "model": self.model,
@@ -148,7 +150,7 @@ impl PromptConversionModel for OpenAiPromptConversionModel {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("error: conversion model request failed: {e}"))?;
+            .map_err(|e| format!("error: OpenRouter conversion request failed: {e}"))?;
         let status = response.status();
         let payload: Value = response
             .json()
@@ -156,13 +158,15 @@ impl PromptConversionModel for OpenAiPromptConversionModel {
             .map_err(|e| format!("error: conversion model response was not JSON: {e}"))?;
         if !status.is_success() {
             return Err(format!(
-                "error: conversion model returned HTTP {status}: {payload}"
+                "error: OpenRouter conversion returned HTTP {status}: {payload}"
             ));
         }
         let content = payload
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
-            .ok_or_else(|| "error: conversion model response had no message content".to_string())?;
+            .ok_or_else(|| {
+                "error: OpenRouter conversion response had no message content".to_string()
+            })?;
         serde_json::from_str(content)
             .map_err(|e| format!("error: conversion model returned invalid JSON content: {e}"))
     }
@@ -299,7 +303,7 @@ pub async fn execute(input: String, out: Option<PathBuf>, model: String) -> anyh
             cwd.display()
         )
     })?;
-    let converter = OpenAiPromptConversionModel::from_env(model).map_err(anyhow::Error::msg)?;
+    let converter = OpenRouterPromptConversionModel::from_env(model).map_err(anyhow::Error::msg)?;
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
     let report = run_with(
