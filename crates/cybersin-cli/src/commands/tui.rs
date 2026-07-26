@@ -881,7 +881,7 @@ fn render_build(frame: &mut Frame, app: &App, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(build_info_text(&app.project_start))
-            .block(Block::default().borders(Borders::ALL).title(" dist/ "))
+            .block(Block::default().borders(Borders::ALL).title(" prompts/ "))
             .wrap(Wrap { trim: false }),
         chunks[0],
     );
@@ -976,33 +976,34 @@ fn build_status_widget(status: &BuildStatus) -> Paragraph<'static> {
     }
 }
 
-/// `Build` tab's info panel: which project this shell is standing
-/// inside of, plus what `dist/manifest.json` (if any) says about it.
+/// `Build` tab's info panel: source prompts the user can attempt to
+/// compile. `dist/` is build output, so runtime-facing artifact state
+/// belongs on the Ops side instead of here.
 fn build_info_text(project_start: &Path) -> String {
     match resolve_project_root(project_start) {
-        Ok(root) => match dist_snapshot(&root) {
-            Ok(snapshot) => format!(
-                "project: {}\n\n{}\n\n{}",
-                root.display(),
-                prompt_sources_snapshot(&root),
-                snapshot
-            ),
-            Err(error) => format!(
-                "project: {}\n\n{}\n\n{}",
-                root.display(),
-                prompt_sources_snapshot(&root),
-                error
-            ),
-        },
+        Ok(root) => format!(
+            "project: {}\n\n{}",
+            root.display(),
+            prompt_sources_snapshot(&root)
+        ),
         Err(error) => error,
     }
 }
 
 fn prompt_sources_snapshot(project_root: &Path) -> String {
     match cybersin_frontend::discover_prompt_sources(project_root) {
-        Ok(sources) if sources.is_empty() => "prompts: none found".to_string(),
+        Ok(sources) if sources.is_empty() => {
+            format!(
+                "prompts/ at {}\n  none found",
+                project_root.join("prompts").display()
+            )
+        }
         Ok(sources) => {
-            let mut lines = vec![format!("prompts: {}", sources.len())];
+            let mut lines = vec![format!(
+                "prompts/ at {}\n  files: {}",
+                project_root.join("prompts").display(),
+                sources.len()
+            )];
             lines.extend(sources.into_iter().map(|source| {
                 let relative = source.strip_prefix(project_root).unwrap_or(&source);
                 format!("  {}", relative.display())
@@ -1017,10 +1018,22 @@ fn prompt_sources_snapshot(project_root: &Path) -> String {
 /// touches the daemon.
 fn ops_info_text(project_start: &Path) -> String {
     match resolve_project_root(project_start) {
-        Ok(root) => match ops_snapshot(&root) {
-            Ok(snapshot) => format!("project: {}\n\n{}", root.display(), snapshot),
-            Err(error) => format!("project: {}\n\n{}", root.display(), error),
-        },
+        Ok(root) => {
+            let runtime_state = match ops_snapshot(&root) {
+                Ok(snapshot) => snapshot,
+                Err(error) => error,
+            };
+            let dist_state = match dist_snapshot(&root) {
+                Ok(snapshot) => snapshot,
+                Err(error) => error,
+            };
+            format!(
+                "project: {}\n\nruntime output:\n{}\n\n{}",
+                root.display(),
+                dist_state,
+                runtime_state
+            )
+        }
         Err(error) => error,
     }
 }
@@ -1385,8 +1398,10 @@ mod tests {
         assert!(error.contains("no dist/ found"));
 
         let info = build_info_text(project.path());
-        assert!(info.contains("prompts: 1"));
+        assert!(info.contains("prompts/ at"));
+        assert!(info.contains("files: 1"));
         assert!(info.contains("prompts/hello.prompt.yaml"));
+        assert!(!info.contains("no dist/ found"));
     }
 
     #[test]
@@ -1402,10 +1417,12 @@ mod tests {
 
         let anchored_text = build_info_text(&nested);
         assert!(anchored_text.contains(&format!("project: {}", project.path().display())));
-        assert!(anchored_text.contains("no dist/ found"));
+        assert!(anchored_text.contains("prompts/ at"));
 
         let ops_text = ops_info_text(&nested);
         assert!(ops_text.contains(&format!("project: {}", project.path().display())));
+        assert!(ops_text.contains("runtime output:"));
+        assert!(ops_text.contains("no dist/ found"));
         assert!(ops_text.contains("state db:"));
     }
 
