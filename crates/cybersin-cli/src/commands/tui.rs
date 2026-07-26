@@ -540,6 +540,11 @@ fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_home(frame: &mut Frame, app: &App, area: Rect) {
+    render_control_room_backdrop(frame, area);
+
+    let panel = centered_rect(area, 64, HOME_ITEMS.len() as u16 + 2);
+    frame.render_widget(Clear, pad_rect(panel, 1, area));
+
     let items: Vec<ListItem> = HOME_ITEMS
         .iter()
         .map(|item| {
@@ -552,6 +557,7 @@ fn render_home(frame: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default();
     state.select(Some(app.home_cursor));
     let list = List::new(items)
+        .style(Style::default().bg(Color::Black))
         .block(focused_block(" Workflows ", true))
         .highlight_style(
             Style::default()
@@ -559,7 +565,119 @@ fn render_home(frame: &mut Frame, app: &App, area: Rect) {
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         );
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, panel, &mut state);
+}
+
+/// A procedurally generated wall of glowing "monitors" behind the
+/// `Workflows` panel — an original, terminal-native stand-in for
+/// `assets/pixel-art-hacker-computer-control-room-*.jpg` (a watermarked
+/// stock preview, not a licensed asset, so not something to embed
+/// directly). Generated from `(x, y)` rather than a fixed string so it
+/// fills whatever size terminal it's drawn into instead of clipping or
+/// leaving a ragged edge.
+fn render_control_room_backdrop(frame: &mut Frame, area: Rect) {
+    let lines: Vec<Line<'static>> = (0..area.height)
+        .map(|y| {
+            let spans: Vec<Span<'static>> = (0..area.width)
+                .map(|x| {
+                    let (ch, color) = backdrop_cell(x, y);
+                    Span::styled(ch.to_string(), Style::default().fg(color))
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// One character of the control-room backdrop at column `x`, row `y`:
+/// tiles `MONITOR_WIDTH`x`MONITOR_HEIGHT` boxes across the whole area,
+/// separated by blank wall gaps, cycling a neon blue/cyan/pink palette
+/// per monitor so it reads as a wall of independently lit screens
+/// rather than one flat color.
+fn backdrop_cell(x: u16, y: u16) -> (char, Color) {
+    const MONITOR_WIDTH: u16 = 7;
+    const MONITOR_HEIGHT: u16 = 3;
+    const GAP: u16 = 2;
+    const COL_PERIOD: u16 = MONITOR_WIDTH + GAP;
+    const ROW_PERIOD: u16 = MONITOR_HEIGHT + GAP;
+
+    let cx = x % COL_PERIOD;
+    let cy = y % ROW_PERIOD;
+    if cx >= MONITOR_WIDTH || cy >= MONITOR_HEIGHT {
+        return (' ', Color::DarkGray);
+    }
+
+    let monitor_index = (x / COL_PERIOD) + (y / ROW_PERIOD);
+    let color = match monitor_index % 6 {
+        0 => Color::Blue,
+        1 => Color::Cyan,
+        2 => Color::LightBlue,
+        3 => Color::Magenta,
+        4 => Color::Blue,
+        _ => Color::LightCyan,
+    };
+
+    let top = cy == 0;
+    let bottom = cy == MONITOR_HEIGHT - 1;
+    let left = cx == 0;
+    let right = cx == MONITOR_WIDTH - 1;
+    let ch = match (top, bottom, left, right) {
+        (true, _, true, _) => '┌',
+        (true, _, _, true) => '┐',
+        (_, true, true, _) => '└',
+        (_, true, _, true) => '┘',
+        (true, _, _, _) | (_, true, _, _) => '─',
+        (_, _, true, _) | (_, _, _, true) => '│',
+        _ => {
+            const GLYPHS: [char; 4] = ['▓', '▒', '░', '▚'];
+            GLYPHS[monitor_index as usize % GLYPHS.len()]
+        }
+    };
+    (ch, color)
+}
+
+/// A `width`x`height` rect centered inside `area`, clamped to fit —
+/// the standard Ratatui "floating panel over a full-screen backdrop"
+/// layout, also used to keep the `Workflows` panel a fixed, readable
+/// size regardless of how large the backdrop around it is.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let height = height.min(area.height);
+    let width = width.min(area.width);
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
+}
+
+/// `rect` expanded by `padding` cells on every side, clamped to `bounds`
+/// — a blank "halo" cleared around the `Workflows` panel so it reads as
+/// a floating console separated from the backdrop's monitor grid,
+/// rather than the two visually colliding edge-to-edge.
+fn pad_rect(rect: Rect, padding: u16, bounds: Rect) -> Rect {
+    let x = rect.x.saturating_sub(padding).max(bounds.x);
+    let y = rect.y.saturating_sub(padding).max(bounds.y);
+    let right = (rect.x + rect.width + padding).min(bounds.x + bounds.width);
+    let bottom = (rect.y + rect.height + padding).min(bounds.y + bounds.height);
+    Rect {
+        x,
+        y,
+        width: right.saturating_sub(x),
+        height: bottom.saturating_sub(y),
+    }
 }
 
 fn render_workspace(frame: &mut Frame, app: &App, area: Rect) {
@@ -1109,6 +1227,30 @@ mod tests {
         let rendered = format!("{buffer:?}");
         assert!(rendered.contains("Raw Prompt"));
         assert!(rendered.contains("network failed"));
+    }
+
+    #[test]
+    fn home_backdrop_surrounds_the_workflows_panel_without_hiding_it() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::default();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Workflows"));
+        assert!(rendered.contains("Convert prompt"));
+        assert!(rendered.contains('┌'));
+    }
+
+    #[test]
+    fn home_backdrop_does_not_panic_on_a_tiny_terminal() {
+        let backend = TestBackend::new(6, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = App::default();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
     }
 
     #[test]
