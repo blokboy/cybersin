@@ -488,3 +488,141 @@ fn from_async(result: anyhow::Result<()>) -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn capability_catalog_covers_every_cli_operation() {
+        let actual_cli_leaves = cli_leaf_commands();
+        let expected_cli_leaves = capability_cli_coverage()
+            .iter()
+            .map(|(command, _)| command.to_string())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            actual_cli_leaves, expected_cli_leaves,
+            "update capability_cli_coverage whenever the Clap command tree changes"
+        );
+
+        let registry = capabilities::registry();
+        for (command, capability_ids) in capability_cli_coverage() {
+            assert!(
+                !capability_ids.is_empty(),
+                "{command} should map to at least one capability"
+            );
+            for capability_id in *capability_ids {
+                let spec = registry
+                    .get(capability_id)
+                    .unwrap_or_else(|| panic!("{command} maps to missing {capability_id}"));
+                assert_eq!(
+                    spec.adapters.cli,
+                    capabilities::AdapterSupport::Available,
+                    "{capability_id} should declare CLI adapter coverage for {command}"
+                );
+            }
+        }
+
+        for capability_id in registry.cli_operations() {
+            assert!(
+                capability_cli_coverage()
+                    .iter()
+                    .any(|(_, ids)| ids.contains(&capability_id)),
+                "{capability_id} declares CLI support but is absent from capability_cli_coverage"
+            );
+        }
+
+        for capability_id in [
+            "compile.build.watch",
+            "compile.fmt.check",
+            "runtime.run.stub",
+            "runtime.run.agent",
+        ] {
+            assert!(
+                registry.get(capability_id).is_some(),
+                "flag-specific capability {capability_id} should remain explicit"
+            );
+        }
+
+        let scaffold = registry
+            .get("workflow.scaffold-build")
+            .expect("TUI-only scaffold/build workflow should be cataloged");
+        assert!(matches!(
+            scaffold.adapters.cli,
+            capabilities::AdapterSupport::Unavailable { .. }
+        ));
+    }
+
+    fn cli_leaf_commands() -> BTreeSet<String> {
+        let root = Cli::command();
+        let mut leaves = BTreeSet::new();
+        collect_leaf_commands(&root, Vec::new(), &mut leaves);
+        leaves
+    }
+
+    fn collect_leaf_commands(
+        command: &clap::Command,
+        path: Vec<String>,
+        leaves: &mut BTreeSet<String>,
+    ) {
+        let subcommands = command
+            .get_subcommands()
+            .filter(|subcommand| !subcommand.is_hide_set())
+            .collect::<Vec<_>>();
+        if subcommands.is_empty() {
+            if !path.is_empty() {
+                leaves.insert(path.join(" "));
+            }
+            return;
+        }
+
+        for subcommand in subcommands {
+            let mut subcommand_path = path.clone();
+            subcommand_path.push(subcommand.get_name().to_string());
+            collect_leaf_commands(subcommand, subcommand_path, leaves);
+        }
+    }
+
+    fn capability_cli_coverage() -> &'static [(&'static str, &'static [&'static str])] {
+        &[
+            ("approve", &["control.approve"]),
+            ("build", &["compile.build", "compile.build.watch"]),
+            ("check", &["compile.check"]),
+            ("convert", &["compile.convert"]),
+            ("cost", &["inspection.cost"]),
+            ("daemon", &["control.daemon.server"]),
+            ("deny", &["control.deny"]),
+            ("diff", &["compile.diff"]),
+            ("dlq drop", &["control.dlq.drop"]),
+            ("dlq ls", &["control.dlq.ls"]),
+            ("dlq retry", &["control.dlq.retry"]),
+            ("dlq show", &["control.dlq.show"]),
+            ("eval gate", &["workflow.eval.gate"]),
+            ("eval run", &["workflow.eval.run"]),
+            ("explain", &["inspection.explain"]),
+            ("fmt", &["compile.fmt", "compile.fmt.check"]),
+            ("init", &["workflow.init"]),
+            ("notify", &["control.notify"]),
+            ("ops", &["control.ops"]),
+            ("optimize", &["workflow.optimize"]),
+            ("run", &["runtime.run.stub", "runtime.run.agent"]),
+            ("sandbox diff", &["sandbox.diff"]),
+            ("sandbox exec", &["sandbox.exec"]),
+            ("sandbox restore", &["sandbox.restore"]),
+            ("sandbox snapshot", &["sandbox.snapshot"]),
+            ("sessions kill", &["control.sessions.kill"]),
+            ("sessions ls", &["control.sessions.ls"]),
+            ("sessions migrate", &["control.sessions.migrate"]),
+            ("sessions resume", &["control.sessions.resume"]),
+            ("sessions show", &["control.sessions.show"]),
+            ("trace ls", &["inspection.trace.ls"]),
+            ("trace sample", &["inspection.trace.sample"]),
+            ("trace show", &["inspection.trace.show"]),
+        ]
+    }
+}
