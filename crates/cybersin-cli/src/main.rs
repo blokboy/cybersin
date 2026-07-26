@@ -17,6 +17,7 @@
 //! (rather than propagating `?` straight out of `main`) so both
 //! conventions map to the same clean 0/1 exit-code contract.
 
+pub mod capabilities;
 mod commands;
 mod git;
 mod harness_config;

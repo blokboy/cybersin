@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "build_hash": "70b46d3a8d0292d8227def5f24b31c9b8793baa0423438b5a929a2c8405d244a",
+  "build_hash": "893bfdc4886941392b82080df379ade4bfff78e38ecd33adcf900f54bbc7da14",
   "git_sha": "0a6a5eaa432ca84015495566af73ca6f1b9131b2",
-  "lockfile_hash": "bf09c369ec9ac8f2a4288bcd3dd44651b8d4cf54543cbb6b978ccf3ba1b792a1",
+  "lockfile_hash": "49cf5ec42f9926d537017e0a6b2bb71214312e67ce87f0dcdb2ab1bde4620653",
   "artifacts": {
     "budget/researcher.json": "ca51f5380253d57664b212d5d7cb271386de788723def6b08d71531fa350a272",
     "budget/synthesizer.json": "e9c149b3116147d2013b5713ecfda42a291dc99ec6e09d625008a578714eb87c",
