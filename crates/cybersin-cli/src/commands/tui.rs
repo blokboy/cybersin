@@ -275,14 +275,13 @@ async fn run_terminal(app: &mut App) -> Result<()> {
 async fn run_conversion(app: &App) -> Result<ConvertReport, String> {
     let cwd =
         std::env::current_dir().map_err(|e| format!("error: reading current directory: {e}"))?;
-    let project_root = crate::project::discover_project_root(&cwd).ok_or_else(|| {
-        format!(
-            "error: no cybersin.yaml found in {} or any parent directory",
-            cwd.display()
-        )
-    })?;
+    let project_root = conversion_root(&cwd);
     let converter = OpenAiPromptConversionModel::from_env(app.model.trim().to_string())?;
     run_conversion_with_model(&converter, &project_root, app).await
+}
+
+fn conversion_root(cwd: &Path) -> PathBuf {
+    crate::project::discover_project_root(cwd).unwrap_or_else(|| cwd.to_path_buf())
 }
 
 async fn run_conversion_with_model(
@@ -596,6 +595,23 @@ mod tests {
             app.status,
             ConversionStatus::Failure("Enter a prompt before converting.".to_string())
         );
+    }
+
+    #[test]
+    fn conversion_root_falls_back_to_cwd_without_project_file() {
+        let cwd = tempfile::tempdir().unwrap();
+
+        assert_eq!(conversion_root(cwd.path()), cwd.path());
+    }
+
+    #[test]
+    fn conversion_root_prefers_discovered_project_root() {
+        let project = tempfile::tempdir().unwrap();
+        let nested = project.path().join("notes/drafts");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(project.path().join("cybersin.yaml"), "name: test\n").unwrap();
+
+        assert_eq!(conversion_root(&nested), project.path());
     }
 
     #[tokio::test]
