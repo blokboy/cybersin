@@ -135,6 +135,54 @@ pub fn run_into_with_progress(
     observed: Option<&ObservedRoutingStats>,
     mut on_progress: impl FnMut(BuildProgress),
 ) -> Result<Option<String>, String> {
+    let sources = discover_prompt_sources(project)
+        .map_err(|e| format!("error: failed to discover prompts: {e}"))?;
+    run_sources_into_with_progress(
+        project,
+        dist_dir,
+        profile,
+        frozen,
+        observed,
+        sources,
+        &mut on_progress,
+    )
+}
+
+pub fn run_source_into_with_progress(
+    project: &Path,
+    dist_dir: &Path,
+    source: &Path,
+    profile: BuildProfile,
+    frozen: bool,
+    observed: Option<&ObservedRoutingStats>,
+    mut on_progress: impl FnMut(BuildProgress),
+) -> Result<Option<String>, String> {
+    if !source.is_file() || !source.to_string_lossy().ends_with(".prompt.yaml") {
+        return Err(format!(
+            "error: {} is not a *.prompt.yaml source",
+            source.display()
+        ));
+    }
+    run_sources_into_with_progress(
+        project,
+        dist_dir,
+        profile,
+        frozen,
+        observed,
+        vec![source.to_path_buf()],
+        &mut on_progress,
+    )
+}
+
+fn run_sources_into_with_progress(
+    project: &Path,
+    dist_dir: &Path,
+    profile: BuildProfile,
+    frozen: bool,
+    observed: Option<&ObservedRoutingStats>,
+    sources: Vec<PathBuf>,
+    mut on_progress: impl FnMut(BuildProgress),
+) -> Result<Option<String>, String> {
     let project_yaml_path = project.join("cybersin.yaml");
     let project_yaml = fs::read_to_string(&project_yaml_path)
         .map_err(|e| format!("error: failed to read {}: {e}", project_yaml_path.display()))?;
@@ -186,8 +234,6 @@ pub fn run_into_with_progress(
         )
     };
 
-    let sources = discover_prompt_sources(project)
-        .map_err(|e| format!("error: failed to discover prompts: {e}"))?;
     if sources.is_empty() {
         return Err("error: no *.prompt.yaml sources found".into());
     }

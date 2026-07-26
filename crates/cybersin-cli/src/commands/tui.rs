@@ -15,6 +15,7 @@
 //! landing on this screen never starts a daemon for a project that
 //! hasn't been run yet.
 
+use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -31,7 +32,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
 use serde_json::Value;
 
@@ -140,6 +141,7 @@ struct App {
     out: String,
     convert_status: ConversionStatus,
     build_status: BuildStatus,
+    selected_build_source: usize,
     show_help: bool,
     should_quit: bool,
 }
@@ -164,6 +166,7 @@ impl App {
             out: String::new(),
             convert_status: ConversionStatus::Idle,
             build_status: BuildStatus::Idle,
+            selected_build_source: 0,
             show_help: false,
             should_quit: false,
         }
@@ -269,6 +272,14 @@ impl App {
                 self.focus_previous();
                 AppAction::None
             }
+            KeyCode::Up if self.screen == Screen::Workspace => {
+                self.move_selection_up();
+                AppAction::None
+            }
+            KeyCode::Down if self.screen == Screen::Workspace => {
+                self.move_selection_down();
+                AppAction::None
+            }
             KeyCode::Char('q') if self.focus != Focus::Prompt => {
                 self.should_quit = true;
                 AppAction::None
@@ -277,6 +288,7 @@ impl App {
                 self.enter_convert();
                 AppAction::None
             }
+            KeyCode::Enter if self.workspace_tab == WorkspaceTab::Build => self.request_action(),
             KeyCode::Enter if self.focus == Focus::ConvertAction => self.request_action(),
             KeyCode::Enter if self.focus == Focus::Prompt => {
                 self.raw_prompt.push('\n');
@@ -393,6 +405,23 @@ impl App {
         self.convert_status = ConversionStatus::Idle;
     }
 
+    fn move_selection_up(&mut self) {
+        if self.workspace_tab != WorkspaceTab::Build {
+            return;
+        }
+        self.selected_build_source = self.selected_build_source.saturating_sub(1);
+    }
+
+    fn move_selection_down(&mut self) {
+        if self.workspace_tab != WorkspaceTab::Build {
+            return;
+        }
+        let max_index = build_sources(&self.project_start)
+            .map(|sources| sources.len().saturating_sub(1))
+            .unwrap_or(0);
+        self.selected_build_source = (self.selected_build_source + 1).min(max_index);
+    }
+
     fn conversion_out(&self) -> Option<PathBuf> {
         let trimmed = self.out.trim();
         (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
@@ -483,13 +512,27 @@ enum BuildThreadMessage {
 /// explicitly, and a landing-screen action silently making network
 /// calls would be a bad surprise.
 fn run_build_interactive(terminal: &mut TerminalSession, app: &mut App) -> Result<()> {
-    app.build_status = BuildStatus::Running(vec!["starting dev build".to_string()]);
+    let selected_source = match selected_build_source(&app.project_start, app.selected_build_source)
+    {
+        Ok(source) => source,
+        Err(error) => {
+            app.build_status = BuildStatus::Failure(error);
+            terminal.draw(|frame| render(frame, app))?;
+            return Ok(());
+        }
+    };
+    let mut build_log = vec![format!(
+        "starting dev build for {}",
+        display_project_path(&app.project_start, &selected_source)
+    )];
+    app.build_status = BuildStatus::Running(build_log.clone());
     terminal.draw(|frame| render(frame, app))?;
 
     let project_start = app.project_start.clone();
+    let log_project_start = app.project_start.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let result = run_build_from(project_start, |progress| {
+        let result = run_selected_build_from(project_start, selected_source, |progress| {
             let _ = tx.send(BuildThreadMessage::Progress(progress));
         });
         let _ = tx.send(BuildThreadMessage::Done(result));
@@ -498,10 +541,24 @@ fn run_build_interactive(terminal: &mut TerminalSession, app: &mut App) -> Resul
     loop {
         while let Ok(message) = rx.try_recv() {
             match message {
-                BuildThreadMessage::Progress(progress) => push_build_progress(app, progress),
+                BuildThreadMessage::Progress(progress) => {
+                    let line = format_build_progress(&app.project_start, progress);
+                    build_log.push(line.clone());
+                    push_build_progress_line(app, line);
+                }
                 BuildThreadMessage::Done(result) => {
+                    let final_line = match &result {
+                        Ok(message) => format!("success: {message}"),
+                        Err(error) => format!("failure: {error}"),
+                    };
+                    build_log.push(final_line.clone());
+                    if let Err(error) = write_build_log(&log_project_start, &build_log) {
+                        build_log.push(format!("warning: failed to write build log: {error}"));
+                    }
                     app.build_status = match result {
-                        Ok(message) => BuildStatus::Success(message),
+                        Ok(message) => {
+                            BuildStatus::Success(format!("{message}\nlogged to dist/build.log"))
+                        }
                         Err(error) => BuildStatus::Failure(error),
                     };
                     terminal.draw(|frame| render(frame, app))?;
@@ -519,6 +576,7 @@ fn run_build_interactive(terminal: &mut TerminalSession, app: &mut App) -> Resul
     }
 }
 
+#[cfg(test)]
 fn run_build_from(
     project_start: PathBuf,
     on_progress: impl FnMut(BuildProgress),
@@ -535,8 +593,25 @@ fn run_build_from(
     .map(|message| message.unwrap_or_else(|| "build complete".to_string()))
 }
 
-fn push_build_progress(app: &mut App, progress: BuildProgress) {
-    let line = format_build_progress(&app.project_start, progress);
+fn run_selected_build_from(
+    project_start: PathBuf,
+    source: PathBuf,
+    on_progress: impl FnMut(BuildProgress),
+) -> Result<String, String> {
+    let project_root = resolve_project_root(&project_start)?;
+    build::run_source_into_with_progress(
+        &project_root,
+        &project_root.join("dist"),
+        &source,
+        BuildProfile::Dev,
+        false,
+        None,
+        on_progress,
+    )
+    .map(|message| message.unwrap_or_else(|| "build complete".to_string()))
+}
+
+fn push_build_progress_line(app: &mut App, line: String) {
     let BuildStatus::Running(lines) = &mut app.build_status else {
         return;
     };
@@ -546,6 +621,35 @@ fn push_build_progress(app: &mut App, progress: BuildProgress) {
         let overflow = lines.len() - MAX_PROGRESS_LINES;
         lines.drain(0..overflow);
     }
+}
+
+fn selected_build_source(project_start: &Path, selected_index: usize) -> Result<PathBuf, String> {
+    let sources = build_sources(project_start)?;
+    sources
+        .get(selected_index.min(sources.len().saturating_sub(1)))
+        .cloned()
+        .ok_or_else(|| "error: no *.prompt.yaml sources found".to_string())
+}
+
+fn build_sources(project_start: &Path) -> Result<Vec<PathBuf>, String> {
+    let root = resolve_project_root(project_start)?;
+    cybersin_frontend::discover_prompt_sources(&root)
+        .map_err(|error| format!("error: failed to discover prompts: {error}"))
+}
+
+fn write_build_log(project_start: &Path, lines: &[String]) -> Result<(), String> {
+    let root = resolve_project_root(project_start)?;
+    let dist = root.join("dist");
+    fs::create_dir_all(&dist)
+        .map_err(|e| format!("error: failed to create {}: {e}", dist.display()))?;
+    let mut text = lines.join("\n");
+    text.push('\n');
+    fs::write(dist.join("build.log"), text).map_err(|e| {
+        format!(
+            "error: failed to write {}: {e}",
+            dist.join("build.log").display()
+        )
+    })
 }
 
 struct TerminalSession {
@@ -821,23 +925,86 @@ fn render_build(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
 
-    frame.render_widget(
-        Paragraph::new(build_info_text(&app.project_start))
-            .block(Block::default().borders(Borders::ALL).title(" prompts/ "))
-            .wrap(Wrap { trim: false }),
-        chunks[0],
-    );
+    render_build_sources(frame, app, chunks[0]);
 
     let action = if matches!(app.build_status, BuildStatus::Running(_)) {
         "Building..."
     } else {
-        "Build (profile: dev)  Ctrl+R / F5"
+        "Build selected prompt (profile: dev)  Enter / Ctrl+R / F5"
     };
     frame.render_widget(
         Paragraph::new(action).block(Block::default().borders(Borders::ALL).title(" Action ")),
         chunks[1],
     );
     frame.render_widget(build_status_widget(&app.build_status), chunks[2]);
+}
+
+fn render_build_sources(frame: &mut Frame, app: &App, area: Rect) {
+    match resolve_project_root(&app.project_start) {
+        Ok(root) => match build_sources(&app.project_start) {
+            Ok(sources) if sources.is_empty() => {
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "project: {}\n\nprompts/ at {}\n  none found",
+                        root.display(),
+                        root.join("prompts").display()
+                    ))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Select prompt "),
+                    )
+                    .wrap(Wrap { trim: false }),
+                    area,
+                );
+            }
+            Ok(sources) => {
+                let selected = app
+                    .selected_build_source
+                    .min(sources.len().saturating_sub(1));
+                let items = sources
+                    .iter()
+                    .map(|source| ListItem::new(display_project_path(&root, source)));
+                let mut state = ListState::default().with_selected(Some(selected));
+                frame.render_stateful_widget(
+                    List::new(items)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(format!(" Select prompt · project: {} ", root.display())),
+                        )
+                        .highlight_symbol("> ")
+                        .highlight_style(Style::default().fg(Color::Yellow)),
+                    area,
+                    &mut state,
+                );
+            }
+            Err(error) => {
+                frame.render_widget(
+                    Paragraph::new(error)
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(" Select prompt "),
+                        )
+                        .wrap(Wrap { trim: false }),
+                    area,
+                );
+            }
+        },
+        Err(error) => {
+            frame.render_widget(
+                Paragraph::new(error)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(" Select prompt "),
+                    )
+                    .wrap(Wrap { trim: false }),
+                area,
+            );
+        }
+    }
 }
 
 fn render_ops(frame: &mut Frame, app: &App, area: Rect) {
@@ -857,11 +1024,9 @@ fn render_ops(frame: &mut Frame, app: &App, area: Rect) {
         chunks[0],
     );
     frame.render_widget(
-        Paragraph::new(
-            "Static snapshot only. Run `cybersin ops` for live sessions, traces, cost, and approvals.",
-        )
-        .block(Block::default().borders(Borders::ALL).title(" Ops "))
-        .wrap(Wrap { trim: false }),
+        Paragraph::new(ops_build_log_text(&app.project_start))
+            .block(Block::default().borders(Borders::ALL).title(" Ops "))
+            .wrap(Wrap { trim: false }),
         chunks[1],
     );
 }
@@ -921,6 +1086,7 @@ fn build_status_widget(status: &BuildStatus) -> Paragraph<'static> {
 /// `Build` tab's info panel: source prompts the user can attempt to
 /// compile. `dist/` is build output, so runtime-facing artifact state
 /// belongs on the Ops side instead of here.
+#[cfg(test)]
 fn build_info_text(project_start: &Path) -> String {
     match resolve_project_root(project_start) {
         Ok(root) => format!(
@@ -932,6 +1098,7 @@ fn build_info_text(project_start: &Path) -> String {
     }
 }
 
+#[cfg(test)]
 fn prompt_sources_snapshot(project_root: &Path) -> String {
     match cybersin_frontend::discover_prompt_sources(project_root) {
         Ok(sources) if sources.is_empty() => {
@@ -978,6 +1145,27 @@ fn ops_info_text(project_start: &Path) -> String {
         }
         Err(error) => error,
     }
+}
+
+fn ops_build_log_text(project_start: &Path) -> String {
+    match resolve_project_root(project_start) {
+        Ok(root) => {
+            let path = root.join("dist/build.log");
+            match fs::read_to_string(&path) {
+                Ok(text) => format!("build log: {}\n\n{}", path.display(), tail_lines(&text, 14)),
+                Err(_) => {
+                    "No TUI build log yet. Select a prompt on Build and press Enter.".to_string()
+                }
+            }
+        }
+        Err(error) => error,
+    }
+}
+
+fn tail_lines(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
 }
 
 fn dist_snapshot(project_root: &Path) -> Result<String, String> {
@@ -1028,6 +1216,13 @@ fn ops_snapshot(project_root: &Path) -> Result<String, String> {
         ),
     };
     Ok(text)
+}
+
+fn display_project_path(project_root: &Path, path: &Path) -> String {
+    path.strip_prefix(project_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 fn format_age(age: Duration) -> String {
@@ -1255,6 +1450,31 @@ mod tests {
     }
 
     #[test]
+    fn build_tab_enter_requests_build_and_up_down_select_sources() {
+        let project = tempfile::tempdir().unwrap();
+        crate::commands::init::run(project.path()).unwrap();
+        std::fs::write(
+            project.path().join("prompts/second.prompt.yaml"),
+            "name: second\nquality: medium\nsections:\n- id: prompt\n  priority: 100\n  body: Build me.\n",
+        )
+        .unwrap();
+        let mut app = App::new(project.path().to_path_buf());
+        app.enter_convert();
+        app.switch_tab(WorkspaceTab::Build);
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.selected_build_source, 1);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.selected_build_source, 1);
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.selected_build_source, 0);
+
+        let action = app.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(action, AppAction::Build));
+    }
+
+    #[test]
     fn ops_tab_has_no_primary_action() {
         let mut app = App::default();
         app.enter_convert();
@@ -1390,6 +1610,36 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.contains("wrote manifest.json")));
+    }
+
+    #[test]
+    fn selected_build_compiles_that_prompt_and_ops_reads_dist_build_log() {
+        let project = tempfile::tempdir().unwrap();
+        crate::commands::init::run(project.path()).unwrap();
+        let selected = project.path().join("prompts/second.prompt.yaml");
+        std::fs::write(
+            &selected,
+            "name: second\nquality: medium\nsections:\n- id: prompt\n  priority: 100\n  body: Build me.\n",
+        )
+        .unwrap();
+        let mut lines = vec![format!(
+            "starting dev build for {}",
+            display_project_path(project.path(), &selected)
+        )];
+
+        let result = run_selected_build_from(project.path().to_path_buf(), selected, |progress| {
+            lines.push(format_build_progress(project.path(), progress));
+        })
+        .unwrap();
+        lines.push(format!("success: {result}"));
+        write_build_log(project.path(), &lines).unwrap();
+
+        assert!(project.path().join("dist/prompts/second.json").exists());
+        assert!(!project.path().join("dist/prompts/hello.json").exists());
+        let ops_text = ops_build_log_text(project.path());
+        assert!(ops_text.contains("dist/build.log"));
+        assert!(ops_text.contains("prompt second"));
+        assert!(ops_text.contains("success: built"));
     }
 
     #[test]
