@@ -25,9 +25,11 @@ mod tool_executor;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::{env, io};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
 
 /// Cybersin: a prompt compiler and agent runtime in one binary (spec §1).
 #[derive(Parser)]
@@ -68,7 +70,7 @@ struct Cli {
     sandbox_backend: Option<commands::sandbox::Backend>,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -217,13 +219,23 @@ enum SandboxCommand {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let args = normalize_help_alias(env::args_os());
     let Cli {
         db,
         dist,
         sandbox_root,
         sandbox_backend,
         command,
-    } = Cli::parse();
+    } = Cli::parse_from(args);
+    let Some(command) = command else {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            eprintln!(
+                "error: bare `cybersin` requires an interactive terminal; use `cybersin -help` or an explicit subcommand for non-interactive use"
+            );
+            return ExitCode::FAILURE;
+        }
+        return from_async(commands::tui::execute().await);
+    };
     match command {
         Command::Build {
             path,
@@ -321,8 +333,7 @@ async fn main() -> ExitCode {
                 Err(e) => return from_async(Err(e)),
             };
             from_async(
-                commands::approval::approve(db, dist, sandbox_root, sandbox_backend, call_id)
-                    .await,
+                commands::approval::approve(db, dist, sandbox_root, sandbox_backend, call_id).await,
             )
         }
         Command::Deny { call_id } => {
@@ -369,6 +380,15 @@ async fn main() -> ExitCode {
     }
 }
 
+fn normalize_help_alias<I>(args: I) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    args.into_iter()
+        .map(|arg| if arg == "-help" { "--help".into() } else { arg })
+        .collect()
+}
+
 /// Resolves the three infallible runtime globals (`--db`/`--sandbox-root`/
 /// `--sandbox-backend`) against the discovered project root (issue #50),
 /// applying an explicit flag over its corresponding discovered/config
@@ -398,7 +418,10 @@ fn resolve_runtime_globals(
 /// Resolves `--dist`: an explicit flag wins, otherwise `<project
 /// root>/dist` if it exists, otherwise a clear error (issue #50) — no more
 /// silent fallback to the bundled stub fixture.
-fn resolve_dist(dist: Option<PathBuf>, defaults: &project::ProjectDefaults) -> anyhow::Result<PathBuf> {
+fn resolve_dist(
+    dist: Option<PathBuf>,
+    defaults: &project::ProjectDefaults,
+) -> anyhow::Result<PathBuf> {
     match dist {
         Some(dist) => Ok(dist),
         None => defaults.dist_default(),

@@ -12,6 +12,29 @@ fn cybersin() -> Command {
 }
 
 #[test]
+fn explicit_help_spellings_print_help_without_entering_tui() {
+    for spelling in ["-help", "-h", "--help"] {
+        cybersin()
+            .arg(spelling)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "Cybersin prompt compiler + agent runtime CLI",
+            ))
+            .stdout(predicate::str::contains("Usage: cybersin"));
+    }
+}
+
+#[test]
+fn bare_non_tty_invocation_fails_clearly_instead_of_hanging() {
+    cybersin()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("requires an interactive terminal"))
+        .stderr(predicate::str::contains("cybersin -help"));
+}
+
+#[test]
 fn init_scaffolds_a_project_layout_that_passes_check() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("myagent");

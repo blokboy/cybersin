@@ -61,6 +61,18 @@ Run the sample project's recorded regression suite:
 ./target/debug/cybersin eval gate fixtures/ic1-research-team
 ```
 
+### Interactive shell and help
+
+Run `cybersin` with no arguments from an interactive terminal to open the
+Ratatui application shell. The first workflow is prompt conversion: enter
+a multiline raw prompt, keep or change the standalone conversion model,
+optionally set an output path, and run the same conversion pipeline used
+by `cybersin convert`.
+
+Use `cybersin -help`, `cybersin -h`, or `cybersin --help` to print CLI
+help and exit. Bare `cybersin` in a non-interactive context fails clearly
+instead of waiting on terminal UI input.
+
 ### Live tool execution
 
 Custom tools declared with `run:` and an optional container `image:` are

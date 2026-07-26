@@ -192,6 +192,15 @@ pub async fn run_with(
     out: Option<&Path>,
 ) -> Result<ConvertReport, String> {
     let raw_prompt = resolve_input(input, stdin)?;
+    run_raw_with(converter, project_root, &raw_prompt, out).await
+}
+
+pub async fn run_raw_with(
+    converter: &dyn PromptConversionModel,
+    project_root: &Path,
+    raw_prompt: &str,
+    out: Option<&Path>,
+) -> Result<ConvertReport, String> {
     let response = converter.convert(&raw_prompt, &conversion_schema()).await?;
     let mut draft: PromptDraft = serde_json::from_value(response)
         .map_err(|e| format!("error: conversion model returned invalid structured data: {e}"))?;
@@ -205,7 +214,7 @@ pub async fn run_with(
         && draft.sections.len() == 1
         && !draft.sections[0].unmapped
     {
-        draft.sections[0].body = raw_prompt.clone();
+        draft.sections[0].body = raw_prompt.to_string();
     }
     if !raw_prompt_implies_structured_output(&raw_prompt) {
         draft.output_contract = None;
