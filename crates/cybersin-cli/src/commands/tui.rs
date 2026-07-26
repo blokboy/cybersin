@@ -112,6 +112,10 @@ impl App {
                 self.show_help = true;
                 AppAction::None
             }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.request_conversion()
+            }
+            KeyCode::F(5) => self.request_conversion(),
             KeyCode::Esc => {
                 self.go_back();
                 AppAction::None
@@ -132,15 +136,7 @@ impl App {
                 self.open_conversion();
                 AppAction::None
             }
-            KeyCode::Enter if self.focus == Focus::ConvertAction => {
-                if self.raw_prompt.trim().is_empty() {
-                    self.status =
-                        ConversionStatus::Failure("Enter a prompt before converting.".to_string());
-                    AppAction::None
-                } else {
-                    AppAction::Convert
-                }
-            }
+            KeyCode::Enter if self.focus == Focus::ConvertAction => self.request_conversion(),
             KeyCode::Enter if self.focus == Focus::Prompt => {
                 self.raw_prompt.push('\n');
                 self.status = ConversionStatus::Idle;
@@ -167,6 +163,19 @@ impl App {
     fn open_conversion(&mut self) {
         self.screen = Screen::Convert;
         self.focus = Focus::Prompt;
+    }
+
+    fn request_conversion(&mut self) -> AppAction {
+        if self.screen != Screen::Convert {
+            return AppAction::None;
+        }
+        if self.raw_prompt.trim().is_empty() {
+            self.status =
+                ConversionStatus::Failure("Enter a prompt before converting.".to_string());
+            AppAction::None
+        } else {
+            AppAction::Convert
+        }
     }
 
     fn go_back(&mut self) {
@@ -407,7 +416,7 @@ fn render_convert(frame: &mut Frame, app: &App, area: Rect) {
     let action = if app.status == ConversionStatus::Running {
         "Converting..."
     } else {
-        "Convert"
+        "Convert  Ctrl+R / F5"
     };
     frame.render_widget(
         Paragraph::new(action).block(focused_block(" Action ", app.focus == Focus::ConvertAction)),
@@ -454,7 +463,9 @@ fn status_widget(status: &ConversionStatus) -> Paragraph<'static> {
 fn footer_text(app: &App) -> &'static str {
     match app.screen {
         Screen::Home => "Enter open · ? help · q quit",
-        Screen::Convert => "Tab/Shift-Tab focus · Enter type/act · Esc back · ? help · q quit",
+        Screen::Convert => {
+            "Ctrl+R/F5 convert · Tab/Shift-Tab focus · Enter type/act · Esc back · ? help · q quit"
+        }
     }
 }
 
@@ -470,7 +481,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(
-            "Tab / Shift-Tab moves focus\nEnter opens or runs the focused action\nEsc goes back or dismisses overlays\nq quits when focus is outside the prompt editor\n-help, -h, and --help print CLI help",
+            "Ctrl+R or F5 converts the raw prompt\nTab / Shift-Tab moves focus\nEnter opens or runs the focused action\nEsc goes back or dismisses overlays\nq quits when focus is outside the prompt editor\n-help, -h, and --help print CLI help",
         )
         .block(Block::default().borders(Borders::ALL).title(" Help "))
         .wrap(Wrap { trim: false }),
@@ -517,6 +528,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn ctrl_key(ch: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
+    }
+
     #[test]
     fn home_opens_conversion_and_back_preserves_draft() {
         let mut app = App::default();
@@ -555,6 +570,32 @@ mod tests {
 
         assert!(!app.should_quit);
         assert_eq!(app.raw_prompt, "q");
+    }
+
+    #[test]
+    fn ctrl_r_converts_from_the_prompt_editor() {
+        let mut app = App::default();
+        app.open_conversion();
+        app.raw_prompt = "Turn this into a prompt source.".to_string();
+
+        let action = app.handle_key(ctrl_key('r'));
+
+        assert!(matches!(action, AppAction::Convert));
+        assert_eq!(app.focus, Focus::Prompt);
+    }
+
+    #[test]
+    fn empty_prompt_conversion_is_rejected_before_model_call() {
+        let mut app = App::default();
+        app.open_conversion();
+
+        let action = app.handle_key(ctrl_key('r'));
+
+        assert!(matches!(action, AppAction::None));
+        assert_eq!(
+            app.status,
+            ConversionStatus::Failure("Enter a prompt before converting.".to_string())
+        );
     }
 
     #[tokio::test]
