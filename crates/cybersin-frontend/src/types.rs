@@ -1,8 +1,10 @@
 //! Parses the `inputs:` type grammar (spec §5.1: `string`, `number`,
 //! `bool`, `document`, `enum[a, b]`, `list[<type>]`, arbitrarily nested)
-//! into [`cybersin_ir::InputType`].
+//! into [`cybersin_ir::InputType`], plus the small `quality:`/
+//! `grounded_tiers:` tier grammar (`low`/`medium`/`high`) shared by both
+//! fields.
 
-use cybersin_ir::InputType;
+use cybersin_ir::{InputType, QualityTier};
 
 /// Parse one type declaration string, e.g. `"list[document]"`.
 pub(crate) fn parse_input_type(raw: &str) -> Option<InputType> {
@@ -51,6 +53,27 @@ pub(crate) fn type_name(t: &InputType) -> String {
         InputType::Document => "document".to_string(),
         InputType::Enum { variants } => format!("enum[{}]", variants.join(", ")),
         InputType::List { of } => format!("list[{}]", type_name(of)),
+    }
+}
+
+/// Parse one quality-tier string, e.g. `"high"` — the grammar shared by
+/// `quality:` and each entry of `grounded_tiers:`.
+pub(crate) fn parse_quality_tier(raw: &str) -> Option<QualityTier> {
+    match raw.trim() {
+        "low" => Some(QualityTier::Low),
+        "medium" => Some(QualityTier::Medium),
+        "high" => Some(QualityTier::High),
+        _ => None,
+    }
+}
+
+/// Render a [`QualityTier`] back to its `quality:`/`grounded_tiers:`
+/// grammar spelling, used in error messages.
+pub(crate) fn quality_tier_name(tier: QualityTier) -> &'static str {
+    match tier {
+        QualityTier::Low => "low",
+        QualityTier::Medium => "medium",
+        QualityTier::High => "high",
     }
 }
 
@@ -113,5 +136,24 @@ mod tests {
             }),
         };
         assert_eq!(type_name(&t), "list[enum[a, b]]");
+    }
+
+    #[test]
+    fn parses_quality_tiers() {
+        assert_eq!(parse_quality_tier("low"), Some(QualityTier::Low));
+        assert_eq!(parse_quality_tier(" medium "), Some(QualityTier::Medium));
+        assert_eq!(parse_quality_tier("high"), Some(QualityTier::High));
+        assert_eq!(parse_quality_tier("ultra"), None);
+    }
+
+    #[test]
+    fn quality_tier_name_round_trips() {
+        for tier in [QualityTier::Low, QualityTier::Medium, QualityTier::High] {
+            assert_eq!(
+                parse_quality_tier(quality_tier_name(tier)),
+                Some(tier),
+                "tier name should re-parse to the same tier"
+            );
+        }
     }
 }

@@ -237,6 +237,59 @@ sections:
     }
 
     #[test]
+    fn grounded_tiers_compile_into_ir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = r#"
+name: researcher
+quality: high
+inputs:
+  topic: string
+grounded_tiers: [medium, high]
+sections:
+  - id: role
+    priority: 100
+    body: "{{ topic }}"
+"#;
+        let prompt_path = write(tmp.path(), "researcher.prompt.yaml", source);
+        let ir = compile_prompt_source(&prompt_path).expect("valid source should compile");
+        assert_eq!(
+            ir.grounded_tiers,
+            std::collections::BTreeSet::from([
+                cybersin_ir::QualityTier::Medium,
+                cybersin_ir::QualityTier::High,
+            ])
+        );
+    }
+
+    #[test]
+    fn grounded_tier_above_quality_fails_clearly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = r#"
+name: broken
+quality: medium
+inputs:
+  topic: string
+grounded_tiers: [high]
+sections:
+  - id: role
+    priority: 100
+    body: "{{ topic }}"
+"#;
+        let prompt_path = write(tmp.path(), "broken.prompt.yaml", source);
+        let err = compile_prompt_source(&prompt_path).unwrap_err();
+        match &err {
+            FrontendError::Typecheck(issues) => {
+                assert!(issues.iter().any(|i| matches!(
+                    i,
+                    TypecheckIssue::GroundedTierAboveQuality { tier, quality }
+                        if tier == "high" && quality == "medium"
+                )));
+            }
+            other => panic!("expected Typecheck error, got: {other}"),
+        }
+    }
+
+    #[test]
     fn discover_prompt_sources_finds_project_prompts_dir() {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "prompts/researcher.prompt.yaml", VALID_SOURCE);

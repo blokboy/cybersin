@@ -105,4 +105,20 @@ pub enum TypecheckIssue {
     /// section body — dead input the author should remove or use.
     #[error("input `{name}` is declared but never referenced in any section body")]
     UnusedInput { name: String },
+
+    /// A `grounded_tiers:` entry was not one of `low`, `medium`, `high`
+    /// (spec issue #82; same grammar as `quality:`).
+    #[error("grounded_tiers entry `{raw}` is not a valid quality tier (expected one of: low, medium, high)")]
+    InvalidGroundedTier { raw: String },
+
+    /// `grounded_tiers:` named a tier above this prompt's own `quality:`,
+    /// so it would never be part of this prompt's cascade — the same
+    /// semantic check the router enforces (spec issue #81), re-derived
+    /// here so it surfaces as a compile error against the real source
+    /// file rather than only at route-compile time.
+    #[error(
+        "grounded_tiers declares `{tier}`, which is above this prompt's own `quality: {quality}` \
+         and is never part of its cascade"
+    )]
+    GroundedTierAboveQuality { tier: String, quality: String },
 }
