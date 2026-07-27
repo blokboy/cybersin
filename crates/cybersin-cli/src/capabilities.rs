@@ -4,7 +4,8 @@
 //! modules are CLI adapters, while these types describe the shared product
 //! surface that CLI and TUI adapters will eventually invoke.
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use cybersin_trace::{Span, SpanFilter, SpanStore};
 use serde_json::{json, Value};
@@ -14,6 +15,8 @@ use crate::commands::build::{self, BuildProfile, BuildProgress};
 
 pub const BUILD_CAPABILITY_ID: &str = "compile.build";
 pub const CHECK_CAPABILITY_ID: &str = "compile.check";
+pub const SCAFFOLD_PROMPT_AGENT_CAPABILITY_ID: &str = "compile.scaffold-prompt-agent";
+pub const SCAFFOLD_BUILD_WORKFLOW_ID: &str = "workflow.scaffold-build";
 pub const TRACE_LS_CAPABILITY_ID: &str = "inspection.trace.ls";
 
 /// A user-facing operation that can be invoked through one or more adapters.
@@ -23,6 +26,7 @@ pub struct CapabilitySpec {
     pub title: String,
     pub summary: String,
     pub category: CapabilityCategory,
+    pub components: Vec<CapabilityId>,
     pub input_schema: Value,
     pub output_modes: Vec<OutputMode>,
     pub safety: SafetyProfile,
@@ -204,6 +208,53 @@ impl BuildInput {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScaffoldPromptAgentInput {
+    pub project_path: PathBuf,
+    pub prompt_source: PathBuf,
+}
+
+impl ScaffoldPromptAgentInput {
+    pub fn new(project_path: impl Into<PathBuf>, prompt_source: impl Into<PathBuf>) -> Self {
+        Self {
+            project_path: project_path.into(),
+            prompt_source: prompt_source.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScaffoldPromptAgentOutput {
+    pub prompt_name: String,
+    pub agent_name: String,
+    pub agent_path: PathBuf,
+    pub harness_script_path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScaffoldBuildInput {
+    pub project_path: PathBuf,
+    pub prompt_source: PathBuf,
+    pub profile: BuildProfile,
+    pub frozen: bool,
+}
+
+impl ScaffoldBuildInput {
+    pub fn new(
+        project_path: impl Into<PathBuf>,
+        prompt_source: impl Into<PathBuf>,
+        profile: BuildProfile,
+        frozen: bool,
+    ) -> Self {
+        Self {
+            project_path: project_path.into(),
+            prompt_source: prompt_source.into(),
+            profile,
+            frozen,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CapabilityExecution {
     pub events: Vec<CapabilityEvent>,
@@ -222,6 +273,13 @@ impl CapabilityExecution {
 }
 
 pub fn execute_build(input: BuildInput) -> CapabilityExecution {
+    execute_build_with_progress(input, |_| {})
+}
+
+pub fn execute_build_with_progress(
+    input: BuildInput,
+    mut on_progress: impl FnMut(BuildProgress),
+) -> CapabilityExecution {
     let mut events = vec![CapabilityEvent::Started {
         capability_id: CapabilityId::new(BUILD_CAPABILITY_ID),
     }];
@@ -236,7 +294,10 @@ pub fn execute_build(input: BuildInput) -> CapabilityExecution {
             input.profile,
             input.frozen,
             None,
-            |progress| progress_events.push(build_progress_event(progress)),
+            |progress| {
+                on_progress(progress.clone());
+                progress_events.push(build_progress_event(progress));
+            },
         )
     } else {
         build::run_into_with_progress(
@@ -245,7 +306,10 @@ pub fn execute_build(input: BuildInput) -> CapabilityExecution {
             input.profile,
             input.frozen,
             None,
-            |progress| progress_events.push(build_progress_event(progress)),
+            |progress| {
+                on_progress(progress.clone());
+                progress_events.push(build_progress_event(progress));
+            },
         )
     };
     events.extend(progress_events);
@@ -297,6 +361,242 @@ pub fn execute_build(input: BuildInput) -> CapabilityExecution {
     }
 
     CapabilityExecution::new(events)
+}
+
+pub fn execute_scaffold_prompt_agent(input: ScaffoldPromptAgentInput) -> CapabilityExecution {
+    let mut events = vec![CapabilityEvent::Started {
+        capability_id: CapabilityId::new(SCAFFOLD_PROMPT_AGENT_CAPABILITY_ID),
+    }];
+
+    match scaffold_prompt_agent(&input.project_path, &input.prompt_source) {
+        Ok(output) => {
+            let value = scaffold_prompt_agent_value(&output);
+            events.push(CapabilityEvent::Output {
+                mode: OutputMode::Json,
+                value: value.clone(),
+            });
+            events.push(CapabilityEvent::Completed { value: Some(value) });
+        }
+        Err(message) => events.push(CapabilityEvent::Failed { message }),
+    }
+
+    CapabilityExecution::new(events)
+}
+
+pub fn execute_scaffold_build(input: ScaffoldBuildInput) -> CapabilityExecution {
+    execute_scaffold_build_with_progress(input, |_| {})
+}
+
+pub fn execute_scaffold_build_with_progress(
+    input: ScaffoldBuildInput,
+    on_progress: impl FnMut(BuildProgress),
+) -> CapabilityExecution {
+    let mut events = vec![CapabilityEvent::Started {
+        capability_id: CapabilityId::new(SCAFFOLD_BUILD_WORKFLOW_ID),
+    }];
+
+    let scaffold = match scaffold_prompt_agent(&input.project_path, &input.prompt_source) {
+        Ok(output) => output,
+        Err(message) => {
+            events.push(CapabilityEvent::Started {
+                capability_id: CapabilityId::new(SCAFFOLD_PROMPT_AGENT_CAPABILITY_ID),
+            });
+            events.push(CapabilityEvent::Failed {
+                message: message.clone(),
+            });
+            events.push(CapabilityEvent::Failed { message });
+            return CapabilityExecution::new(events);
+        }
+    };
+    let scaffold_value = scaffold_prompt_agent_value(&scaffold);
+    events.push(CapabilityEvent::Started {
+        capability_id: CapabilityId::new(SCAFFOLD_PROMPT_AGENT_CAPABILITY_ID),
+    });
+    events.push(CapabilityEvent::Output {
+        mode: OutputMode::Json,
+        value: scaffold_value.clone(),
+    });
+    events.push(CapabilityEvent::Completed {
+        value: Some(scaffold_value.clone()),
+    });
+
+    let build = execute_build_with_progress(
+        BuildInput::new(&input.project_path, input.profile, input.frozen)
+            .with_selected_prompt_source(&input.prompt_source),
+        on_progress,
+    );
+    let build_success = build.is_success();
+    let build_value = build.events.iter().rev().find_map(|event| match event {
+        CapabilityEvent::Completed { value } => value.clone(),
+        _ => None,
+    });
+    events.extend(build.events);
+
+    if build_success {
+        let build_message = build_value
+            .as_ref()
+            .and_then(|value| value.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("build complete");
+        let agent_path = display_project_path(&input.project_path, &scaffold.agent_path);
+        let message = format!("{build_message}; agent {agent_path}");
+        events.push(CapabilityEvent::Output {
+            mode: OutputMode::Text,
+            value: json!({
+                "stream": "stdout",
+                "text": message,
+            }),
+        });
+        events.push(CapabilityEvent::Completed {
+            value: Some(json!({
+                "scaffold": scaffold_value,
+                "build": build_value,
+                "message": message,
+            })),
+        });
+    } else if let Some(Err(message)) = build_summary(&events) {
+        events.push(CapabilityEvent::Failed { message });
+    }
+
+    CapabilityExecution::new(events)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PromptNameYaml {
+    name: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AgentNameYaml {
+    name: String,
+}
+
+fn scaffold_prompt_agent(
+    project_path: &Path,
+    prompt_source: &Path,
+) -> Result<ScaffoldPromptAgentOutput, String> {
+    let prompt_text = fs::read_to_string(prompt_source)
+        .map_err(|e| format!("error: failed to read {}: {e}", prompt_source.display()))?;
+    let prompt: PromptNameYaml = serde_yaml::from_str(&prompt_text)
+        .map_err(|e| format!("error: invalid {}: {e}", prompt_source.display()))?;
+    let prompt_slug = prompt_name_slug(&prompt.name);
+    let agent_name = format!("{prompt_slug}-agent");
+    let generated_agent_path = project_path
+        .join("agents")
+        .join(format!("{prompt_slug}.agent.yaml"));
+
+    for agent_source in build::discover_agent_sources(project_path)? {
+        if agent_source == generated_agent_path {
+            continue;
+        }
+        let text = fs::read_to_string(&agent_source)
+            .map_err(|e| format!("error: failed to read {}: {e}", agent_source.display()))?;
+        let agent: AgentNameYaml = serde_yaml::from_str(&text)
+            .map_err(|e| format!("error: invalid {}: {e}", agent_source.display()))?;
+        if agent.name == agent_name {
+            let script_path = project_path
+                .join("harnesses")
+                .join(format!("{prompt_slug}.script.yaml"));
+            return Ok(ScaffoldPromptAgentOutput {
+                prompt_name: prompt.name,
+                agent_name,
+                agent_path: agent_source,
+                harness_script_path: script_path,
+            });
+        }
+    }
+
+    let script_path = project_path
+        .join("harnesses")
+        .join(format!("{prompt_slug}.script.yaml"));
+    write_prompt_harness_script(&script_path, &prompt.name)?;
+
+    if let Some(parent) = generated_agent_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("error: failed to create {}: {e}", parent.display()))?;
+    }
+    let script_rel = display_project_path(project_path, &script_path);
+    fs::write(
+        &generated_agent_path,
+        scaffold_agent_yaml(&agent_name, &script_rel),
+    )
+    .map_err(|e| {
+        format!(
+            "error: failed to write {}: {e}",
+            generated_agent_path.display()
+        )
+    })?;
+
+    Ok(ScaffoldPromptAgentOutput {
+        prompt_name: prompt.name,
+        agent_name,
+        agent_path: generated_agent_path,
+        harness_script_path: script_path,
+    })
+}
+
+fn scaffold_prompt_agent_value(output: &ScaffoldPromptAgentOutput) -> Value {
+    json!({
+        "prompt_name": output.prompt_name,
+        "agent_name": output.agent_name,
+        "agent_path": output.agent_path.display().to_string(),
+        "harness_script_path": output.harness_script_path.display().to_string(),
+    })
+}
+
+fn prompt_name_slug(name: &str) -> String {
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash && !slug.is_empty() {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "prompt".to_string()
+    } else {
+        slug
+    }
+}
+
+fn write_prompt_harness_script(path: &Path, prompt_name: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("error: failed to create {}: {e}", parent.display()))?;
+    }
+    let prompt_name = serde_json::to_string(prompt_name)
+        .map_err(|e| format!("error: failed to serialize prompt name: {e}"))?;
+    let text = format!(
+        "- llm_request:\n\
+    prompt_name: {prompt_name}\n\
+    inputs: {{}}\n"
+    );
+    fs::write(path, text).map_err(|e| format!("error: failed to write {}: {e}", path.display()))
+}
+
+fn scaffold_agent_yaml(agent_name: &str, script_path: &str) -> String {
+    let script_path = serde_json::to_string(script_path).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        "# Agent runtime config generated by the Cybersin TUI Build tab.\n\
+name: {agent_name}\n\
+harness: {{ adapter: process, command: [\"scripted_harness\", {script_path}] }}\n\
+budget: {{ usd_per_session: 1.00, on_breach: degrade }}\n\
+tools: []\n"
+    )
+}
+
+fn display_project_path(project_root: &Path, path: &Path) -> String {
+    path.strip_prefix(project_root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 pub fn build_summary(events: &[CapabilityEvent]) -> Option<Result<String, String>> {
@@ -989,6 +1289,15 @@ pub fn registry() -> CapabilityRegistry {
             cli(),
         ),
         spec(
+            SCAFFOLD_PROMPT_AGENT_CAPABILITY_ID,
+            "Scaffold prompt agent",
+            "Create the generated agent yaml and scripted harness for a prompt source.",
+            CapabilityCategory::Compile,
+            vec![OutputMode::Json, OutputMode::Artifact],
+            writes_project_files(NetworkRequirement::None, LongRunningBehavior::Finite),
+            unavailable("scaffold is invoked as a component of workflow.scaffold-build"),
+        ),
+        spec(
             "workflow.optimize",
             "Optimize project",
             "Analyze traces, emit an optimization report, and rebuild with observed routing stats.",
@@ -1000,8 +1309,8 @@ pub fn registry() -> CapabilityRegistry {
             ),
             cli(),
         ),
-        spec(
-            "workflow.scaffold-build",
+        workflow_spec(
+            SCAFFOLD_BUILD_WORKFLOW_ID,
             "Scaffold and build prompt source",
             "Create the TUI's prompt-source scaffold and immediately build it.",
             CapabilityCategory::Workflow,
@@ -1010,7 +1319,11 @@ pub fn registry() -> CapabilityRegistry {
                 NetworkRequirement::Optional,
                 LongRunningBehavior::StreamsUntilComplete,
             ),
-            unavailable("private TUI workflow is not exposed through the capability adapter yet"),
+            custom_tui(),
+            vec![
+                CapabilityId::new(SCAFFOLD_PROMPT_AGENT_CAPABILITY_ID),
+                CapabilityId::new(BUILD_CAPABILITY_ID),
+            ],
         ),
     ])
 }
@@ -1029,6 +1342,7 @@ fn spec(
         title: title.to_string(),
         summary: summary.to_string(),
         category,
+        components: Vec::new(),
         input_schema: json!({
             "type": "object",
             "additionalProperties": true
@@ -1039,12 +1353,28 @@ fn spec(
     }
 }
 
+fn workflow_spec(
+    id: &str,
+    title: &str,
+    summary: &str,
+    category: CapabilityCategory,
+    output_modes: Vec<OutputMode>,
+    safety: SafetyProfile,
+    adapters: AdapterCoverage,
+    components: Vec<CapabilityId>,
+) -> CapabilitySpec {
+    let mut spec = spec(id, title, summary, category, output_modes, safety, adapters);
+    spec.components = components;
+    spec
+}
+
 fn build_spec() -> CapabilitySpec {
     CapabilitySpec {
         id: CapabilityId::new(BUILD_CAPABILITY_ID),
         title: "Build project".to_string(),
         summary: "Compile a project into dist artifacts.".to_string(),
         category: CapabilityCategory::Compile,
+        components: Vec::new(),
         input_schema: json!({
             "type": "object",
             "required": ["project_path", "profile", "frozen"],
@@ -1084,6 +1414,7 @@ fn check_spec() -> CapabilitySpec {
         title: "Check prompt sources".to_string(),
         summary: "Parse, include-resolve, typecheck, and emit prompt IR.".to_string(),
         category: CapabilityCategory::Compile,
+        components: Vec::new(),
         input_schema: json!({
             "type": "object",
             "required": ["path"],
@@ -1114,6 +1445,15 @@ fn generic_tui() -> AdapterCoverage {
     AdapterCoverage {
         cli: AdapterSupport::Available,
         tui: AdapterSupport::Generic,
+    }
+}
+
+fn custom_tui() -> AdapterCoverage {
+    AdapterCoverage {
+        cli: AdapterSupport::Unavailable {
+            reason: "TUI-only workflow".to_string(),
+        },
+        tui: AdapterSupport::Custom,
     }
 }
 
@@ -1220,6 +1560,7 @@ mod tests {
             title: "Check prompt sources".to_string(),
             summary: "Parse, include-resolve, and typecheck prompt sources.".to_string(),
             category: CapabilityCategory::Compile,
+            components: Vec::new(),
             input_schema: json!({
                 "type": "object",
                 "required": ["path"],
@@ -1363,6 +1704,7 @@ mod tests {
                         spec.id.as_str(),
                         CHECK_CAPABILITY_ID | TRACE_LS_CAPABILITY_ID
                     ) => {}
+                AdapterSupport::Custom if spec.id.as_str() == SCAFFOLD_BUILD_WORKFLOW_ID => {}
                 AdapterSupport::Unavailable { reason } => assert!(
                     !reason.is_empty(),
                     "{} should explain why TUI capability invocation is unavailable",
@@ -1391,15 +1733,71 @@ mod tests {
         assert!(registry.get("runtime.run.stub").is_some());
         assert!(registry.get("runtime.run.agent").is_some());
         assert!(registry.get("sandbox.restore").is_some());
+        let scaffold_build = registry.get(SCAFFOLD_BUILD_WORKFLOW_ID).unwrap();
         assert_eq!(
-            registry
-                .get("workflow.scaffold-build")
-                .map(|spec| &spec.adapters.cli),
-            Some(&AdapterSupport::Unavailable {
-                reason: "private TUI workflow is not exposed through the capability adapter yet"
-                    .to_string()
-            })
+            scaffold_build.components,
+            vec![
+                CapabilityId::new(SCAFFOLD_PROMPT_AGENT_CAPABILITY_ID),
+                CapabilityId::new(BUILD_CAPABILITY_ID),
+            ]
         );
+        assert_eq!(scaffold_build.adapters.tui, AdapterSupport::Custom);
         assert!(registry.get("missing").is_none());
+    }
+
+    #[test]
+    fn scaffold_build_workflow_invokes_components_in_order_and_hands_off_typed_output() {
+        let project = tempfile::tempdir().unwrap();
+        crate::commands::init::run(project.path()).unwrap();
+        let source = project.path().join("prompts/hello.prompt.yaml");
+        std::fs::write(
+            &source,
+            "name: hello\nquality: medium\nsections:\n- id: prompt\n  priority: 100\n  body: Hello.\n",
+        )
+        .unwrap();
+
+        let execution = execute_scaffold_build(ScaffoldBuildInput::new(
+            project.path(),
+            &source,
+            BuildProfile::Dev,
+            false,
+        ));
+
+        assert!(execution.is_success());
+        let started = execution
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                CapabilityEvent::Started { capability_id } => Some(capability_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            started,
+            vec![
+                SCAFFOLD_BUILD_WORKFLOW_ID,
+                SCAFFOLD_PROMPT_AGENT_CAPABILITY_ID,
+                BUILD_CAPABILITY_ID,
+            ]
+        );
+
+        let workflow_value = execution.events.iter().rev().find_map(|event| match event {
+            CapabilityEvent::Completed { value: Some(value) } => {
+                value.get("scaffold").map(|_| value)
+            }
+            _ => None,
+        });
+        let value = workflow_value.expect("workflow completion value");
+        assert_eq!(
+            value["scaffold"]["agent_path"].as_str().unwrap(),
+            project
+                .path()
+                .join("agents/hello.agent.yaml")
+                .display()
+                .to_string()
+        );
+        assert!(project.path().join("agents/hello.agent.yaml").exists());
+        assert!(project.path().join("harnesses/hello.script.yaml").exists());
+        assert!(project.path().join("dist/prompts/hello.json").exists());
     }
 }

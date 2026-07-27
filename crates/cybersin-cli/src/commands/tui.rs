@@ -19,26 +19,14 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use crossterm::cursor::Show;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
-use ratatui::{Frame, Terminal};
-use serde::Deserialize;
-
 use crate::capabilities::{
-    check_output_stream, execute_check, execute_trace_ls, registry, AdapterSupport,
-    CapabilityEvent, CapabilitySpec, TraceLsInput, CHECK_CAPABILITY_ID, TRACE_LS_CAPABILITY_ID,
+    build_summary, check_output_stream, execute_check, execute_scaffold_build_with_progress,
+    execute_trace_ls, registry, AdapterSupport, CapabilityEvent, CapabilitySpec,
+    ScaffoldBuildInput, TraceLsInput, CHECK_CAPABILITY_ID, TRACE_LS_CAPABILITY_ID,
 };
-use crate::commands::build::{self, BuildProfile, BuildProgress};
+#[cfg(test)]
+use crate::commands::build;
+use crate::commands::build::{BuildProfile, BuildProgress};
 use crate::commands::convert::{
     self, ConvertReport, OpenRouterPromptConversionModel, PromptConversionModel,
 };
@@ -46,7 +34,20 @@ use crate::commands::ops;
 use crate::commands::run::{self, RunArgs};
 use crate::project::ProjectDefaults;
 use crate::project::{self};
+use anyhow::{Context, Result};
+use crossterm::cursor::Show;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use cybersin_runtime::DaemonHandle;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::{Frame, Terminal};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -1018,22 +1019,12 @@ fn run_selected_build_from(
     on_progress: impl FnMut(BuildProgress),
 ) -> Result<String, String> {
     let project_root = resolve_project_root(&project_start)?;
-    let agent = ensure_agent_for_prompt_source(&project_root, &source)?;
-    build::run_source_into_with_progress(
-        &project_root,
-        &project_root.join("dist"),
-        &source,
-        BuildProfile::Dev,
-        false,
-        None,
+    let execution = execute_scaffold_build_with_progress(
+        ScaffoldBuildInput::new(&project_root, &source, BuildProfile::Dev, false),
         on_progress,
-    )
-    .map(|message| {
-        format!(
-            "{}; agent {}",
-            message.unwrap_or_else(|| "build complete".to_string()),
-            display_project_path(&project_root, &agent)
-        )
+    );
+    build_summary(&execution.events).unwrap_or_else(|| {
+        Err("cybersin build failed: workflow did not emit a terminal event".to_string())
     })
 }
 
@@ -1061,111 +1052,6 @@ fn build_sources(project_start: &Path) -> Result<Vec<PathBuf>, String> {
     let root = resolve_project_root(project_start)?;
     cybersin_frontend::discover_prompt_sources(&root)
         .map_err(|error| format!("error: failed to discover prompts: {error}"))
-}
-
-#[derive(Debug, Deserialize)]
-struct PromptNameYaml {
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AgentNameYaml {
-    name: String,
-}
-
-fn ensure_agent_for_prompt_source(project_root: &Path, source: &Path) -> Result<PathBuf, String> {
-    let prompt_text = fs::read_to_string(source)
-        .map_err(|e| format!("error: failed to read {}: {e}", source.display()))?;
-    let prompt: PromptNameYaml = serde_yaml::from_str(&prompt_text)
-        .map_err(|e| format!("error: invalid {}: {e}", source.display()))?;
-    let prompt_slug = prompt_name_slug(&prompt.name);
-    let agent_name = format!("{prompt_slug}-agent");
-    let generated_agent_path = project_root
-        .join("agents")
-        .join(format!("{prompt_slug}.agent.yaml"));
-
-    for agent_source in build::discover_agent_sources(project_root)? {
-        if agent_source == generated_agent_path {
-            continue;
-        }
-        let text = fs::read_to_string(&agent_source)
-            .map_err(|e| format!("error: failed to read {}: {e}", agent_source.display()))?;
-        let agent: AgentNameYaml = serde_yaml::from_str(&text)
-            .map_err(|e| format!("error: invalid {}: {e}", agent_source.display()))?;
-        if agent.name == agent_name {
-            return Ok(agent_source);
-        }
-    }
-
-    let script_path = project_root
-        .join("harnesses")
-        .join(format!("{prompt_slug}.script.yaml"));
-    write_prompt_harness_script(&script_path, &prompt.name)?;
-
-    if let Some(parent) = generated_agent_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("error: failed to create {}: {e}", parent.display()))?;
-    }
-    let script_rel = display_project_path(project_root, &script_path);
-    fs::write(
-        &generated_agent_path,
-        scaffold_agent_yaml(&agent_name, &script_rel),
-    )
-    .map_err(|e| {
-        format!(
-            "error: failed to write {}: {e}",
-            generated_agent_path.display()
-        )
-    })?;
-    Ok(generated_agent_path)
-}
-
-fn prompt_name_slug(name: &str) -> String {
-    let mut slug = String::new();
-    let mut last_was_dash = false;
-    for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch.to_ascii_lowercase());
-            last_was_dash = false;
-        } else if !last_was_dash && !slug.is_empty() {
-            slug.push('-');
-            last_was_dash = true;
-        }
-    }
-    while slug.ends_with('-') {
-        slug.pop();
-    }
-    if slug.is_empty() {
-        "prompt".to_string()
-    } else {
-        slug
-    }
-}
-
-fn write_prompt_harness_script(path: &Path, prompt_name: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("error: failed to create {}: {e}", parent.display()))?;
-    }
-    let prompt_name = serde_json::to_string(prompt_name)
-        .map_err(|e| format!("error: failed to serialize prompt name: {e}"))?;
-    let text = format!(
-        "- llm_request:\n\
-    prompt_name: {prompt_name}\n\
-    inputs: {{}}\n"
-    );
-    fs::write(path, text).map_err(|e| format!("error: failed to write {}: {e}", path.display()))
-}
-
-fn scaffold_agent_yaml(agent_name: &str, script_path: &str) -> String {
-    let script_path = serde_json::to_string(script_path).unwrap_or_else(|_| "\"\"".to_string());
-    format!(
-        "# Agent runtime config generated by the Cybersin TUI Build tab.\n\
-name: {agent_name}\n\
-harness: {{ adapter: process, command: [\"scripted_harness\", {script_path}] }}\n\
-budget: {{ usd_per_session: 1.00, on_breach: degrade }}\n\
-tools: []\n"
-    )
 }
 
 fn write_build_log(project_start: &Path, lines: &[String]) -> Result<(), String> {
@@ -2328,6 +2214,28 @@ mod tests {
         let action = app.handle_key(key(KeyCode::Enter));
 
         assert!(matches!(action, AppAction::Build));
+    }
+
+    #[test]
+    fn selected_build_uses_scaffold_build_workflow() {
+        let project = tempfile::tempdir().unwrap();
+        crate::commands::init::run(project.path()).unwrap();
+        write_hello_prompt(project.path());
+        let source = project.path().join("prompts/hello.prompt.yaml");
+        let mut progress = Vec::new();
+
+        let message = run_selected_build_from(project.path().to_path_buf(), source, |event| {
+            progress.push(event)
+        })
+        .unwrap();
+
+        assert!(message.contains("agent agents/hello.agent.yaml"));
+        assert!(project.path().join("agents/hello.agent.yaml").exists());
+        assert!(project.path().join("harnesses/hello.script.yaml").exists());
+        assert!(project.path().join("dist/prompts/hello.json").exists());
+        assert!(progress.iter().any(
+            |event| matches!(event, BuildProgress::PromptStarted { name, .. } if name == "hello")
+        ));
     }
 
     #[test]
