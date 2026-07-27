@@ -127,6 +127,125 @@ fn init_scaffolds_only_the_basic_project_spine() {
 }
 
 #[test]
+fn init_starter_template_creates_a_buildable_recorded_eval_loop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("starter");
+
+    cybersin()
+        .arg("init")
+        .arg(&project)
+        .arg("--template")
+        .arg("starter")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "scaffolded cybersin starter project",
+        ))
+        .stdout(predicate::str::contains(
+            "prompts/cybersin-starter.prompt.yaml",
+        ))
+        .stdout(predicate::str::contains(
+            "inputs/cybersin-starter.input.json",
+        ));
+
+    for expected in [
+        "cybersin.yaml",
+        "cybersin.lock",
+        "fragments/cybersin-starter-instructions.md",
+        "prompts/cybersin-starter.prompt.yaml",
+        "evals/cybersin-starter.eval.yaml",
+        "inputs",
+        "inputs/cybersin-starter.input.json",
+    ] {
+        assert!(project.join(expected).exists(), "missing {expected}");
+    }
+    assert!(
+        !project.join("agents/cybersin-starter.agent.yaml").exists(),
+        "starter template should rely on the built-in starter harness, not a user-authored harness"
+    );
+
+    cybersin()
+        .arg("build")
+        .arg(&project)
+        .arg("--profile")
+        .arg("dev")
+        .arg("--frozen")
+        .assert()
+        .success();
+    assert!(project.join("dist/prompts/cybersin-starter.json").exists());
+
+    cybersin()
+        .arg("eval")
+        .arg("run")
+        .arg(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "cybersin-starter.eval.yaml::starter_brief",
+        ))
+        .stdout(predicate::str::contains("PASS"));
+}
+
+#[test]
+fn init_starter_template_honors_skip_force_and_dry_run_reporting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("starter");
+    fs::create_dir_all(project.join("prompts")).unwrap();
+    fs::write(
+        project.join("prompts/cybersin-starter.prompt.yaml"),
+        "name: existing\n",
+    )
+    .unwrap();
+
+    cybersin()
+        .arg("init")
+        .arg(&project)
+        .arg("--template")
+        .arg("starter")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skipped:"))
+        .stdout(predicate::str::contains(
+            "prompts/cybersin-starter.prompt.yaml",
+        ));
+    assert_eq!(
+        fs::read_to_string(project.join("prompts/cybersin-starter.prompt.yaml")).unwrap(),
+        "name: existing\n"
+    );
+
+    let dry_run_project = tmp.path().join("dry-run-starter");
+    cybersin()
+        .arg("init")
+        .arg(&dry_run_project)
+        .arg("--template")
+        .arg("starter")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "would scaffold cybersin starter project",
+        ))
+        .stdout(predicate::str::contains(
+            "inputs/cybersin-starter.input.json",
+        ));
+    assert!(!dry_run_project.exists());
+
+    cybersin()
+        .arg("init")
+        .arg(&project)
+        .arg("--template")
+        .arg("starter")
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skipped: none"));
+    assert_ne!(
+        fs::read_to_string(project.join("prompts/cybersin-starter.prompt.yaml")).unwrap(),
+        "name: existing\n"
+    );
+}
+
+#[test]
 fn init_with_setup_differs_from_plain_init_only_by_setup_phase() {
     let tmp = tempfile::tempdir().unwrap();
     let plain = tmp.path().join("plain");

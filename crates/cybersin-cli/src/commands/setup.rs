@@ -11,9 +11,11 @@ use serde_yaml::{Mapping, Value};
 
 use crate::commands::doctor;
 use crate::project::discover_project_root;
-use crate::readiness::{OPENROUTER_API_KEY_ENV, OPENROUTER_PROVIDER};
+use crate::project::ProjectDefaults;
+use crate::readiness::{OPENROUTER_API_KEY_ENV, OPENROUTER_BASE_URL_ENV, OPENROUTER_PROVIDER};
 
 pub const DEFAULT_OPENROUTER_MODEL: &str = "openai/gpt-4o-mini";
+const SCAFFOLDED_STUB_PROVIDER: &str = "stub";
 
 #[derive(Args, Debug)]
 pub struct SetupArgs {
@@ -53,6 +55,7 @@ pub fn execute(project_start: &Path, args: SetupArgs) -> anyhow::Result<()> {
             "no cybersin.yaml found in this directory or its parents; run `cybersin init .` first"
         );
     };
+    ProjectDefaults::detect(&project_root)?.load_dotenv()?;
 
     let path = project_root.join(LOCAL_CONFIG_FILENAME);
     let mut root = if path.is_file() {
@@ -77,10 +80,22 @@ pub fn execute(project_start: &Path, args: SetupArgs) -> anyhow::Result<()> {
     );
     changed |= set_missing_string(&mut root, &["defaults", "provider"], OPENROUTER_PROVIDER);
     changed |= set_missing_string(&mut root, &["defaults", "model"], &args.model);
+    if let Ok(base_url) = std::env::var(OPENROUTER_BASE_URL_ENV) {
+        changed |= set_missing_string(
+            &mut root,
+            &["providers", OPENROUTER_PROVIDER, "base_url"],
+            &base_url,
+        );
+    }
     changed |= append_unique_string(
         &mut root,
         &["permissions", "routing", "allowed_providers"],
         OPENROUTER_PROVIDER,
+    );
+    changed |= append_unique_string(
+        &mut root,
+        &["permissions", "routing", "allowed_providers"],
+        SCAFFOLDED_STUB_PROVIDER,
     );
 
     if changed || !path.is_file() {
