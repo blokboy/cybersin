@@ -2,7 +2,9 @@
 //! (spec §11), exercised by shelling out to the built binary via
 //! `assert_cmd`, matching this issue's acceptance criteria end-to-end.
 
+use std::collections::BTreeSet;
 use std::fs;
+use std::path::Path;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -34,6 +36,27 @@ sections:
 "#,
     )
     .unwrap();
+}
+
+fn relative_paths(root: &Path) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            paths.insert(rel);
+            if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    paths
 }
 
 #[test]
@@ -101,6 +124,77 @@ fn init_scaffolds_only_the_basic_project_spine() {
             "unexpected scaffolded path {unexpected}"
         );
     }
+}
+
+#[test]
+fn init_with_setup_differs_from_plain_init_only_by_setup_phase() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plain = tmp.path().join("plain");
+    let with_setup = tmp.path().join("with-setup");
+    fs::create_dir_all(&plain).unwrap();
+    fs::create_dir_all(&with_setup).unwrap();
+    fs::write(plain.join(".env"), "OPENROUTER_API_KEY=test-key\n").unwrap();
+    fs::write(with_setup.join(".env"), "OPENROUTER_API_KEY=test-key\n").unwrap();
+
+    cybersin().arg("init").arg(&plain).assert().success();
+    cybersin()
+        .arg("init")
+        .arg(&with_setup)
+        .arg("--setup")
+        .env_remove("OPENROUTER_API_KEY")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scaffolded"))
+        .stdout(predicate::str::contains("Updated"))
+        .stdout(predicate::str::contains("Cybersin doctor"));
+
+    let plain_paths = relative_paths(&plain);
+    let mut setup_paths = relative_paths(&with_setup);
+    assert!(setup_paths.remove("cybersin.local.yaml"));
+    assert_eq!(plain_paths, setup_paths);
+
+    let local = fs::read_to_string(with_setup.join("cybersin.local.yaml")).unwrap();
+    assert!(local.contains("api_key: ${OPENROUTER_API_KEY}"));
+    assert!(local.contains("provider: openrouter"));
+    assert!(!plain.join("cybersin.local.yaml").exists());
+}
+
+#[test]
+fn init_with_setup_honors_init_overwrite_rules_for_existing_directories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("myagent");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join(".env"), "OPENROUTER_API_KEY=test-key\n").unwrap();
+    fs::write(project.join("cybersin.yaml"), "name: existing\n").unwrap();
+
+    cybersin()
+        .arg("init")
+        .arg(&project)
+        .arg("--setup")
+        .env_remove("OPENROUTER_API_KEY")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skipped:"))
+        .stdout(predicate::str::contains("cybersin.yaml"));
+    assert_eq!(
+        fs::read_to_string(project.join("cybersin.yaml")).unwrap(),
+        "name: existing\n"
+    );
+    assert!(project.join("cybersin.local.yaml").exists());
+
+    cybersin()
+        .arg("init")
+        .arg(&project)
+        .arg("--force")
+        .arg("--setup")
+        .env_remove("OPENROUTER_API_KEY")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skipped: none"));
+    assert_ne!(
+        fs::read_to_string(project.join("cybersin.yaml")).unwrap(),
+        "name: existing\n"
+    );
 }
 
 #[test]
