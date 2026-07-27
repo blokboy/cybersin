@@ -38,6 +38,17 @@ sections:
     .unwrap();
 }
 
+fn show_session(db: &Path, session_id: &str) -> serde_json::Value {
+    let output = cybersin()
+        .args(["--db", db.to_str().unwrap(), "sessions", "show", session_id])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).unwrap()
+}
+
 fn relative_paths(root: &Path) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     let mut stack = vec![root.to_path_buf()];
@@ -934,4 +945,51 @@ fn durable_session_cli_lists_shows_notifies_migrates_and_resumes() {
         .assert()
         .success()
         .stdout(predicate::str::contains("resumed durable-1"));
+}
+
+#[test]
+fn run_start_ingests_artifacts_idempotently_and_audits_outcome() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("state.db");
+    let dist = cybersin_runtime::bundled_stub_dist_dir();
+    let config_hash = "stub-manual-0001";
+
+    for session_id in ["ingest-1", "ingest-2"] {
+        cybersin()
+            .args([
+                "--db",
+                db.to_str().unwrap(),
+                "--dist",
+                dist.to_str().unwrap(),
+                "run",
+                "--stub",
+                "--session-id",
+                session_id,
+            ])
+            .assert()
+            .success();
+    }
+
+    let first = show_session(&db, "ingest-1");
+    let second = show_session(&db, "ingest-2");
+    assert_eq!(first["config_hash"], config_hash);
+    assert_eq!(second["config_hash"], config_hash);
+
+    let artifact_event = |session: &serde_json::Value| {
+        session["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["kind"] == "artifact.bundle")
+            .unwrap()
+            .clone()
+    };
+    let first_artifact = artifact_event(&first);
+    let second_artifact = artifact_event(&second);
+
+    assert_eq!(first_artifact["payload"]["config_hash"], config_hash);
+    assert_eq!(first_artifact["payload"]["outcome"], "stored");
+    assert_eq!(second_artifact["payload"]["config_hash"], config_hash);
+    assert_eq!(second_artifact["payload"]["outcome"], "reused");
+    assert!(first_artifact["payload"]["file_count"].as_u64().unwrap() > 1);
 }
