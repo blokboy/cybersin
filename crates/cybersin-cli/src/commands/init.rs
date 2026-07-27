@@ -6,6 +6,8 @@
 use std::fs;
 use std::path::Path;
 
+use clap::ValueEnum;
+
 const CYBERSIN_YAML: &str = r#"# Cybersin project config (spec §5, §6.3 cost model).
 name: myagent
 targets:
@@ -50,10 +52,72 @@ const GITIGNORE: &str = r#"/.cybersin/
 /dist/
 "#;
 
+const STARTER_FRAGMENT: &str = r#"# Starter loop instructions
+
+Write a concise project brief for the requested topic and audience. Return only JSON that matches the requested schema.
+"#;
+
+const STARTER_PROMPT: &str = r#"name: cybersin-starter
+quality: medium
+inputs:
+  topic: string
+  audience: string
+sections:
+  - id: role
+    priority: 100
+    body: |
+      You are the Cybersin starter assistant.
+  - id: instructions
+    priority: 90
+    body: !include ../fragments/cybersin-starter-instructions.md
+  - id: request
+    priority: 80
+    body: |
+      Topic: {{ topic }}
+      Audience: {{ audience }}
+output_contract:
+  type: json_schema
+  schema: |
+    {"type":"object","properties":{"summary":{"type":"string"},"next_steps":{"type":"array","items":{"type":"string"}}},"required":["summary","next_steps"]}
+"#;
+
+const STARTER_EVAL: &str = r#"prompt: cybersin-starter
+cases:
+  - name: starter_brief
+    inputs:
+      topic: durable agent runtimes
+      audience: new Cybersin users
+    assertions:
+      - type: json_valid
+      - type: contains_none
+        values: [panic, traceback]
+    recorded_outputs:
+      - output:
+          summary: Cybersin helps compile prompts and run durable agent sessions.
+          next_steps:
+            - Build the starter prompt.
+            - Run it with the sample inputs.
+runs_per_case: 1
+"#;
+
+const STARTER_INPUT: &str = r#"{
+  "topic": "durable agent runtimes",
+  "audience": "new Cybersin users"
+}
+"#;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum InitTemplate {
+    #[default]
+    Basic,
+    Starter,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InitOptions {
     pub force: bool,
     pub dry_run: bool,
+    pub template: InitTemplate,
 }
 
 enum ScaffoldEntry {
@@ -81,6 +145,17 @@ const SCAFFOLD: &[ScaffoldEntry] = &[
     ScaffoldEntry::Dir("tools"),
 ];
 
+const STARTER_TEMPLATE: &[ScaffoldEntry] = &[
+    ScaffoldEntry::File(
+        "fragments/cybersin-starter-instructions.md",
+        STARTER_FRAGMENT,
+    ),
+    ScaffoldEntry::File("prompts/cybersin-starter.prompt.yaml", STARTER_PROMPT),
+    ScaffoldEntry::File("evals/cybersin-starter.eval.yaml", STARTER_EVAL),
+    ScaffoldEntry::Dir("inputs"),
+    ScaffoldEntry::File("inputs/cybersin-starter.input.json", STARTER_INPUT),
+];
+
 #[cfg(test)]
 pub fn run(dir: &Path) -> Result<Option<String>, String> {
     run_with_options(dir, InitOptions::default())
@@ -90,7 +165,7 @@ pub fn run_with_options(dir: &Path, options: InitOptions) -> Result<Option<Strin
     let mut created = Vec::new();
     let mut skipped = Vec::new();
 
-    for entry in SCAFFOLD {
+    for entry in scaffold_for(options.template) {
         let rel = entry.rel();
         let path = dir.join(rel);
         let exists = path.exists();
@@ -126,7 +201,11 @@ pub fn run_with_options(dir: &Path, options: InitOptions) -> Result<Option<Strin
     } else {
         "scaffolded"
     };
-    let mut message = format!("{verb} cybersin project spine at {}", dir.display());
+    let template_label = match options.template {
+        InitTemplate::Basic => "project spine",
+        InitTemplate::Starter => "starter project",
+    };
+    let mut message = format!("{verb} cybersin {template_label} at {}", dir.display());
     message.push_str("\ncreated:");
     if created.is_empty() {
         message.push_str(" none");
@@ -144,4 +223,12 @@ pub fn run_with_options(dir: &Path, options: InitOptions) -> Result<Option<Strin
         }
     }
     Ok(Some(message))
+}
+
+fn scaffold_for(template: InitTemplate) -> Vec<&'static ScaffoldEntry> {
+    let mut entries = SCAFFOLD.iter().collect::<Vec<_>>();
+    if template == InitTemplate::Starter {
+        entries.extend(STARTER_TEMPLATE.iter());
+    }
+    entries
 }
