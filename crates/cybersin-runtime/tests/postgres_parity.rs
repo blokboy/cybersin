@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use cybersin_runtime::stub_agent::run_stub_session;
-use cybersin_runtime::{DistFixture, PgStorage, SqliteStorage, Storage};
+use cybersin_runtime::{
+    DistArtifactBundle, DistArtifactFile, DistFixture, PgStorage, SqliteStorage, Storage,
+};
 use cybersin_trace::SpanStore;
 use serde_json::json;
 
@@ -64,6 +66,17 @@ async fn exercise(storage: &dyn Storage, suffix: &str) -> ParityResult {
         .await
         .unwrap()
         .is_none());
+    storage
+        .ingest_artifact_bundle(&DistArtifactBundle {
+            config_hash: "config-v2".to_string(),
+            files: vec![DistArtifactFile {
+                path: "manifest.json".to_string(),
+                sha256: "parity".to_string(),
+                bytes: b"parity".to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
     storage
         .migrate_session(&session, "config-v2")
         .await

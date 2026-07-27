@@ -29,8 +29,8 @@ use cybersin_adapter::transport::stdio::in_memory_pair;
 use cybersin_adapter::transport::stdio::StdioDaemonChannel;
 use cybersin_router::{ModelKind, RouteDecision};
 use cybersin_runtime::{
-    stub_agent, DaemonHandle, DistFixture, LocalConfigFile, ModelAllowlist, OpenRouterModelCaller,
-    RuntimeSessionSummary,
+    stub_agent, ArtifactIngestOutcome, DaemonHandle, DistFixture, LocalConfigFile, ModelAllowlist,
+    OpenRouterModelCaller, RuntimeSessionSummary, Storage,
 };
 use tokio::process::{Child, Command};
 
@@ -284,6 +284,7 @@ async fn run_stub(
         "running stub agent: session={session_id} agent={agent_name} dist={}",
         dist_dir.display()
     );
+    ingest_dist_for_session(daemon.storage().as_ref(), &dist_dir, &session_id).await?;
 
     stub_agent::run_stub_session(
         daemon.storage(),
@@ -350,6 +351,7 @@ async fn run_live(
     let session_id = args
         .session_id
         .unwrap_or_else(|| format!("sess-{}", now_unix_ms()));
+    ingest_dist_for_session(daemon.storage().as_ref(), &dist_dir, &session_id).await?;
 
     println!(
         "spawning harness: session={session_id} agent={agent_name} command={:?} (adapter={})",
@@ -494,6 +496,7 @@ async fn run_builtin_starter(
     let session_id = args
         .session_id
         .unwrap_or_else(|| format!("sess-{}", now_unix_ms()));
+    ingest_dist_for_session(daemon.storage().as_ref(), &dist_dir, &session_id).await?;
 
     println!(
         "running built-in starter harness: session={session_id} agent={agent_name} prompt={prompt_name}"
@@ -517,6 +520,34 @@ async fn run_builtin_starter(
     let starter_fut = run_starter_harness(harness_io, session_id, prompt_name, inputs);
     let (summary, ()) = tokio::try_join!(daemon_fut, starter_fut)?;
     Ok(summary)
+}
+
+async fn ingest_dist_for_session(
+    storage: &dyn Storage,
+    dist_dir: &Path,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let bundle = DistFixture::load_artifact_bundle(dist_dir)
+        .with_context(|| format!("loading artifact bundle from {}", dist_dir.display()))?;
+    let config_hash = bundle.config_hash.clone();
+    let file_count = bundle.files.len();
+    let outcome = storage.ingest_artifact_bundle(&bundle).await?;
+    let outcome_text = match outcome {
+        ArtifactIngestOutcome::Stored => "stored",
+        ArtifactIngestOutcome::Reused => "reused",
+    };
+    storage
+        .append_event(
+            session_id,
+            "artifact.bundle",
+            serde_json::json!({
+                "config_hash": config_hash,
+                "outcome": outcome_text,
+                "file_count": file_count,
+            }),
+        )
+        .await?;
+    Ok(())
 }
 
 fn retarget_scaffolded_stub_routes(dist: &mut DistFixture, config: Option<&LocalConfigFile>) {

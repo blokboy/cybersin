@@ -10,11 +10,20 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
 use sqlx::{Row, SqlitePool};
 
+use crate::dist::DistArtifactBundle;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error("io error at {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("sqlite error: {0}")]
     Sqlx(#[from] sqlx::Error),
     #[error("(de)serialization error: {0}")]
@@ -26,6 +35,21 @@ pub enum StorageError {
         expected: String,
         actual: String,
     },
+    #[error("artifact bundle for config_hash {0:?} is not stored; run a build/run that ingests it first")]
+    ArtifactBundleMissing(String),
+    #[error("artifact bundle for config_hash {config_hash:?} has no stored files")]
+    ArtifactBundleEmpty { config_hash: String },
+    #[error("stored artifact {path} for config_hash {config_hash:?} hash mismatch: stored {expected}, actual {actual}")]
+    ArtifactHashMismatch {
+        config_hash: String,
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("stored artifact path is not a safe relative file path: {0}")]
+    UnsafeArtifactPath(String),
+    #[error("materialize target is not empty: {0}")]
+    MaterializeTargetNotEmpty(String),
 }
 
 pub(crate) fn json_type(value: &Value) -> &'static str {
@@ -50,6 +74,76 @@ fn row_to_state(row: SqliteRow) -> Result<StateRecord> {
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+pub async fn materialize_artifact_bundle(
+    storage: &dyn Storage,
+    config_hash: &str,
+    target_dir: &std::path::Path,
+) -> Result<usize> {
+    let files = storage.load_artifact_bundle(config_hash).await?;
+    if files.is_empty() {
+        return Err(StorageError::ArtifactBundleEmpty {
+            config_hash: config_hash.to_string(),
+        });
+    }
+    if target_dir.exists() {
+        let mut entries = std::fs::read_dir(target_dir).map_err(|source| StorageError::Io {
+            path: target_dir.display().to_string(),
+            source,
+        })?;
+        if entries.next().is_some() {
+            return Err(StorageError::MaterializeTargetNotEmpty(
+                target_dir.display().to_string(),
+            ));
+        }
+    }
+    std::fs::create_dir_all(target_dir).map_err(|source| StorageError::Io {
+        path: target_dir.display().to_string(),
+        source,
+    })?;
+    for file in &files {
+        if hex_sha256(&file.bytes) != file.sha256 {
+            return Err(StorageError::ArtifactHashMismatch {
+                config_hash: config_hash.to_string(),
+                path: file.path.clone(),
+                expected: file.sha256.clone(),
+                actual: hex_sha256(&file.bytes),
+            });
+        }
+        let relative = safe_artifact_path(&file.path)?;
+        let destination = target_dir.join(relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| StorageError::Io {
+                path: parent.display().to_string(),
+                source,
+            })?;
+        }
+        std::fs::write(&destination, &file.bytes).map_err(|source| StorageError::Io {
+            path: destination.display().to_string(),
+            source,
+        })?;
+    }
+    Ok(files.len())
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn safe_artifact_path(relative: &str) -> Result<&std::path::Path> {
+    let path = std::path::Path::new(relative);
+    if path.is_absolute()
+        || relative.is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(StorageError::UnsafeArtifactPath(relative.to_string()));
+    }
+    Ok(path)
+}
 
 /// One row of the `sessions` table: a session's identity and current
 /// status. Sessions pin `agent_hash`/build hash in the real spec (§8.1);
@@ -159,6 +253,20 @@ pub struct ToolCallRecord {
     pub updated_unix_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactFileRecord {
+    pub config_hash: String,
+    pub path: String,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArtifactIngestOutcome {
+    Stored,
+    Reused,
+}
+
 /// Storage trait boundary (spec §8), implemented by SQLite for local
 /// development and Postgres for server mode.
 #[async_trait]
@@ -217,6 +325,12 @@ pub trait Storage: Send + Sync {
     async fn enqueue_signal(&self, session_id: &str, signal: &str, payload: &Value) -> Result<()>;
     async fn take_signal(&self, session_id: &str, signal: &str) -> Result<Option<Value>>;
     async fn migrate_session(&self, session_id: &str, config_hash: &str) -> Result<()>;
+    async fn ingest_artifact_bundle(
+        &self,
+        bundle: &DistArtifactBundle,
+    ) -> Result<ArtifactIngestOutcome>;
+    async fn has_artifact_bundle(&self, config_hash: &str) -> Result<bool>;
+    async fn load_artifact_bundle(&self, config_hash: &str) -> Result<Vec<ArtifactFileRecord>>;
 
     /// Admit `(tool, idem_key)` into the ledger as a fresh `pending` row —
     /// or, if that pair is already there, return the existing row instead
@@ -402,6 +516,21 @@ impl SqliteStorage {
         // the actual race-arbiter, not the single-connection pool (a
         // future multi-connection Postgres impl, issue #24, must keep
         // relying on this same constraint).
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS artifact_files (
+                config_hash TEXT NOT NULL,
+                path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                bytes BLOB NOT NULL,
+                created_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY (config_hash, path)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS tool_calls (
@@ -809,6 +938,9 @@ impl Storage for SqliteStorage {
     }
 
     async fn migrate_session(&self, session_id: &str, config_hash: &str) -> Result<()> {
+        if !self.has_artifact_bundle(config_hash).await? {
+            return Err(StorageError::ArtifactBundleMissing(config_hash.to_string()));
+        }
         sqlx::query("UPDATE sessions SET config_hash = ? WHERE session_id = ?")
             .bind(config_hash)
             .bind(session_id)
@@ -821,6 +953,70 @@ impl Storage for SqliteStorage {
         )
         .await?;
         Ok(())
+    }
+
+    async fn ingest_artifact_bundle(
+        &self,
+        bundle: &DistArtifactBundle,
+    ) -> Result<ArtifactIngestOutcome> {
+        if self.has_artifact_bundle(&bundle.config_hash).await? {
+            return Ok(ArtifactIngestOutcome::Reused);
+        }
+        let mut tx = self.pool.begin().await?;
+        let now = now_unix_ms();
+        let mut inserted = 0u64;
+        for file in &bundle.files {
+            inserted += sqlx::query(
+                "INSERT INTO artifact_files (config_hash, path, sha256, bytes, created_unix_ms)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(config_hash, path) DO NOTHING",
+            )
+            .bind(&bundle.config_hash)
+            .bind(&file.path)
+            .bind(&file.sha256)
+            .bind(&file.bytes)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        tx.commit().await?;
+        Ok(if inserted == 0 {
+            ArtifactIngestOutcome::Reused
+        } else {
+            ArtifactIngestOutcome::Stored
+        })
+    }
+
+    async fn has_artifact_bundle(&self, config_hash: &str) -> Result<bool> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifact_files WHERE config_hash = ?")
+                .bind(config_hash)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count > 0)
+    }
+
+    async fn load_artifact_bundle(&self, config_hash: &str) -> Result<Vec<ArtifactFileRecord>> {
+        let rows = sqlx::query(
+            "SELECT config_hash, path, sha256, bytes FROM artifact_files
+             WHERE config_hash = ? ORDER BY path",
+        )
+        .bind(config_hash)
+        .fetch_all(&self.pool)
+        .await?;
+        if rows.is_empty() {
+            return Err(StorageError::ArtifactBundleMissing(config_hash.to_string()));
+        }
+        Ok(rows
+            .into_iter()
+            .map(|row| ArtifactFileRecord {
+                config_hash: row.get("config_hash"),
+                path: row.get("path"),
+                sha256: row.get("sha256"),
+                bytes: row.get("bytes"),
+            })
+            .collect())
     }
 
     async fn begin_tool_call(
@@ -1007,6 +1203,7 @@ pub(crate) fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dist::{DistArtifactBundle, DistArtifactFile};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -1106,6 +1303,69 @@ mod tests {
         storage.create_session("sess-2", "agent-b").await.unwrap();
         let sessions = storage.list_sessions().await.unwrap();
         assert_eq!(sessions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn artifact_bundle_ingest_is_idempotent_and_materializes_bytes() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let bytes = br#"{"build_hash":"hash-1"}"#.to_vec();
+        let bundle = DistArtifactBundle {
+            config_hash: "hash-1".to_string(),
+            files: vec![DistArtifactFile {
+                path: "manifest.json".to_string(),
+                sha256: hex_sha256(&bytes),
+                bytes: bytes.clone(),
+            }],
+        };
+        assert_eq!(
+            storage.ingest_artifact_bundle(&bundle).await.unwrap(),
+            ArtifactIngestOutcome::Stored
+        );
+        assert_eq!(
+            storage.ingest_artifact_bundle(&bundle).await.unwrap(),
+            ArtifactIngestOutcome::Reused
+        );
+        assert!(storage.has_artifact_bundle("hash-1").await.unwrap());
+
+        let out = tempfile::tempdir().unwrap();
+        let count = materialize_artifact_bundle(&storage, "hash-1", out.path())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            std::fs::read(out.path().join("manifest.json")).unwrap(),
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_session_requires_stored_target_hash() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        storage
+            .create_session_pinned("s", "a", "hash-1")
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage.migrate_session("s", "hash-2").await,
+            Err(StorageError::ArtifactBundleMissing(hash)) if hash == "hash-2"
+        ));
+        let bytes = b"stored".to_vec();
+        storage
+            .ingest_artifact_bundle(&DistArtifactBundle {
+                config_hash: "hash-2".to_string(),
+                files: vec![DistArtifactFile {
+                    path: "manifest.json".to_string(),
+                    sha256: hex_sha256(&bytes),
+                    bytes,
+                }],
+            })
+            .await
+            .unwrap();
+        storage.migrate_session("s", "hash-2").await.unwrap();
+        assert_eq!(
+            storage.get_session("s").await.unwrap().unwrap().config_hash,
+            "hash-2"
+        );
     }
 
     #[tokio::test]

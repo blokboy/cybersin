@@ -19,6 +19,7 @@ use cybersin_router::{
 };
 use cybersin_sandbox::{ResourceLimits, SandboxScope};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::route_executor::CacheArtifact;
 
@@ -40,6 +41,14 @@ pub enum DistError {
     MissingRouting(String),
     #[error("dist fixture has no prompt named {0:?}")]
     MissingPrompt(String),
+    #[error("dist manifest artifact path is not a safe relative file path: {0}")]
+    UnsafeArtifactPath(String),
+    #[error("dist artifact {path} hash mismatch: manifest has {expected}, actual {actual}")]
+    ArtifactHashMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 /// `dist/manifest.json` (spec §6.6): build hash, git SHA, lockfile hash,
@@ -51,6 +60,21 @@ pub enum DistError {
 pub struct DistManifest {
     pub build_hash: String,
     pub git_sha: String,
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistArtifactFile {
+    pub path: String,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DistArtifactBundle {
+    pub config_hash: String,
+    pub files: Vec<DistArtifactFile>,
 }
 
 /// Minimal per-prompt routing/pricing info the stub agent needs to price
@@ -314,6 +338,64 @@ impl DistFixture {
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
+
+    /// Read the exact compiled artifact bytes under `dist/`, verifying
+    /// every manifest-listed file before handing bytes to the runtime
+    /// artifact store. Legacy hand-written fixtures that predate the
+    /// `artifacts` manifest map are still accepted by hashing the whole
+    /// tree; real compiler output takes the manifest-verified path.
+    pub fn load_artifact_bundle(dir: impl AsRef<Path>) -> Result<DistArtifactBundle, DistError> {
+        let dir = dir.as_ref();
+        let manifest_path = dir.join("manifest.json");
+        let manifest_bytes = read_bytes(&manifest_path)?;
+        let manifest: DistManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|source| DistError::Json {
+                path: manifest_path.display().to_string(),
+                source,
+            })?;
+
+        let mut files = Vec::new();
+        if manifest.artifacts.is_empty() {
+            for path in files_in_tree(dir)? {
+                let relative = relative_artifact_path(dir, &path)?;
+                let bytes = read_bytes(&path)?;
+                files.push(DistArtifactFile {
+                    path: relative,
+                    sha256: hex_sha256(&bytes),
+                    bytes,
+                });
+            }
+        } else {
+            files.push(DistArtifactFile {
+                path: "manifest.json".to_string(),
+                sha256: hex_sha256(&manifest_bytes),
+                bytes: manifest_bytes,
+            });
+            for (relative, expected) in &manifest.artifacts {
+                validate_artifact_path(relative)?;
+                let path = dir.join(relative);
+                let bytes = read_bytes(&path)?;
+                let actual = hex_sha256(&bytes);
+                if actual != *expected {
+                    return Err(DistError::ArtifactHashMismatch {
+                        path: relative.clone(),
+                        expected: expected.clone(),
+                        actual,
+                    });
+                }
+                files.push(DistArtifactFile {
+                    path: relative.clone(),
+                    sha256: expected.clone(),
+                    bytes,
+                });
+            }
+        }
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(DistArtifactBundle {
+            config_hash: manifest.build_hash,
+            files,
+        })
+    }
 }
 
 /// The runtime originally bootstrapped against a hand-written
@@ -514,6 +596,62 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, DistError> 
     })
 }
 
+fn read_bytes(path: &Path) -> Result<Vec<u8>, DistError> {
+    std::fs::read(path).map_err(|source| DistError::Io {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn files_in_tree(dir: &Path) -> Result<Vec<PathBuf>, DistError> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|source| DistError::Io {
+        path: dir.display().to_string(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| DistError::Io {
+            path: dir.display().to_string(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(files_in_tree(&path)?);
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+fn relative_artifact_path(base: &Path, path: &Path) -> Result<String, DistError> {
+    let relative = path
+        .strip_prefix(base)
+        .map_err(|_| DistError::UnsafeArtifactPath(path.display().to_string()))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    validate_artifact_path(&relative)?;
+    Ok(relative)
+}
+
+fn validate_artifact_path(relative: &str) -> Result<(), DistError> {
+    let path = Path::new(relative);
+    if path.is_absolute()
+        || relative.is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(DistError::UnsafeArtifactPath(relative.to_string()));
+    }
+    Ok(())
+}
+
 fn json_files_in(dir: &Path) -> Result<Vec<PathBuf>, DistError> {
     let entries = std::fs::read_dir(dir).map_err(|e| DistError::Io {
         path: dir.display().to_string(),
@@ -629,5 +767,45 @@ mod tests {
         assert_eq!(citation.sandbox_scope().unwrap(), SandboxScope::Call);
         assert!(citation.egress.is_empty());
         assert_eq!(citation.resource_limits().wall_clock.as_secs(), 120);
+    }
+
+    #[test]
+    fn artifact_bundle_verifies_manifest_hashes() {
+        let dist_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/ic1-research-team/dist");
+        let bundle = DistFixture::load_artifact_bundle(&dist_dir).unwrap();
+        assert_eq!(
+            bundle.config_hash,
+            "893bfdc4886941392b82080df379ade4bfff78e38ecd33adcf900f54bbc7da14"
+        );
+        assert!(bundle.files.iter().any(|file| file.path == "manifest.json"));
+        assert!(bundle
+            .files
+            .iter()
+            .any(|file| file.path == "tools/citation_lookup.py"));
+    }
+
+    #[test]
+    fn artifact_bundle_rejects_corrupt_manifest_listed_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path();
+        std::fs::write(dist.join("routing.json"), "{}").unwrap();
+        std::fs::write(
+            dist.join("manifest.json"),
+            serde_json::json!({
+                "build_hash": "hash",
+                "git_sha": "git",
+                "artifacts": {
+                    "routing.json": "not-the-real-hash"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            DistFixture::load_artifact_bundle(dist),
+            Err(DistError::ArtifactHashMismatch { path, .. }) if path == "routing.json"
+        ));
     }
 }

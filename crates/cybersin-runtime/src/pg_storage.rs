@@ -5,9 +5,11 @@ use serde_json::Value;
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 
+use crate::dist::DistArtifactBundle;
 use crate::storage::{
-    json_type, now_unix_ms, CasOutcome, CheckpointRecord, EventRecord, Result, SessionRecord,
-    StateRecord, Storage, StorageError, ToolCallRecord,
+    json_type, now_unix_ms, ArtifactFileRecord, ArtifactIngestOutcome, CasOutcome,
+    CheckpointRecord, EventRecord, Result, SessionRecord, StateRecord, Storage, StorageError,
+    ToolCallRecord,
 };
 
 /// Multi-connection Postgres storage used by server-mode workers.
@@ -150,6 +152,18 @@ impl PgStorage {
                 created_unix_ms BIGINT NOT NULL,
                 updated_unix_ms BIGINT NOT NULL,
                 UNIQUE (tool, idem_key)
+            )",
+        )
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS artifact_files (
+                config_hash TEXT NOT NULL,
+                path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                bytes BYTEA NOT NULL,
+                created_unix_ms BIGINT NOT NULL,
+                PRIMARY KEY (config_hash, path)
             )",
         )
         .execute(&mut *conn)
@@ -559,6 +573,9 @@ impl Storage for PgStorage {
     }
 
     async fn migrate_session(&self, session_id: &str, config_hash: &str) -> Result<()> {
+        if !self.has_artifact_bundle(config_hash).await? {
+            return Err(StorageError::ArtifactBundleMissing(config_hash.to_string()));
+        }
         sqlx::query("UPDATE sessions SET config_hash = $1 WHERE session_id = $2")
             .bind(config_hash)
             .bind(session_id)
@@ -571,6 +588,70 @@ impl Storage for PgStorage {
         )
         .await?;
         Ok(())
+    }
+
+    async fn ingest_artifact_bundle(
+        &self,
+        bundle: &DistArtifactBundle,
+    ) -> Result<ArtifactIngestOutcome> {
+        if self.has_artifact_bundle(&bundle.config_hash).await? {
+            return Ok(ArtifactIngestOutcome::Reused);
+        }
+        let mut tx = self.pool.begin().await?;
+        let now = now_unix_ms();
+        let mut inserted = 0u64;
+        for file in &bundle.files {
+            inserted += sqlx::query(
+                "INSERT INTO artifact_files (config_hash, path, sha256, bytes, created_unix_ms)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (config_hash, path) DO NOTHING",
+            )
+            .bind(&bundle.config_hash)
+            .bind(&file.path)
+            .bind(&file.sha256)
+            .bind(&file.bytes)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        tx.commit().await?;
+        Ok(if inserted == 0 {
+            ArtifactIngestOutcome::Reused
+        } else {
+            ArtifactIngestOutcome::Stored
+        })
+    }
+
+    async fn has_artifact_bundle(&self, config_hash: &str) -> Result<bool> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM artifact_files WHERE config_hash = $1")
+                .bind(config_hash)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count > 0)
+    }
+
+    async fn load_artifact_bundle(&self, config_hash: &str) -> Result<Vec<ArtifactFileRecord>> {
+        let rows = sqlx::query(
+            "SELECT config_hash, path, sha256, bytes FROM artifact_files
+             WHERE config_hash = $1 ORDER BY path",
+        )
+        .bind(config_hash)
+        .fetch_all(&self.pool)
+        .await?;
+        if rows.is_empty() {
+            return Err(StorageError::ArtifactBundleMissing(config_hash.to_string()));
+        }
+        Ok(rows
+            .into_iter()
+            .map(|row| ArtifactFileRecord {
+                config_hash: row.get("config_hash"),
+                path: row.get("path"),
+                sha256: row.get("sha256"),
+                bytes: row.get("bytes"),
+            })
+            .collect())
     }
 
     async fn begin_tool_call(

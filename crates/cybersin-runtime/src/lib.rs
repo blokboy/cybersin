@@ -45,7 +45,8 @@ pub use allowlist::{
 pub use budget::{BudgetConfig, OnBreach};
 pub use daemon::{serve_server, DaemonHandle, ServerConfig};
 pub use dist::{
-    bundled_stub_dist_dir, DistError, DistFixture, DistManifest, RoutingEntry, ToolPolicy,
+    bundled_stub_dist_dir, DistArtifactBundle, DistArtifactFile, DistError, DistFixture,
+    DistManifest, RoutingEntry, ToolPolicy,
 };
 pub use error::RuntimeError;
 pub use live_model_caller::{MissingApiKey, OpenRouterModelCaller};
@@ -62,7 +63,8 @@ pub use route_executor::{
 pub use sandbox_executor::RuntimeSandbox;
 pub use session::{estimate_tokens, RuntimeDaemon, RuntimeSessionSummary};
 pub use storage::{
-    CasOutcome, CheckpointRecord, EventRecord, SessionRecord, SqliteStorage, StateRecord, Storage,
+    materialize_artifact_bundle, ArtifactFileRecord, ArtifactIngestOutcome, CasOutcome,
+    CheckpointRecord, EventRecord, SessionRecord, SqliteStorage, StateRecord, Storage,
     StorageError, ToolCallRecord,
 };
 pub use supervisor::SessionSupervisor;

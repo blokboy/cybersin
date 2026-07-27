@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::Subcommand;
-use cybersin_runtime::{DaemonHandle, SessionSupervisor};
+use cybersin_runtime::{materialize_artifact_bundle, DaemonHandle, SessionSupervisor};
 
 #[derive(Debug, Subcommand)]
 pub enum SessionsCommand {
@@ -21,6 +21,14 @@ pub enum SessionsCommand {
         session: String,
         #[arg(long)]
         config_hash: String,
+    },
+    Materialize {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        config_hash: Option<String>,
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -74,6 +82,31 @@ pub async fn execute(db: PathBuf, command: SessionsCommand) -> anyhow::Result<()
         } => {
             storage.migrate_session(&session, &config_hash).await?;
             println!("migrated {session} to {config_hash}");
+        }
+        SessionsCommand::Materialize {
+            session,
+            config_hash,
+            out,
+        } => {
+            let config_hash = match (session, config_hash) {
+                (Some(session), None) => {
+                    storage
+                        .get_session(&session)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("session {session:?} not found"))?
+                        .config_hash
+                }
+                (None, Some(config_hash)) => config_hash,
+                (Some(_), Some(_)) => {
+                    anyhow::bail!("pass either --session or --config-hash, not both")
+                }
+                (None, None) => anyhow::bail!("pass --session or --config-hash"),
+            };
+            let count = materialize_artifact_bundle(storage.as_ref(), &config_hash, &out).await?;
+            println!(
+                "materialized {count} files for {config_hash} to {}",
+                out.display()
+            );
         }
     }
     Ok(())
