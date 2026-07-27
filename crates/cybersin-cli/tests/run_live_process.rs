@@ -7,6 +7,9 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use serde_json::json;
+use wiremock::matchers::{body_partial_json, header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn cybersin() -> Command {
     Command::cargo_bin("cybersin").expect("find cybersin binary")
@@ -189,6 +192,124 @@ fn run_without_an_agent_path_infers_the_single_runnable_target() {
         .assert()
         .success()
         .stdout(predicate::str::contains("completed"));
+}
+
+#[tokio::test]
+async fn convert_build_run_uses_builtin_starter_without_external_harness() {
+    let convert_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key"))
+        .and(body_partial_json(json!({"model": "test-converter"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"name\":\"starter-draft\",\"quality\":\"medium\",\"sections\":[{\"id\":\"prompt\",\"priority\":100,\"body\":\"Summarize the starter harness path.\"}],\"output_contract\":{\"type\":\"json_schema\",\"schema\":\"{\\\"type\\\":\\\"object\\\",\\\"properties\\\":{\\\"summary\\\":{\\\"type\\\":\\\"string\\\"}},\\\"required\\\":[\\\"summary\\\"]}\"}}"
+                }
+            }]
+        })))
+        .mount(&convert_server)
+        .await;
+    let run_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"summary\":\"starter completed\", \"__cascade_confidence\": 0.99}"
+                }
+            }]
+        })))
+        .mount(&run_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let db = project.join(".cybersin/cybersin.db");
+
+    cybersin().arg("init").arg(&project).assert().success();
+
+    cybersin()
+        .current_dir(&project)
+        .env("OPENROUTER_API_KEY", "test-key")
+        .env("OPENROUTER_BASE_URL", convert_server.uri())
+        .arg("convert")
+        .arg("--model")
+        .arg("test-converter")
+        .arg("Create a starter harness smoke prompt.")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("self-validation passed"));
+
+    assert!(project.join("prompts/starter-draft.prompt.yaml").is_file());
+    assert!(
+        !project
+            .join("agents")
+            .join("starter-draft.agent.yaml")
+            .exists(),
+        "convert/build/run starter path should not require a user-authored harness file"
+    );
+
+    cybersin()
+        .current_dir(&project)
+        .arg("build")
+        .assert()
+        .success();
+
+    std::fs::write(
+        project.join("cybersin.local.yaml"),
+        format!(
+            "providers:\n  openrouter:\n    api_key: ${{OPENROUTER_API_KEY}}\n    base_url: {}\n",
+            run_server.uri()
+        ),
+    )
+    .unwrap();
+
+    cybersin()
+        .current_dir(&project)
+        .env("OPENROUTER_API_KEY", "test-key")
+        .arg("run")
+        .arg("--session-id")
+        .arg("sess-starter")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("built-in starter harness"))
+        .stdout(predicate::str::contains("sess-starter completed"))
+        .stdout(predicate::str::contains("spans recorded"));
+
+    cybersin()
+        .current_dir(&project)
+        .arg("sessions")
+        .arg("ls")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sess-starter"))
+        .stdout(predicate::str::contains("completed"))
+        .stdout(predicate::str::contains("starter-draft-starter"));
+
+    cybersin()
+        .current_dir(&project)
+        .arg("trace")
+        .arg("ls")
+        .arg("--session")
+        .arg("sess-starter")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("llm_call"))
+        .stdout(predicate::str::contains("stub-medium"));
+
+    cybersin()
+        .current_dir(&project)
+        .arg("cost")
+        .arg("--by")
+        .arg("session")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sess-starter"))
+        .stdout(predicate::str::contains("TOTAL"));
+
+    assert!(db.is_file(), "runtime session should create the normal db");
 }
 
 #[test]

@@ -20,7 +20,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use clap::Args;
 use cybersin_adapter::channel::DaemonChannel;
+use cybersin_adapter::messages::CallOutcome;
+use cybersin_adapter::stub_harness::{CallOutcomeOrPark, StubHarness};
 use cybersin_adapter::transport::grpc;
+use cybersin_adapter::transport::stdio::in_memory_pair;
 use cybersin_adapter::transport::stdio::StdioDaemonChannel;
 use cybersin_runtime::{
     stub_agent, DaemonHandle, DistFixture, LocalConfigFile, ModelAllowlist, OpenRouterModelCaller,
@@ -40,6 +43,11 @@ use crate::tool_executor::{self, GatewayToolCaller};
 /// codebase's existing `CYBERSIN_CONTAINER_RUNTIME`-style scope
 /// discipline for knobs nothing has asked to configure yet).
 const GRPC_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+enum RunTarget {
+    Agent(PathBuf),
+    BuiltInStarter { prompt_name: String },
+}
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
@@ -93,42 +101,97 @@ pub async fn run_session(
     match (args.stub, args.agent_yaml.clone()) {
         (true, _) => run_stub(db_path, dist_dir, args).await,
         (false, explicit_agent_yaml) => {
-            let agent_yaml = match explicit_agent_yaml {
-                Some(agent_yaml) => agent_yaml,
-                None => infer_agent_yaml(&dist_dir)?,
+            let target = match explicit_agent_yaml {
+                Some(agent_yaml) => RunTarget::Agent(agent_yaml),
+                None => infer_run_target(&dist_dir)?,
             };
-            run_live(
-                db_path,
-                dist_dir,
-                sandbox_root,
-                sandbox_backend,
-                agent_yaml,
-                args,
-            )
-            .await
+            match target {
+                RunTarget::Agent(agent_yaml) => {
+                    run_live(
+                        db_path,
+                        dist_dir,
+                        sandbox_root,
+                        sandbox_backend,
+                        agent_yaml,
+                        args,
+                    )
+                    .await
+                }
+                RunTarget::BuiltInStarter { prompt_name } => {
+                    run_builtin_starter(
+                        db_path,
+                        dist_dir,
+                        sandbox_root,
+                        sandbox_backend,
+                        prompt_name,
+                        args,
+                    )
+                    .await
+                }
+            }
         }
     }
 }
 
+#[cfg(test)]
 fn infer_agent_yaml(dist_dir: &Path) -> anyhow::Result<PathBuf> {
+    match infer_run_target(dist_dir)? {
+        RunTarget::Agent(agent_yaml) => Ok(agent_yaml),
+        RunTarget::BuiltInStarter { .. } => anyhow::bail!(
+            "no runnable agent targets found in {}; create an agents/*.agent.yaml file or run `cybersin run <agent.yaml>` explicitly",
+            project_dir_from_dist(dist_dir).join("agents").display()
+        ),
+    }
+}
+
+fn infer_run_target(dist_dir: &Path) -> anyhow::Result<RunTarget> {
     let project_dir = project_dir_from_dist(dist_dir);
     let candidates = runnable_agent_targets(project_dir)?;
     match candidates.as_slice() {
-        [] => anyhow::bail!(
-            "no runnable agent targets found in {}; create an agents/*.agent.yaml file or run `cybersin run <agent.yaml>` explicitly",
-            project_dir.join("agents").display()
-        ),
-        [single] => Ok(single.clone()),
+        [] => infer_builtin_starter_target(project_dir, dist_dir),
+        [single] => Ok(RunTarget::Agent(single.clone())),
         multiple => {
             let choices = multiple
                 .iter()
-                .map(|path| format!("  - cybersin run {}", display_project_path(project_dir, path)))
+                .map(|path| {
+                    format!(
+                        "  - cybersin run {}",
+                        display_project_path(project_dir, path)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             anyhow::bail!(
                 "multiple runnable agent targets found; choose one explicitly:\n{choices}"
             )
         }
+    }
+}
+
+fn infer_builtin_starter_target(project_dir: &Path, dist_dir: &Path) -> anyhow::Result<RunTarget> {
+    let no_agent_message = || {
+        anyhow::anyhow!(
+            "no runnable agent targets found in {}; create an agents/*.agent.yaml file or run `cybersin run <agent.yaml>` explicitly",
+            project_dir.join("agents").display()
+        )
+    };
+    if !project_dir.join("cybersin.yaml").is_file() {
+        return Err(no_agent_message());
+    }
+
+    let dist = DistFixture::load_dir(dist_dir)
+        .with_context(|| format!("loading built dist from {}", dist_dir.display()))?;
+    match dist.prompts.keys().cloned().collect::<Vec<_>>().as_slice() {
+        [prompt_name] => Ok(RunTarget::BuiltInStarter {
+            prompt_name: prompt_name.clone(),
+        }),
+        [] => Err(no_agent_message()),
+        prompts => anyhow::bail!(
+            "no runnable agent targets found and built-in starter requires exactly one compiled prompt; found {} prompts in {}: {}",
+            prompts.len(),
+            dist_dir.join("prompts").display(),
+            prompts.join(", ")
+        ),
     }
 }
 
@@ -288,7 +351,7 @@ async fn run_live(
     // clean-exit `child.wait()` win (below) needs to keep polling this
     // exact future afterward, which `runtime_daemon.run()` a second time
     // couldn't do (`runtime_daemon` is moved into it the first time).
-    let daemon_fut = runtime_daemon.run();
+    let daemon_fut = async move { runtime_daemon.run().await.map_err(anyhow::Error::from) };
     tokio::pin!(daemon_fut);
 
     let summary = tokio::select! {
@@ -336,6 +399,123 @@ async fn run_live(
     };
 
     Ok(summary)
+}
+
+async fn run_builtin_starter(
+    db_path: PathBuf,
+    dist_dir: PathBuf,
+    sandbox_root: PathBuf,
+    sandbox_backend: crate::commands::sandbox::Backend,
+    prompt_name: String,
+    args: RunArgs,
+) -> anyhow::Result<RuntimeSessionSummary> {
+    let dist = Arc::new(DistFixture::load_dir(&dist_dir)?);
+    let agent_name = args
+        .agent
+        .clone()
+        .unwrap_or_else(|| format!("{prompt_name}-starter"));
+    let inputs = match &args.input {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
+        }
+        None => serde_json::json!({}),
+    };
+
+    println!("cybersind: auto-starting (state: {})", db_path.display());
+    let daemon = DaemonHandle::auto_start(&db_path).await?;
+
+    let project_dir = project_dir_from_dist(&dist_dir);
+    let local_config = LocalConfigFile::load_optional(project_dir).with_context(|| {
+        format!(
+            "reading {}",
+            project_dir.join("cybersin.local.yaml").display()
+        )
+    })?;
+    let model_caller = openrouter_from_local_config(dist.clone(), local_config.as_ref())
+        .context("configuring live model calling")?;
+    let allowlist = local_config
+        .as_ref()
+        .map(LocalConfigFile::model_allowlist)
+        .unwrap_or_else(ModelAllowlist::allow_all);
+    let executor = tool_executor::configured_executor_with_local_config(
+        &dist_dir,
+        &sandbox_root,
+        sandbox_backend,
+        local_config.as_ref(),
+    )
+    .context("configuring live tool execution")?;
+    let tool_caller = GatewayToolCaller::new(executor, daemon.storage(), dist.clone());
+
+    let session_id = args
+        .session_id
+        .unwrap_or_else(|| format!("sess-{}", now_unix_ms()));
+
+    println!(
+        "running built-in starter harness: session={session_id} agent={agent_name} prompt={prompt_name}"
+    );
+
+    let (harness_io, daemon_io) = in_memory_pair();
+    let mut runtime_daemon = cybersin_runtime::RuntimeDaemon::new(
+        daemon_io,
+        daemon.storage(),
+        daemon.spans(),
+        dist,
+        session_id.clone(),
+        agent_name,
+    )
+    .with_models(model_caller, allowlist)
+    .with_tool_caller(tool_caller);
+
+    runtime_daemon.start_session(inputs.clone()).await?;
+
+    let daemon_fut = async move { runtime_daemon.run().await.map_err(anyhow::Error::from) };
+    let starter_fut = run_starter_harness(harness_io, session_id, prompt_name, inputs);
+    let (summary, ()) = tokio::try_join!(daemon_fut, starter_fut)?;
+    Ok(summary)
+}
+
+async fn run_starter_harness<C>(
+    harness_io: C,
+    session_id: String,
+    prompt_name: String,
+    inputs: serde_json::Value,
+) -> anyhow::Result<()>
+where
+    C: cybersin_adapter::channel::HarnessChannel,
+{
+    let mut harness = StubHarness::new(harness_io);
+    let (started_session, _, _) = harness.recv_session_start().await;
+    if started_session != session_id {
+        anyhow::bail!(
+            "built-in starter harness received session {started_session:?}, expected {session_id:?}"
+        );
+    }
+
+    let (_, outcome) = harness.llm_request(prompt_name.clone(), inputs).await;
+    let result = match outcome {
+        CallOutcomeOrPark::Result(CallOutcome::Ok { value }) => value,
+        CallOutcomeOrPark::Result(CallOutcome::Failed { reason, .. }) => {
+            anyhow::bail!("built-in starter harness prompt {prompt_name:?} failed: {reason}")
+        }
+        CallOutcomeOrPark::Parked(approval_id) => {
+            anyhow::bail!(
+                "built-in starter harness prompt {prompt_name:?} parked unexpectedly for approval {approval_id}"
+            )
+        }
+        CallOutcomeOrPark::Aborted(reason) => {
+            anyhow::bail!("built-in starter harness session aborted: {reason:?}")
+        }
+    };
+    harness
+        .session_complete(
+            session_id,
+            serde_json::json!({ "prompt": prompt_name, "result": result }),
+        )
+        .await;
+    harness.wait_for_close().await;
+    Ok(())
 }
 
 fn openrouter_from_local_config(
