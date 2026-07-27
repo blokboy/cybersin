@@ -133,6 +133,111 @@ fn doctor_reports_ready_setup_without_requiring_dist() {
 }
 
 #[test]
+fn setup_creates_local_config_with_env_reference_and_runs_doctor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("myagent");
+    cybersin().arg("init").arg(&project).assert().success();
+    fs::write(project.join(".env"), "OPENROUTER_API_KEY=test-key\n").unwrap();
+
+    cybersin()
+        .arg("--project")
+        .arg(&project)
+        .arg("setup")
+        .env_remove("OPENROUTER_API_KEY")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Updated"))
+        .stdout(predicate::str::contains("cybersin.local.yaml"))
+        .stdout(predicate::str::contains("Cybersin doctor"))
+        .stdout(predicate::str::contains(
+            "api key: ready via cybersin.local.yaml -> .env:OPENROUTER_API_KEY",
+        ));
+
+    let local = fs::read_to_string(project.join("cybersin.local.yaml")).unwrap();
+    assert!(local.contains("api_key: ${OPENROUTER_API_KEY}"));
+    assert!(local.contains("provider: openrouter"));
+    assert!(local.contains("allowed_providers:"));
+}
+
+#[test]
+fn setup_rerun_is_idempotent_and_preserves_existing_local_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("myagent");
+    cybersin().arg("init").arg(&project).assert().success();
+    fs::write(project.join(".env"), "CUSTOM_OPENROUTER_KEY=test-key\n").unwrap();
+    fs::write(
+        project.join("cybersin.local.yaml"),
+        "providers:\n  openrouter:\n    api_key: ${CUSTOM_OPENROUTER_KEY}\ntools:\n  tavily:\n    availability: auto\n",
+    )
+    .unwrap();
+
+    cybersin()
+        .arg("--project")
+        .arg(&project)
+        .arg("setup")
+        .env_remove("CUSTOM_OPENROUTER_KEY")
+        .assert()
+        .success();
+    let after_first = fs::read_to_string(project.join("cybersin.local.yaml")).unwrap();
+
+    cybersin()
+        .arg("--project")
+        .arg(&project)
+        .arg("setup")
+        .env_remove("CUSTOM_OPENROUTER_KEY")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already up to date"));
+    let after_second = fs::read_to_string(project.join("cybersin.local.yaml")).unwrap();
+
+    assert_eq!(after_first, after_second);
+    assert!(after_second.contains("api_key: ${CUSTOM_OPENROUTER_KEY}"));
+    assert!(after_second.contains("tavily:"));
+}
+
+#[test]
+fn setup_reports_missing_key_guidance_from_doctor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("myagent");
+    cybersin().arg("init").arg(&project).assert().success();
+
+    cybersin()
+        .arg("--project")
+        .arg(&project)
+        .arg("setup")
+        .env_remove("OPENROUTER_API_KEY")
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains(
+            "api key: OPENROUTER_API_KEY is referenced but not set",
+        ))
+        .stdout(predicate::str::contains(
+            "Set OPENROUTER_API_KEY in .env or export it",
+        ));
+}
+
+#[test]
+fn setup_raw_secret_opt_in_is_explicit_but_rejected_by_current_config_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("myagent");
+    cybersin().arg("init").arg(&project).assert().success();
+
+    cybersin()
+        .arg("--project")
+        .arg(&project)
+        .arg("setup")
+        .arg("--raw-openrouter-api-key")
+        .arg("sk-or-raw-secret")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--raw-openrouter-api-key is not supported by the current local config model",
+        ));
+
+    assert!(!project.join("cybersin.local.yaml").exists());
+}
+
+#[test]
 fn init_skips_existing_files_unless_forced_and_supports_dry_run() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("myagent");

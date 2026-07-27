@@ -163,6 +163,8 @@ enum Command {
     },
     /// Report local setup readiness by project area.
     Doctor,
+    /// Configure local OpenRouter-first readiness, then run doctor.
+    Setup(commands::setup::SetupArgs),
     /// Cost rollups (spec §8.5: `cybersin cost --by <dim>`).
     Cost(commands::cost::CostArgs),
     /// Compile, run, and gate single-prompt output-quality eval suites.
@@ -307,6 +309,7 @@ async fn main() -> ExitCode {
             from_async(commands::trace::execute(db, command).await)
         }
         Command::Doctor => from_async(commands::doctor::execute(&project_start)),
+        Command::Setup(args) => from_async(commands::setup::execute(&project_start, args)),
         Command::Cost(args) => {
             let (db, ..) =
                 match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
@@ -620,6 +623,7 @@ mod tests {
             ("deny", &["control.deny"]),
             ("diff", &["compile.diff"]),
             ("doctor", &["inspection.doctor"]),
+            ("setup", &["workflow.setup"]),
             ("dlq drop", &["control.dlq.drop"]),
             ("dlq ls", &["control.dlq.ls"]),
             ("dlq retry", &["control.dlq.retry"]),
