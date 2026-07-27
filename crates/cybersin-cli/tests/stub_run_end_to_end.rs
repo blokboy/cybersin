@@ -145,7 +145,8 @@ fn run_without_stub_fails_with_a_clear_message() {
         .arg("run")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--stub"));
+        .stderr(predicate::str::contains("no runnable agent targets found"))
+        .stderr(predicate::str::contains("cybersin run <agent.yaml>"));
 }
 
 #[test]

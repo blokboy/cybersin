@@ -28,6 +28,7 @@ use cybersin_runtime::{
 };
 use tokio::process::{Child, Command};
 
+use crate::commands::build::discover_agent_sources;
 use crate::harness_config::AgentMeta;
 use crate::readiness;
 use crate::tool_executor::{self, GatewayToolCaller};
@@ -91,7 +92,11 @@ pub async fn run_session(
 ) -> anyhow::Result<RuntimeSessionSummary> {
     match (args.stub, args.agent_yaml.clone()) {
         (true, _) => run_stub(db_path, dist_dir, args).await,
-        (false, Some(agent_yaml)) => {
+        (false, explicit_agent_yaml) => {
+            let agent_yaml = match explicit_agent_yaml {
+                Some(agent_yaml) => agent_yaml,
+                None => infer_agent_yaml(&dist_dir)?,
+            };
             run_live(
                 db_path,
                 dist_dir,
@@ -102,8 +107,53 @@ pub async fn run_session(
             )
             .await
         }
-        (false, None) => anyhow::bail!("cybersin run needs either <agent.yaml> or --stub"),
     }
+}
+
+fn infer_agent_yaml(dist_dir: &Path) -> anyhow::Result<PathBuf> {
+    let project_dir = project_dir_from_dist(dist_dir);
+    let candidates = runnable_agent_targets(project_dir)?;
+    match candidates.as_slice() {
+        [] => anyhow::bail!(
+            "no runnable agent targets found in {}; create an agents/*.agent.yaml file or run `cybersin run <agent.yaml>` explicitly",
+            project_dir.join("agents").display()
+        ),
+        [single] => Ok(single.clone()),
+        multiple => {
+            let choices = multiple
+                .iter()
+                .map(|path| format!("  - cybersin run {}", display_project_path(project_dir, path)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!(
+                "multiple runnable agent targets found; choose one explicitly:\n{choices}"
+            )
+        }
+    }
+}
+
+fn runnable_agent_targets(project_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let candidates = discover_agent_sources(project_dir).map_err(anyhow::Error::msg)?;
+    let mut runnable = Vec::new();
+    for candidate in candidates {
+        let yaml_source = std::fs::read_to_string(&candidate)
+            .with_context(|| format!("reading {}", candidate.display()))?;
+        AgentMeta::from_agent_yaml(&yaml_source)
+            .with_context(|| format!("parsing {}", candidate.display()))?;
+        runnable.push(candidate);
+    }
+    Ok(runnable)
+}
+
+fn project_dir_from_dist(dist_dir: &Path) -> &Path {
+    dist_dir.parent().unwrap_or_else(|| Path::new("."))
+}
+
+fn display_project_path(project_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(project_dir)
+        .unwrap_or(path)
+        .display()
+        .to_string()
 }
 
 async fn run_stub(
@@ -170,7 +220,7 @@ async fn run_live(
     println!("cybersind: auto-starting (state: {})", db_path.display());
     let daemon = DaemonHandle::auto_start(&db_path).await?;
 
-    let project_dir: &Path = dist_dir.parent().unwrap_or_else(|| Path::new("."));
+    let project_dir = project_dir_from_dist(&dist_dir);
     let local_config = LocalConfigFile::load_optional(project_dir).with_context(|| {
         format!(
             "reading {}",
@@ -422,4 +472,71 @@ fn now_unix_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_agent(path: &Path, name: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            path,
+            format!(
+                r#"
+name: {name}
+harness:
+  adapter: process
+  command: ["printf", "%s\n", "{{\"type\":\"session.complete\",\"session_id\":\"sess\",\"result\":{{}}}}"]
+budget:
+  usd_per_session: 1.00
+  on_breach: degrade
+tools: []
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn infers_the_single_runnable_agent_target() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("dist")).unwrap();
+        let agent = project.path().join("agents/hello.agent.yaml");
+        write_agent(&agent, "hello-agent");
+
+        assert_eq!(
+            infer_agent_yaml(&project.path().join("dist")).unwrap(),
+            agent
+        );
+    }
+
+    #[test]
+    fn zero_runnable_agent_targets_is_a_clear_error() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("dist")).unwrap();
+
+        let err = infer_agent_yaml(&project.path().join("dist")).unwrap_err();
+
+        assert!(err.to_string().contains("no runnable agent targets found"));
+        assert!(err.to_string().contains("agents"));
+        assert!(err.to_string().contains("cybersin run <agent.yaml>"));
+    }
+
+    #[test]
+    fn multiple_runnable_agent_targets_list_explicit_choices() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("dist")).unwrap();
+        write_agent(&project.path().join("agents/alpha.agent.yaml"), "alpha");
+        write_agent(&project.path().join("agents/fleet/beta.agent.yaml"), "beta");
+
+        let err = infer_agent_yaml(&project.path().join("dist")).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("multiple runnable agent targets found"));
+        assert!(message.contains("cybersin run agents/alpha.agent.yaml"));
+        assert!(message.contains("cybersin run agents/fleet/beta.agent.yaml"));
+    }
 }

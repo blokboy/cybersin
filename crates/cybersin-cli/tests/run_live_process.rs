@@ -12,6 +12,53 @@ fn cybersin() -> Command {
     Command::cargo_bin("cybersin").expect("find cybersin binary")
 }
 
+fn copy_dir(source: &std::path::Path, destination: &std::path::Path) {
+    std::fs::create_dir_all(destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&source_path, &destination_path);
+        } else {
+            std::fs::copy(&source_path, &destination_path).unwrap();
+        }
+    }
+}
+
+fn fixture_dist() -> &'static std::path::Path {
+    std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/ic1-research-team/dist"
+    ))
+}
+
+fn write_fast_complete_agent(path: &std::path::Path, name: &str, session_id: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let completion =
+        format!(r#"{{"type":"session.complete","session_id":"{session_id}","result":{{}}}}"#);
+    let script =
+        serde_json::to_string(&format!("IFS= read -r _; printf '%s\\n' '{completion}'")).unwrap();
+    std::fs::write(
+        path,
+        format!(
+            r#"
+name: {name}
+harness:
+  adapter: process
+  command: ["sh", "-c", {script}]
+budget:
+  usd_per_session: 1.00
+  on_breach: degrade
+tools: []
+"#
+        ),
+    )
+    .unwrap();
+}
+
 #[test]
 fn a_harness_process_that_exits_early_produces_a_clear_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -32,17 +79,12 @@ tools: []
     )
     .unwrap();
 
-    let dist_dir = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../fixtures/ic1-research-team/dist"
-    );
-
     cybersin()
         .env("OPENROUTER_API_KEY", "test-key-not-validated-before-crash")
         .arg("--db")
         .arg(&db)
         .arg("--dist")
-        .arg(dist_dir)
+        .arg(fixture_dist())
         .arg("run")
         .arg(&agent_yaml)
         .assert()
@@ -77,18 +119,13 @@ tools: []
     )
     .unwrap();
 
-    let dist_dir = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../fixtures/ic1-research-team/dist"
-    );
-
     cybersin()
         .current_dir(dir.path())
         .env_remove("OPENROUTER_API_KEY")
         .arg("--db")
         .arg(&db)
         .arg("--dist")
-        .arg(dist_dir)
+        .arg(fixture_dist())
         .arg("run")
         .arg(&agent_yaml)
         .assert()
@@ -113,32 +150,14 @@ fn a_harness_process_that_completes_and_exits_immediately_is_reported_as_success
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("cybersin.db");
     let agent_yaml = dir.path().join("fast-complete.agent.yaml");
-    std::fs::write(
-        &agent_yaml,
-        r#"
-name: fast-complete-agent
-harness:
-  adapter: process
-  command: ["printf", "%s\n", "{\"type\":\"session.complete\",\"session_id\":\"sess-race-test\",\"result\":{}}"]
-budget:
-  usd_per_session: 1.00
-  on_breach: degrade
-tools: []
-"#,
-    )
-    .unwrap();
-
-    let dist_dir = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../fixtures/ic1-research-team/dist"
-    );
+    write_fast_complete_agent(&agent_yaml, "fast-complete-agent", "sess-race-test");
 
     cybersin()
         .env("OPENROUTER_API_KEY", "test-key-not-validated")
         .arg("--db")
         .arg(&db)
         .arg("--dist")
-        .arg(dist_dir)
+        .arg(fixture_dist())
         .arg("run")
         .arg("--session-id")
         .arg("sess-race-test")
@@ -146,4 +165,62 @@ tools: []
         .assert()
         .success()
         .stdout(predicate::str::contains("completed"));
+}
+
+#[test]
+fn run_without_an_agent_path_infers_the_single_runnable_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("cybersin.yaml"), "name: infer-test\n").unwrap();
+    copy_dir(fixture_dist(), &project.join("dist"));
+    write_fast_complete_agent(
+        &project.join("agents/only.agent.yaml"),
+        "only-agent",
+        "sess-infer",
+    );
+
+    cybersin()
+        .current_dir(&project)
+        .env("OPENROUTER_API_KEY", "test-key-not-validated")
+        .arg("run")
+        .arg("--session-id")
+        .arg("sess-infer")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("completed"));
+}
+
+#[test]
+fn run_without_an_agent_path_lists_choices_when_multiple_targets_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(project.join("cybersin.yaml"), "name: infer-test\n").unwrap();
+    std::fs::create_dir(project.join("dist")).unwrap();
+    write_fast_complete_agent(
+        &project.join("agents/alpha.agent.yaml"),
+        "alpha",
+        "sess-alpha",
+    );
+    write_fast_complete_agent(
+        &project.join("agents/fleet/beta.agent.yaml"),
+        "beta",
+        "sess-beta",
+    );
+
+    cybersin()
+        .current_dir(&project)
+        .arg("run")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "multiple runnable agent targets found",
+        ))
+        .stderr(predicate::str::contains(
+            "cybersin run agents/alpha.agent.yaml",
+        ))
+        .stderr(predicate::str::contains(
+            "cybersin run agents/fleet/beta.agent.yaml",
+        ));
 }
