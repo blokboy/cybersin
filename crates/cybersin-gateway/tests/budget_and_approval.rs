@@ -23,8 +23,8 @@ use cybersin_adapter::transport::stdio::in_memory_pair;
 use cybersin_gateway::{EchoExecutor, ToolExecutor, ToolGateway};
 use cybersin_router::RouteModel;
 use cybersin_runtime::{
-    bundled_stub_dist_dir, BudgetConfig, DaemonHandle, DistFixture, ModelAllowlist, ModelCaller,
-    ModelOutput, OnBreach, RuntimeDaemon, SessionSupervisor, Storage,
+    bundled_stub_dist_dir, BudgetConfig, DaemonHandle, DistFixture, ModelAllowlist, ModelCallError,
+    ModelCaller, ModelOutput, OnBreach, RuntimeDaemon, SessionSupervisor, Storage,
 };
 use cybersin_trace::{SpanFilter, SpanKind, SpanStore};
 use serde_json::json;
@@ -580,8 +580,11 @@ impl ModelCaller for AlwaysFailsModelCaller {
         _inputs: &Value,
         _confidence_instruction: Option<&str>,
         _grounded: bool,
-    ) -> Result<ModelOutput, String> {
-        Err(format!("simulated provider outage for {}", model.name))
+    ) -> Result<ModelOutput, ModelCallError> {
+        Err(ModelCallError::permanent(format!(
+            "simulated provider outage for {}",
+            model.name
+        )))
     }
 }
 

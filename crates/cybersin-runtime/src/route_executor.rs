@@ -3,6 +3,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use cybersin_router::{CascadeStep, RouteDecision, RouteModel, RoutingArtifact};
@@ -129,6 +130,54 @@ pub struct ModelOutput {
     pub usage: Option<ModelUsage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelErrorClass {
+    Transient { retry_after: Option<Duration> },
+    Permanent,
+}
+
+impl ModelErrorClass {
+    pub fn transient() -> Self {
+        Self::Transient { retry_after: None }
+    }
+
+    pub fn transient_with_retry_after(retry_after: Duration) -> Self {
+        Self::Transient {
+            retry_after: Some(retry_after),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct ModelCallError {
+    pub class: ModelErrorClass,
+    pub message: String,
+}
+
+impl ModelCallError {
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            class: ModelErrorClass::transient(),
+            message: message.into(),
+        }
+    }
+
+    pub fn transient_with_retry_after(message: impl Into<String>, retry_after: Duration) -> Self {
+        Self {
+            class: ModelErrorClass::transient_with_retry_after(retry_after),
+            message: message.into(),
+        }
+    }
+
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            class: ModelErrorClass::Permanent,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionResponse {
     pub response: Value,
@@ -190,7 +239,7 @@ pub trait ModelCaller: Send + Sync {
         inputs: &Value,
         confidence_instruction: Option<&str>,
         grounded: bool,
-    ) -> Result<ModelOutput, String>;
+    ) -> Result<ModelOutput, ModelCallError>;
 }
 
 #[async_trait]
@@ -446,7 +495,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     serde_json::json!({
                                         "decision": "cascade_error",
                                         "model": step.model.name,
-                                        "error": error,
+                                        "error": error.to_string(),
                                         "grounded": step.grounded,
                                     }),
                                 )
@@ -502,7 +551,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     serde_json::json!({
                                         "decision": "fallback_error",
                                         "model": model.name,
-                                        "error": error,
+                                        "error": error.to_string(),
                                         "grounded": false,
                                     }),
                                 )
@@ -848,7 +897,7 @@ mod tests {
             _inputs: &Value,
             _confidence_instruction: Option<&str>,
             _grounded: bool,
-        ) -> Result<ModelOutput, String> {
+        ) -> Result<ModelOutput, ModelCallError> {
             self.0.lock().unwrap().push(model.name.clone());
             Ok(ModelOutput {
                 response: serde_json::json!({"from": model.name}),
@@ -869,7 +918,7 @@ mod tests {
             _inputs: &Value,
             _confidence_instruction: Option<&str>,
             _grounded: bool,
-        ) -> Result<ModelOutput, String> {
+        ) -> Result<ModelOutput, ModelCallError> {
             Ok(ModelOutput {
                 response: serde_json::json!({"from": model.name}),
                 confidence: 0.95,
@@ -928,7 +977,7 @@ mod tests {
             _inputs: &Value,
             _confidence_instruction: Option<&str>,
             _grounded: bool,
-        ) -> Result<ModelOutput, String> {
+        ) -> Result<ModelOutput, ModelCallError> {
             self.0.lock().unwrap().push(model.name.clone());
             if model.name == "backup" {
                 Ok(ModelOutput {
@@ -937,7 +986,7 @@ mod tests {
                     usage: None,
                 })
             } else {
-                Err("unavailable".into())
+                Err(ModelCallError::permanent("unavailable"))
             }
         }
     }
@@ -959,7 +1008,7 @@ mod tests {
             _inputs: &Value,
             _confidence_instruction: Option<&str>,
             grounded: bool,
-        ) -> Result<ModelOutput, String> {
+        ) -> Result<ModelOutput, ModelCallError> {
             self.0.lock().unwrap().push((model.name.clone(), grounded));
             Ok(ModelOutput {
                 response: serde_json::json!({"from": model.name}),
@@ -986,7 +1035,7 @@ mod tests {
             _inputs: &Value,
             _confidence_instruction: Option<&str>,
             grounded: bool,
-        ) -> Result<ModelOutput, String> {
+        ) -> Result<ModelOutput, ModelCallError> {
             self.0.lock().unwrap().push((model.name.clone(), grounded));
             if model.name == "backup" {
                 Ok(ModelOutput {
@@ -995,7 +1044,7 @@ mod tests {
                     usage: None,
                 })
             } else {
-                Err("unavailable".into())
+                Err(ModelCallError::permanent("unavailable"))
             }
         }
     }

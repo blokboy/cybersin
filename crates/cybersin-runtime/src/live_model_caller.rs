@@ -46,15 +46,18 @@
 //! changing this file.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use cybersin_backends::{backend_for, RenderedPrompt};
 use cybersin_ir::PromptIr;
 use cybersin_router::RouteModel;
+use reqwest::header::RETRY_AFTER;
+use reqwest::StatusCode;
 use serde_json::{json, Value};
 
 use crate::dist::DistFixture;
-use crate::route_executor::{ModelCaller, ModelOutput, ModelUsage};
+use crate::route_executor::{ModelCallError, ModelCaller, ModelOutput, ModelUsage};
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
@@ -191,13 +194,15 @@ impl ModelCaller for OpenRouterModelCaller {
         inputs: &Value,
         confidence_instruction: Option<&str>,
         grounded: bool,
-    ) -> Result<ModelOutput, String> {
-        let prompt = self
-            .dist
-            .prompt(prompt_name)
-            .map_err(|error| format!("loading compiled prompt {prompt_name:?}: {error}"))?;
-        let rendered = self.render_messages(prompt, inputs)?;
-        let response_format = response_format_with_confidence(&rendered)?;
+    ) -> Result<ModelOutput, ModelCallError> {
+        let prompt = self.dist.prompt(prompt_name).map_err(|error| {
+            ModelCallError::permanent(format!("loading compiled prompt {prompt_name:?}: {error}"))
+        })?;
+        let rendered = self
+            .render_messages(prompt, inputs)
+            .map_err(ModelCallError::permanent)?;
+        let response_format =
+            response_format_with_confidence(&rendered).map_err(ModelCallError::permanent)?;
 
         let mut messages: Vec<Value> = rendered
             .messages
@@ -267,36 +272,47 @@ impl ModelCaller for OpenRouterModelCaller {
             .json(&body)
             .send()
             .await
-            .map_err(|error| format!("calling OpenRouter for model {}: {error}", model.name))?;
+            .map_err(|error| {
+                ModelCallError::transient(format!(
+                    "calling OpenRouter for model {}: {error}",
+                    model.name
+                ))
+            })?;
 
         let status = http_response.status();
+        let retry_after = http_response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after);
         let payload: Value = http_response.json().await.map_err(|error| {
-            format!(
+            ModelCallError::transient(format!(
                 "parsing OpenRouter response for model {}: {error}",
                 model.name
-            )
+            ))
         })?;
         if !status.is_success() {
-            return Err(format!(
+            let message = format!(
                 "OpenRouter returned {status} for model {}: {payload}",
                 model.name
-            ));
+            );
+            return Err(classify_openrouter_status(status, retry_after, message));
         }
 
         let content = payload
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                format!(
+                ModelCallError::permanent(format!(
                     "OpenRouter response for model {} had no message content",
                     model.name
-                )
+                ))
             })?;
         let mut parsed: Value = serde_json::from_str(content).map_err(|error| {
-            format!(
+            ModelCallError::permanent(format!(
                 "model {} did not return valid JSON matching its output contract: {error}",
                 model.name
-            )
+            ))
         })?;
         // Extract, then strip, the reserved routing-layer field: it's
         // internal cascade bookkeeping, not part of the prompt's own
@@ -310,10 +326,10 @@ impl ModelCaller for OpenRouterModelCaller {
             .get(CASCADE_CONFIDENCE_KEY)
             .and_then(Value::as_f64)
             .ok_or_else(|| {
-                format!(
+                ModelCallError::permanent(format!(
                     "model {} did not self-report a confidence field",
                     model.name
-                )
+                ))
             })?;
         if let Some(obj) = parsed.as_object_mut() {
             obj.remove(CASCADE_CONFIDENCE_KEY);
@@ -334,6 +350,26 @@ fn openrouter_model_id(model: &RouteModel) -> String {
     } else {
         format!("{}/{}", model.provider, model.name)
     }
+}
+
+fn classify_openrouter_status(
+    status: StatusCode,
+    retry_after: Option<Duration>,
+    message: String,
+) -> ModelCallError {
+    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        if let Some(retry_after) = retry_after {
+            ModelCallError::transient_with_retry_after(message, retry_after)
+        } else {
+            ModelCallError::transient(message)
+        }
+    } else {
+        ModelCallError::permanent(message)
+    }
+}
+
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
 fn provider_usage(payload: &Value) -> Option<ModelUsage> {
@@ -586,7 +622,115 @@ mod tests {
             .call(&model(), "researcher", &json!({"topic": "x"}), None, false)
             .await
             .unwrap_err();
-        assert!(error.contains("did not self-report a confidence field"));
+        assert_eq!(
+            error.class,
+            crate::route_executor::ModelErrorClass::Permanent
+        );
+        assert!(error
+            .message
+            .contains("did not self-report a confidence field"));
+    }
+
+    #[tokio::test]
+    async fn rate_limits_are_transient_and_capture_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "7")
+                    .set_body_json(json!({"error": {"message": "slow down"}})),
+            )
+            .mount(&server)
+            .await;
+
+        let caller = OpenRouterModelCaller::new(dist_with_prompt(researcher_prompt()), "test-key")
+            .with_base_url(server.uri());
+
+        let error = caller
+            .call(&model(), "researcher", &json!({"topic": "x"}), None, false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.class,
+            crate::route_executor::ModelErrorClass::Transient {
+                retry_after: Some(Duration::from_secs(7))
+            }
+        );
+        assert!(error.message.contains("OpenRouter returned 429"));
+    }
+
+    #[tokio::test]
+    async fn server_errors_are_transient_without_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_json(json!({"error": "temporarily down"})),
+            )
+            .mount(&server)
+            .await;
+
+        let caller = OpenRouterModelCaller::new(dist_with_prompt(researcher_prompt()), "test-key")
+            .with_base_url(server.uri());
+
+        let error = caller
+            .call(&model(), "researcher", &json!({"topic": "x"}), None, false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.class,
+            crate::route_executor::ModelErrorClass::Transient { retry_after: None }
+        );
+        assert!(error.message.contains("OpenRouter returned 503"));
+    }
+
+    #[tokio::test]
+    async fn auth_and_other_client_errors_are_permanent() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({"error": "bad key"})))
+            .mount(&server)
+            .await;
+
+        let caller = OpenRouterModelCaller::new(dist_with_prompt(researcher_prompt()), "test-key")
+            .with_base_url(server.uri());
+
+        let error = caller
+            .call(&model(), "researcher", &json!({"topic": "x"}), None, false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.class,
+            crate::route_executor::ModelErrorClass::Permanent
+        );
+        assert!(error.message.contains("OpenRouter returned 401"));
+
+        let other_client_error_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({"error": "invalid request"})),
+            )
+            .mount(&other_client_error_server)
+            .await;
+        let caller = OpenRouterModelCaller::new(dist_with_prompt(researcher_prompt()), "test-key")
+            .with_base_url(other_client_error_server.uri());
+
+        let error = caller
+            .call(&model(), "researcher", &json!({"topic": "x"}), None, false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.class,
+            crate::route_executor::ModelErrorClass::Permanent
+        );
+        assert!(error.message.contains("OpenRouter returned 400"));
     }
 
     #[tokio::test]

@@ -11,8 +11,8 @@ use assert_cmd::Command;
 use async_trait::async_trait;
 use cybersin_router::RouteModel;
 use cybersin_runtime::{
-    default_model, CacheEntry, DaemonHandle, DistFixture, ExecutionRequest, Judge, ModelCaller,
-    ModelOutput, RouteExecutor,
+    default_model, CacheEntry, DaemonHandle, DistFixture, ExecutionRequest, Judge, ModelCallError,
+    ModelCaller, ModelOutput, RouteExecutor,
 };
 use serde_json::{json, Value};
 
@@ -48,8 +48,10 @@ impl ModelCaller for UnusedModel {
         _inputs: &Value,
         _confidence_instruction: Option<&str>,
         _grounded: bool,
-    ) -> Result<ModelOutput, String> {
-        Err("the accepted cache candidate should avoid a provider call".into())
+    ) -> Result<ModelOutput, ModelCallError> {
+        Err(ModelCallError::permanent(
+            "the accepted cache candidate should avoid a provider call",
+        ))
     }
 }
 

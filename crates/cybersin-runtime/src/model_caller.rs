@@ -21,7 +21,7 @@ use cybersin_ir::QualityTier;
 use cybersin_router::RouteModel;
 use serde_json::Value;
 
-use crate::route_executor::{Judge, ModelCaller, ModelOutput};
+use crate::route_executor::{Judge, ModelCallError, ModelCaller, ModelOutput};
 
 /// Fixed self-confidence per quality tier. Tuned against the compiler's own
 /// `confidence_rubric` thresholds (`cybersin-router::confidence_rubric`) so
@@ -48,7 +48,7 @@ impl ModelCaller for StubModelCaller {
         _inputs: &Value,
         _confidence_instruction: Option<&str>,
         _grounded: bool,
-    ) -> Result<ModelOutput, String> {
+    ) -> Result<ModelOutput, ModelCallError> {
         Ok(ModelOutput {
             response: serde_json::json!({
                 "text": format!("stub completion for prompt `{prompt_name}`"),
@@ -96,7 +96,7 @@ impl ModelCaller for Box<dyn ModelCaller> {
         inputs: &Value,
         confidence_instruction: Option<&str>,
         grounded: bool,
-    ) -> Result<ModelOutput, String> {
+    ) -> Result<ModelOutput, ModelCallError> {
         (**self)
             .call(model, prompt_name, inputs, confidence_instruction, grounded)
             .await
