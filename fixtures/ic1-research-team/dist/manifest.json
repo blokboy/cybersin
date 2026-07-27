@@ -1,19 +1,19 @@
 {
   "schema_version": 1,
   "build_hash": "893bfdc4886941392b82080df379ade4bfff78e38ecd33adcf900f54bbc7da14",
-  "git_sha": "0a6a5eaa432ca84015495566af73ca6f1b9131b2",
+  "git_sha": "5fa128bd890dfc92bada1e9587ea87d55061a1f5",
   "lockfile_hash": "49cf5ec42f9926d537017e0a6b2bb71214312e67ce87f0dcdb2ab1bde4620653",
   "artifacts": {
     "budget/researcher.json": "ca51f5380253d57664b212d5d7cb271386de788723def6b08d71531fa350a272",
     "budget/synthesizer.json": "e9c149b3116147d2013b5713ecfda42a291dc99ec6e09d625008a578714eb87c",
     "cache.json": "f74d091602861d782e7a310a2126519d72c7af38da0ee7d9798161e8795e7fee",
-    "prompts/researcher.json": "46114ff2bf4b39caf4a5ac1739983fa29a5dfab8bc68a5d967070894da13e289",
+    "prompts/researcher.json": "f69ee00985b9f3e3627a6cda5db1ec22e41f68e492d1b58992c5f3b20dbbff2a",
     "prompts/researcher/generic.json": "d55f6868657c702edc57c39802f9867833966cc561a0c31ab146354ef6639c36",
     "prompts/researcher/openai.json": "3ace923b3b43bcfb8d01f35b1a8ab20cb197f1abea1b0c6a4ab36bf5cffc76ae",
-    "prompts/synthesizer.json": "ecb7d3280bbb4ef502f03970a80b961809b39af23d9a5f402b7d0777bde59c55",
+    "prompts/synthesizer.json": "c9bec9e4350b3a6be2c62092fba85a60c557cdaa6fb93ae4a06f99f1be1f9f93",
     "prompts/synthesizer/generic.json": "dae392b00a169398192608726b8dd3b3fc02cb0156a7badd7b62bb6181ee213c",
     "prompts/synthesizer/openai.json": "f6839cd2c0abf3fbd3f59060190764f015d4acac5f95051f3e18783102df6261",
-    "routing.json": "91e0e46c03de2dcc0dca6e5d8952e47b0b849400cc1326f73120c3bec9c8121f",
+    "routing.json": "86dd2bf43b1f475ae820676889973e3b029186c0e1af9997f97ab3b2353b4a9f",
     "tools.json": "2b358fe37a17e46aa141f0380b9fdc8dfaa82d0184d43c33ed1976e3c617b25a",
     "tools/citation_lookup.py": "c2d7f172bc377ef75d1a63a2529a9ca9952d964a3d290d75188ffe5fd01e9737"
   }
