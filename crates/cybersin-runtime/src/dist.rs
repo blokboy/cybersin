@@ -441,6 +441,7 @@ fn synthesize_routing_artifact(
                         instruction: "legacy fixture: only reachable via forced degrade"
                             .to_string(),
                     },
+                    grounded: false,
                 })
                 .into_iter()
                 .collect();
@@ -450,6 +451,7 @@ fn synthesize_routing_artifact(
                     minimum_score: 0.0,
                     instruction: "legacy fixture: no confidence gate".to_string(),
                 },
+                grounded: false,
             });
             let route = PromptRoute {
                 quality: QualityTier::High,

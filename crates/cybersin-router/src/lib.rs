@@ -34,6 +34,15 @@ pub struct CostModelConfig {
     pub judge_trigger_band: [f64; 2],
     #[serde(default = "default_judge_model")]
     pub judge_model: String,
+    /// Flat per-request USD surcharge OpenRouter's web-grounding plugin
+    /// adds on top of ordinary token pricing (spec issue #80). `None`
+    /// unless declared — a prompt requesting grounding on a tier while
+    /// this is unset is a compile error rather than a silent $0 estimate,
+    /// since this is the only place grounding's cost is ever accounted
+    /// for (`cybersin cost`/budget enforcement both read the compiled
+    /// `estimated_cost_usd`, never live usage).
+    #[serde(default)]
+    pub web_search_surcharge_usd: Option<f64>,
 }
 
 fn default_judge_model() -> String {
@@ -137,6 +146,13 @@ pub struct CascadeDecision {
 pub struct CascadeStep {
     pub model: RouteModel,
     pub confidence: ConfidenceRubric,
+    /// Whether this step's call should be grounded in OpenRouter web
+    /// search (spec issue #80). Deliberately absent from [`RouteModel`]
+    /// itself and from [`FallbackDecision::providers`]'s route models —
+    /// the fallback tier has no `CascadeStep` wrapper at all, so it is
+    /// structurally impossible for a fallback call to be grounded.
+    #[serde(default)]
+    pub grounded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -295,16 +311,42 @@ fn compile_prompt(
         .cloned()
         .collect();
 
+    let available_tiers = tiers_through(prompt.quality);
+    if let Some(tier) = prompt
+        .grounded_tiers
+        .iter()
+        .find(|tier| !available_tiers.contains(tier))
+    {
+        return Err(RouterError::Config(format!(
+            "prompt {:?} requests grounding on {tier:?} quality, which is above its own \
+             declared {:?} quality and is never part of its cascade",
+            prompt.name, prompt.quality
+        )));
+    }
+
     let mut steps = Vec::new();
-    for &quality in tiers_through(prompt.quality) {
+    for &quality in available_tiers {
         if let Some(model) = eligible
             .iter()
             .filter(|model| model.quality == quality)
             .min_by(|left, right| compare_cost_then_name(left, right))
         {
+            let grounded = prompt.grounded_tiers.contains(&quality);
+            let mut step_model = model.clone();
+            if grounded {
+                let surcharge = config.web_search_surcharge_usd.ok_or_else(|| {
+                    RouterError::Config(format!(
+                        "prompt {:?} requests grounding on {quality:?} quality, but \
+                         cost_model.web_search_surcharge_usd is not set",
+                        prompt.name
+                    ))
+                })?;
+                step_model.estimated_cost_usd += surcharge;
+            }
             steps.push(CascadeStep {
-                model: model.clone(),
+                model: step_model,
                 confidence: confidence_rubric(quality, prompt.quality),
+                grounded,
             });
         }
     }
@@ -449,6 +491,13 @@ fn validate_config(config: &CostModelConfig) -> Result<(), RouterError> {
         return Err(RouterError::Config(
             "judge_model must not be empty".to_owned(),
         ));
+    }
+    if let Some(surcharge) = config.web_search_surcharge_usd {
+        if !surcharge.is_finite() || surcharge < 0.0 {
+            return Err(RouterError::Config(
+                "web_search_surcharge_usd must be a non-negative, finite number".to_owned(),
+            ));
+        }
     }
     validate_thresholds(config.cache_similarity_threshold, config.judge_trigger_band)
 }
@@ -729,5 +778,204 @@ prices:
         )
         .unwrap_err();
         assert!(error.to_string().contains("no priced model provides it"));
+    }
+
+    fn project_yaml_with_surcharge(surcharge: f64) -> String {
+        format!(
+            r#"
+name: test
+cost_model:
+  cache_similarity_threshold: 0.97
+  judge_trigger_band: [0.90, 0.97]
+  judge_model: route-judge
+  web_search_surcharge_usd: {surcharge}
+"#
+        )
+    }
+
+    #[test]
+    fn grounded_tier_gets_marker_and_surcharge_added_to_estimated_cost() {
+        let config: ProjectConfig =
+            serde_yaml::from_str(&project_yaml_with_surcharge(0.004)).unwrap();
+        let lock: ModelLock = serde_yaml::from_str(lock_yaml()).unwrap();
+        let ungrounded_high = compile(
+            &[prompt("high", QualityTier::High)],
+            &config.cost_model,
+            &lock,
+            None,
+            WorkloadEstimate::default(),
+        )
+        .unwrap();
+        let grounded_prompt = prompt("high", QualityTier::High)
+            .with_grounded_tiers(BTreeSet::from([QualityTier::High]));
+        let grounded = compile(
+            &[grounded_prompt],
+            &config.cost_model,
+            &lock,
+            None,
+            WorkloadEstimate::default(),
+        )
+        .unwrap();
+
+        let ungrounded_steps = &cascade(&ungrounded_high.prompts["high"]).steps;
+        let grounded_steps = &cascade(&grounded.prompts["high"]).steps;
+
+        for (ungrounded_step, grounded_step) in ungrounded_steps.iter().zip(grounded_steps.iter()) {
+            if grounded_step.model.quality == QualityTier::High {
+                assert!(grounded_step.grounded);
+                assert_eq!(
+                    grounded_step.model.estimated_cost_usd,
+                    ungrounded_step.model.estimated_cost_usd + 0.004
+                );
+            } else {
+                assert!(!grounded_step.grounded);
+                assert_eq!(
+                    grounded_step.model.estimated_cost_usd,
+                    ungrounded_step.model.estimated_cost_usd
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grounding_never_reaches_cache_judge_or_fallback_costs() {
+        let config: ProjectConfig =
+            serde_yaml::from_str(&project_yaml_with_surcharge(0.004)).unwrap();
+        let lock: ModelLock = serde_yaml::from_str(lock_yaml()).unwrap();
+        let ungrounded = compile(
+            &[prompt("high", QualityTier::High)],
+            &config.cost_model,
+            &lock,
+            None,
+            WorkloadEstimate::default(),
+        )
+        .unwrap();
+        let grounded_prompt =
+            prompt("high", QualityTier::High).with_grounded_tiers(BTreeSet::from([
+                QualityTier::Low,
+                QualityTier::Medium,
+                QualityTier::High,
+            ]));
+        let grounded = compile(
+            &[grounded_prompt],
+            &config.cost_model,
+            &lock,
+            None,
+            WorkloadEstimate::default(),
+        )
+        .unwrap();
+
+        // Cache/judge pseudo-model costs are untouched by grounding.
+        let judge_cost = |artifact: &RoutingArtifact| {
+            artifact.prompts["high"]
+                .optimization_candidates
+                .iter()
+                .find(|candidate| candidate.model.model_kind == ModelKind::Judge)
+                .unwrap()
+                .model
+                .estimated_cost_usd
+        };
+        let cache_cost = |artifact: &RoutingArtifact| {
+            artifact.prompts["high"]
+                .optimization_candidates
+                .iter()
+                .find(|candidate| candidate.model.model_kind == ModelKind::Cache)
+                .unwrap()
+                .model
+                .estimated_cost_usd
+        };
+        assert_eq!(cache_cost(&grounded), PSEUDO_MODEL_COST_USD);
+        assert_eq!(judge_cost(&grounded), judge_cost(&ungrounded));
+
+        // Fallback-tier provider costs are identical whether or not the
+        // cascade steps they'd fall back from were grounded — proving the
+        // surcharge never reaches the fallback tier.
+        let fallback_costs =
+            |artifact: &RoutingArtifact| match &artifact.prompts["high"].decisions[2] {
+                RouteDecision::Fallbacks(fallbacks) => fallbacks
+                    .providers
+                    .iter()
+                    .map(|provider| (provider.name.clone(), provider.estimated_cost_usd))
+                    .collect::<Vec<_>>(),
+                other => panic!("expected fallbacks, got {other:?}"),
+            };
+        let ungrounded_fallbacks = fallback_costs(&ungrounded);
+        assert!(!ungrounded_fallbacks.is_empty());
+        assert_eq!(ungrounded_fallbacks, fallback_costs(&grounded));
+    }
+
+    #[test]
+    fn grounding_a_tier_above_the_prompts_own_quality_is_a_clear_error() {
+        let config: ProjectConfig =
+            serde_yaml::from_str(&project_yaml_with_surcharge(0.004)).unwrap();
+        let lock: ModelLock = serde_yaml::from_str(lock_yaml()).unwrap();
+        let over_grounded = prompt("medium", QualityTier::Medium)
+            .with_grounded_tiers(BTreeSet::from([QualityTier::High]));
+        let error = compile(
+            &[over_grounded],
+            &config.cost_model,
+            &lock,
+            None,
+            WorkloadEstimate::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("above its own declared"));
+    }
+
+    #[test]
+    fn grounding_without_a_declared_surcharge_is_a_clear_error() {
+        let config: ProjectConfig = serde_yaml::from_str(project_yaml()).unwrap();
+        assert_eq!(config.cost_model.web_search_surcharge_usd, None);
+        let lock: ModelLock = serde_yaml::from_str(lock_yaml()).unwrap();
+        let grounded = prompt("high", QualityTier::High)
+            .with_grounded_tiers(BTreeSet::from([QualityTier::High]));
+        let error = compile(
+            &[grounded],
+            &config.cost_model,
+            &lock,
+            None,
+            WorkloadEstimate::default(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("web_search_surcharge_usd is not set"));
+    }
+
+    #[test]
+    fn negative_surcharge_is_a_clear_error() {
+        let config: ProjectConfig =
+            serde_yaml::from_str(&project_yaml_with_surcharge(-0.01)).unwrap();
+        let lock: ModelLock = serde_yaml::from_str(lock_yaml()).unwrap();
+        let error = compile(
+            &[prompt("high", QualityTier::High)],
+            &config.cost_model,
+            &lock,
+            None,
+            WorkloadEstimate::default(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("web_search_surcharge_usd must be a non-negative"));
+    }
+
+    #[test]
+    fn ungrounded_prompt_is_unaffected_by_a_declared_surcharge() {
+        let config: ProjectConfig =
+            serde_yaml::from_str(&project_yaml_with_surcharge(0.004)).unwrap();
+        let lock: ModelLock = serde_yaml::from_str(lock_yaml()).unwrap();
+        let artifact = compile(
+            &[prompt("high", QualityTier::High)],
+            &config.cost_model,
+            &lock,
+            None,
+            WorkloadEstimate::default(),
+        )
+        .unwrap();
+        assert!(cascade(&artifact.prompts["high"])
+            .steps
+            .iter()
+            .all(|step| !step.grounded));
     }
 }

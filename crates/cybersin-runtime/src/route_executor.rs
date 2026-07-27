@@ -874,6 +874,7 @@ mod tests {
                                         minimum_score: 0.9,
                                         instruction: "score".into(),
                                     },
+                                    grounded: false,
                                 },
                                 CascadeStep {
                                     model: model("strong", ModelKind::Provider),
@@ -881,6 +882,7 @@ mod tests {
                                         minimum_score: 0.9,
                                         instruction: "score".into(),
                                     },
+                                    grounded: false,
                                 },
                             ],
                         }),

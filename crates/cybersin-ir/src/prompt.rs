@@ -7,7 +7,7 @@
 //! downstream. Optimizer passes (`cybersin-passes`) consume and produce
 //! this same shape (IR → IR), and backends render it per model family.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,14 @@ pub struct PromptIr {
     pub sections: Vec<Section>,
     /// Optional structured-output contract.
     pub output_contract: Option<OutputContract>,
+    /// Quality tiers whose router-compiled cascade step should be grounded
+    /// in OpenRouter web search (spec issue #80), a routing-level
+    /// mechanism distinct from the harness-decided `web_search` tool named
+    /// in `tools` above. Purely additive — `#[serde(default)]` so IR
+    /// written before this field existed keeps deserializing, and
+    /// `IR_VERSION` does not bump.
+    #[serde(default)]
+    pub grounded_tiers: BTreeSet<QualityTier>,
 }
 
 impl PromptIr {
@@ -66,7 +74,16 @@ impl PromptIr {
             tools,
             sections,
             output_contract,
+            grounded_tiers: BTreeSet::new(),
         }
+    }
+
+    /// Builder-style setter for [`PromptIr::grounded_tiers`], kept separate
+    /// from [`PromptIr::new`] so existing positional call sites are
+    /// unaffected by this field's addition.
+    pub fn with_grounded_tiers(mut self, grounded_tiers: BTreeSet<QualityTier>) -> Self {
+        self.grounded_tiers = grounded_tiers;
+        self
     }
 }
 
@@ -194,6 +211,30 @@ mod tests {
     #[test]
     fn prompt_ir_round_trips_through_json() {
         let original = sample_prompt_ir();
+        let json = serde_json::to_string(&original).expect("serialize");
+        let restored: PromptIr = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn prompt_ir_without_grounded_tiers_field_deserializes() {
+        // IR written before `grounded_tiers` existed (e.g. hand-authored
+        // dist fixtures) must keep deserializing (spec §6.6's shared-shape
+        // contract), defaulting to no grounded tiers.
+        let mut original = sample_prompt_ir();
+        let mut json: serde_json::Value =
+            serde_json::to_value(&original).expect("serialize to value");
+        json.as_object_mut()
+            .expect("object")
+            .remove("grounded_tiers");
+        let restored: PromptIr = serde_json::from_value(json).expect("deserialize");
+        original.grounded_tiers = BTreeSet::new();
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn prompt_ir_with_grounded_tiers_round_trips() {
+        let original = sample_prompt_ir().with_grounded_tiers(BTreeSet::from([QualityTier::High]));
         let json = serde_json::to_string(&original).expect("serialize");
         let restored: PromptIr = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, restored);
