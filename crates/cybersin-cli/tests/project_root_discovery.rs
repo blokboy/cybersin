@@ -15,12 +15,18 @@ fn cybersin() -> Command {
     Command::cargo_bin("cybersin").expect("find cybersin binary")
 }
 
-fn write_hello_prompt(project: &std::path::Path) {
+fn write_prompt(project: &std::path::Path, name: &str) {
     std::fs::write(
-        project.join("prompts/hello.prompt.yaml"),
-        "name: hello\nquality: medium\nsections:\n- id: prompt\n  priority: 100\n  body: Hello.\n",
+        project.join(format!("prompts/{name}.prompt.yaml")),
+        format!(
+            "name: {name}\nquality: medium\nsections:\n- id: prompt\n  priority: 100\n  body: Hello.\n"
+        ),
     )
     .unwrap();
+}
+
+fn write_hello_prompt(project: &std::path::Path) {
+    write_prompt(project, "hello");
 }
 
 #[test]
@@ -96,7 +102,12 @@ fn dist_resolves_against_the_discovered_project_root_when_present() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("myagent");
     cybersin().arg("init").arg(&project).assert().success();
+    // Two compiled prompts, so bare `run` can't infer the single-prompt
+    // built-in starter (which would head off toward live model calling) and
+    // instead fails target inference with a message that embeds the
+    // resolved dist path.
     write_hello_prompt(&project);
+    write_prompt(&project, "goodbye");
     cybersin()
         .arg("build")
         .arg(&project)
@@ -112,11 +123,15 @@ fn dist_resolves_against_the_discovered_project_root_when_present() {
     // No `--dist` flag: `run` (without `--stub` or an agent path) must get
     // past dist resolution and reach its own no-runnable-target validation,
     // proving `<root>/dist` was found rather than erroring out for a
-    // missing dist/.
+    // missing dist/. The error names the prompts dir under the discovered
+    // root, which is the discovery proof itself.
     cybersin()
         .current_dir(&nested)
         .arg("run")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("no runnable agent targets found"));
+        .stderr(predicate::str::contains("no runnable agent targets found"))
+        .stderr(predicate::str::contains(
+            project.join("dist").join("prompts").display().to_string(),
+        ));
 }

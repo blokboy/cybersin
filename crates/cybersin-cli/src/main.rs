@@ -532,7 +532,10 @@ fn from_async(result: anyhow::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("error: {err}");
+            // `:#` prints the whole anyhow context chain ("configuring live
+            // model calling: OPENROUTER_API_KEY is not set; ...") — the root
+            // cause is usually the only actionable part.
+            eprintln!("error: {err:#}");
             ExitCode::FAILURE
         }
     }
