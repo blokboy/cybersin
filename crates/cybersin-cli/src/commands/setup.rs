@@ -31,6 +31,16 @@ pub struct SetupArgs {
     pub raw_openrouter_api_key: Option<String>,
 }
 
+impl Default for SetupArgs {
+    fn default() -> Self {
+        Self {
+            openrouter_api_key_env: OPENROUTER_API_KEY_ENV.to_string(),
+            model: DEFAULT_OPENROUTER_MODEL.to_string(),
+            raw_openrouter_api_key: None,
+        }
+    }
+}
+
 pub fn execute(project_start: &Path, args: SetupArgs) -> anyhow::Result<()> {
     if args.raw_openrouter_api_key.is_some() {
         anyhow::bail!(

@@ -143,6 +143,9 @@ enum Command {
         /// Report what would be created or skipped without writing files.
         #[arg(long)]
         dry_run: bool,
+        /// After scaffolding, write local readiness defaults and run doctor.
+        #[arg(long)]
+        setup: bool,
     },
     /// Normalize the formatting of a `*.prompt.yaml` source file.
     Fmt {
@@ -283,10 +286,32 @@ async fn main() -> ExitCode {
             dir,
             force,
             dry_run,
-        } => from_sync(commands::init::run_with_options(
-            &dir,
-            commands::init::InitOptions { force, dry_run },
-        )),
+            setup,
+        } => {
+            let init = commands::init::run_with_options(
+                &dir,
+                commands::init::InitOptions { force, dry_run },
+            );
+            match init {
+                Ok(message) => {
+                    if let Some(message) = message {
+                        println!("{message}");
+                    }
+                    if setup && !dry_run {
+                        from_async(commands::setup::execute(
+                            &dir,
+                            commands::setup::SetupArgs::default(),
+                        ))
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(message) => {
+                    eprintln!("{message}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::Fmt { path, check } => from_sync(commands::fmt::run(&path, check)),
         Command::Run(args) => {
             let (db, sandbox_root, sandbox_backend, defaults) =
