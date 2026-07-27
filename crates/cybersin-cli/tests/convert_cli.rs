@@ -48,6 +48,11 @@ async fn convert_discovers_the_project_and_writes_a_valid_draft() {
     assert!(std::fs::read_to_string(written)
         .unwrap()
         .contains("Write from a nested directory."));
+    assert!(!project.path().join("agents").exists());
+    assert!(!project.path().join("evals").exists());
+    assert!(!project.path().join("builds").exists());
+    assert!(!project.path().join("runs").exists());
+    assert!(!project.path().join(".cybersin").exists());
 }
 
 #[tokio::test]
@@ -135,6 +140,57 @@ async fn convert_loads_project_dotenv_before_openrouter_readiness_check() {
         .exists());
 }
 
+#[tokio::test]
+async fn convert_resolves_openrouter_from_local_config_and_dotenv() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key-from-dotenv"))
+        .and(body_partial_json(json!({"model": "test-converter"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"name\":\"local-config-draft\",\"quality\":\"medium\",\"sections\":[{\"id\":\"prompt\",\"priority\":100,\"body\":\"ignored\"}]}"
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("cybersin.yaml"), "name: test\n").unwrap();
+    std::fs::write(
+        project.path().join("cybersin.local.yaml"),
+        format!(
+            "providers:\n  openrouter:\n    api_key: ${{OPENROUTER_API_KEY}}\n    base_url: {}\n",
+            server.uri()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join(".env"),
+        "OPENROUTER_API_KEY=\"Bearer test-key-from-dotenv\"\n",
+    )
+    .unwrap();
+
+    cybersin()
+        .current_dir(project.path())
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("OPENROUTER_BASE_URL")
+        .arg("convert")
+        .arg("--model")
+        .arg("test-converter")
+        .arg("Use local config credentials.")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("self-validation passed"));
+
+    assert!(project
+        .path()
+        .join("prompts/local-config-draft.prompt.yaml")
+        .exists());
+}
+
 #[test]
 fn convert_reports_a_missing_project_with_a_nonzero_exit() {
     let outside_project = tempfile::tempdir().unwrap();
@@ -156,11 +212,38 @@ fn convert_reports_missing_openrouter_key() {
     cybersin()
         .current_dir(project.path())
         .env_remove("OPENROUTER_API_KEY")
+        .env_remove("OPENROUTER_BASE_URL")
         .arg("convert")
         .arg("A raw prompt")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("OPENROUTER_API_KEY"));
+        .stderr(predicate::str::contains("OPENROUTER_API_KEY"))
+        .stderr(predicate::str::contains("cybersin.local.yaml"));
+}
+
+#[test]
+fn convert_reports_missing_local_config_key_reference() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("cybersin.yaml"), "name: test\n").unwrap();
+    std::fs::write(
+        project.path().join("cybersin.local.yaml"),
+        "providers:\n  openrouter:\n    api_key: ${CYBERSIN_TEST_MISSING_OPENROUTER_KEY}\n",
+    )
+    .unwrap();
+
+    cybersin()
+        .current_dir(project.path())
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("OPENROUTER_BASE_URL")
+        .env_remove("CYBERSIN_TEST_MISSING_OPENROUTER_KEY")
+        .arg("convert")
+        .arg("A raw prompt")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "CYBERSIN_TEST_MISSING_OPENROUTER_KEY",
+        ))
+        .stderr(predicate::str::contains("project .env"));
 }
 
 #[tokio::test]

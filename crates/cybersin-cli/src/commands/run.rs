@@ -29,6 +29,7 @@ use cybersin_runtime::{
 use tokio::process::{Child, Command};
 
 use crate::harness_config::AgentMeta;
+use crate::readiness;
 use crate::tool_executor::{self, GatewayToolCaller};
 
 /// How long `cybersin run`'s `harness.adapter: grpc` path waits for the
@@ -291,20 +292,14 @@ fn openrouter_from_local_config(
     dist: Arc<DistFixture>,
     config: Option<&LocalConfigFile>,
 ) -> Result<OpenRouterModelCaller, cybersin_runtime::MissingApiKey> {
-    let provider = config.and_then(|config| config.provider("openrouter"));
-    let api_key = provider
-        .and_then(|provider| provider.api_key.as_ref())
-        .and_then(|reference| reference.read());
-    let caller = match api_key {
+    let caller = match readiness::resolve_openrouter_api_key(config) {
         Some(api_key) => OpenRouterModelCaller::new(dist, api_key),
         None => OpenRouterModelCaller::from_env(dist)?,
     };
-    Ok(
-        match provider.and_then(|provider| provider.base_url.as_ref()) {
-            Some(base_url) => caller.with_base_url(base_url.clone()),
-            None => caller,
-        },
-    )
+    Ok(match readiness::openrouter_base_url(config) {
+        Some(base_url) => caller.with_base_url(base_url),
+        None => caller,
+    })
 }
 
 /// Spawns `harness.command` and returns its process handle plus a

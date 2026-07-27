@@ -104,6 +104,35 @@ fn init_scaffolds_only_the_basic_project_spine() {
 }
 
 #[test]
+fn doctor_reports_ready_setup_without_requiring_dist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("myagent");
+    cybersin().arg("init").arg(&project).assert().success();
+    fs::write(project.join(".env"), "OPENROUTER_API_KEY=test-key\n").unwrap();
+    fs::write(
+        project.join("cybersin.local.yaml"),
+        "providers:\n  openrouter:\n    availability: available\ndefaults:\n  provider: openrouter\n  model: openai/gpt-4o-mini\npermissions:\n  routing:\n    allowed_providers: [openrouter]\n",
+    )
+    .unwrap();
+
+    cybersin()
+        .arg("--project")
+        .arg(&project)
+        .arg("doctor")
+        .env_remove("OPENROUTER_API_KEY")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Cybersin doctor"))
+        .stdout(predicate::str::contains(
+            "api key: ready via .env:OPENROUTER_API_KEY",
+        ))
+        .stdout(predicate::str::contains("[warn] dist/ missing"))
+        .stdout(predicate::str::contains(
+            "Run `cybersin build . --profile dev --frozen`",
+        ));
+}
+
+#[test]
 fn init_skips_existing_files_unless_forced_and_supports_dry_run() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("myagent");
@@ -281,7 +310,7 @@ name: unsorted
 }
 
 #[test]
-fn build_frozen_fails_when_release_compression_is_not_pinned() {
+fn default_build_uses_dev_profile_and_succeeds_frozen_without_pins() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("project");
     cybersin().arg("init").arg(&project).assert().success();
@@ -292,12 +321,12 @@ fn build_frozen_fails_when_release_compression_is_not_pinned() {
         .arg(&project)
         .arg("--frozen")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("would require a network call"));
+        .success();
+    assert!(project.join("dist/prompts/hello.json").exists());
 }
 
 #[test]
-fn dev_build_excludes_compression_and_succeeds_frozen_without_pins() {
+fn explicit_dev_build_excludes_compression_and_succeeds_frozen_without_pins() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("project");
     cybersin().arg("init").arg(&project).assert().success();
@@ -312,6 +341,81 @@ fn dev_build_excludes_compression_and_succeeds_frozen_without_pins() {
         .assert()
         .success();
     assert!(project.join("dist/prompts/hello.json").exists());
+}
+
+#[test]
+fn explicit_release_build_runs_release_compression_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    cybersin().arg("init").arg(&project).assert().success();
+    write_hello_prompt(&project);
+
+    cybersin()
+        .arg("build")
+        .arg(&project)
+        .arg("--profile")
+        .arg("release")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "compression provider failed: no compression provider configured",
+        ));
+}
+
+#[test]
+fn frozen_release_build_refuses_unpinned_compression() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    cybersin().arg("init").arg(&project).assert().success();
+    write_hello_prompt(&project);
+
+    cybersin()
+        .arg("build")
+        .arg(&project)
+        .arg("--profile")
+        .arg("release")
+        .arg("--frozen")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("would require a network call"));
+}
+
+#[test]
+fn build_validates_prompt_sources_before_replacing_dist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    cybersin().arg("init").arg(&project).assert().success();
+    write_hello_prompt(&project);
+
+    cybersin().arg("build").arg(&project).assert().success();
+    let manifest = fs::read_to_string(project.join("dist/manifest.json")).unwrap();
+
+    fs::write(
+        project.join("prompts/broken.prompt.yaml"),
+        r#"
+name: broken
+quality: medium
+inputs:
+  unused: string
+sections:
+  - id: body
+    priority: 100
+    body: "Nothing references the input."
+"#,
+    )
+    .unwrap();
+
+    cybersin()
+        .arg("build")
+        .arg(&project)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("typecheck failed"));
+
+    assert_eq!(
+        fs::read_to_string(project.join("dist/manifest.json")).unwrap(),
+        manifest
+    );
 }
 
 #[test]

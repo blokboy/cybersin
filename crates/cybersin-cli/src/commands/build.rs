@@ -245,6 +245,15 @@ fn run_sources_into_with_progress(
     }
     on_progress(BuildProgress::DiscoveredPrompts(sources.clone()));
 
+    let compiled_sources = sources
+        .iter()
+        .map(|source| {
+            compile_prompt_source(source)
+                .map(|ir| (source.clone(), ir))
+                .map_err(|e| format!("error: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     // Every build fully determines dist/ from sources + lockfile (spec
     // §7); starting from a clean directory means a renamed/removed
     // prompt, or a target dropped from `cybersin.yaml`, can't leave a
@@ -259,11 +268,10 @@ fn run_sources_into_with_progress(
         .map_err(|e| format!("error: failed to create {}: {e}", prompt_dir.display()))?;
 
     let mut compiled: Vec<PromptIr> = Vec::new();
-    for source in &sources {
-        let ir = compile_prompt_source(source).map_err(|e| format!("error: {e}"))?;
+    for (source, ir) in compiled_sources {
         on_progress(BuildProgress::PromptStarted {
             name: ir.name.clone(),
-            source: source.clone(),
+            source,
         });
         let outcome = run_pipeline_with_progress(&pipeline, ir, None, |prompt, pass| {
             on_progress(BuildProgress::PassFinished {

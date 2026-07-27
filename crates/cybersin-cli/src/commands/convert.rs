@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
+use cybersin_runtime::LocalConfigFile;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
@@ -98,13 +99,27 @@ pub struct OpenRouterPromptConversionModel {
 }
 
 impl OpenRouterPromptConversionModel {
-    pub fn from_env(model: String) -> Result<Self, String> {
-        let api_key = std::env::var("OPENROUTER_API_KEY").map_err(|_| {
-            "error: OPENROUTER_API_KEY is required for `cybersin convert`".to_string()
+    pub fn from_local_config(
+        model: String,
+        config: Option<&LocalConfigFile>,
+    ) -> Result<Self, String> {
+        let api_key = crate::readiness::resolve_openrouter_api_key(config).ok_or_else(|| {
+            crate::readiness::openrouter_key_reference(config)
+                .map(|variable| missing_openrouter_key_ref(&variable))
+                .unwrap_or_else(missing_openrouter_key)
         })?;
+        let base_url = crate::readiness::openrouter_base_url(config)
+            .or_else(|| std::env::var("OPENROUTER_BASE_URL").ok());
+        Self::from_parts(model, api_key, base_url)
+    }
+
+    fn from_parts(
+        model: String,
+        api_key: String,
+        base_url: Option<String>,
+    ) -> Result<Self, String> {
         let api_key = normalize_openrouter_api_key(&api_key)?;
-        let base_url =
-            std::env::var("OPENROUTER_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         Ok(Self {
             client: reqwest::Client::new(),
             api_key,
@@ -112,6 +127,16 @@ impl OpenRouterPromptConversionModel {
             model,
         })
     }
+}
+
+fn missing_openrouter_key() -> String {
+    "error: no OpenRouter API key configured for `cybersin convert`; set OPENROUTER_API_KEY or add providers.openrouter.api_key to cybersin.local.yaml".to_string()
+}
+
+fn missing_openrouter_key_ref(variable: &str) -> String {
+    format!(
+        "error: providers.openrouter.api_key references {variable}, but that environment variable is not set; add it to the environment or project .env"
+    )
 }
 
 fn normalize_openrouter_api_key(raw: &str) -> Result<String, String> {
@@ -324,7 +349,11 @@ pub async fn execute(
             project_start.display()
         )
     })?;
-    let converter = OpenRouterPromptConversionModel::from_env(model).map_err(anyhow::Error::msg)?;
+    crate::project::ProjectDefaults::detect(&project_root)?.load_dotenv()?;
+    let local_config = LocalConfigFile::load_optional(&project_root)?;
+    let converter =
+        OpenRouterPromptConversionModel::from_local_config(model, local_config.as_ref())
+            .map_err(anyhow::Error::msg)?;
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
     let report = run_with(
