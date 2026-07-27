@@ -22,5 +22,6 @@ pub mod optimize;
 pub mod run;
 pub mod sandbox;
 pub mod sessions;
+pub mod setup;
 pub mod trace;
 pub mod tui;

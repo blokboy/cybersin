@@ -1112,6 +1112,18 @@ pub fn registry() -> CapabilityRegistry {
             cli(),
         ),
         spec(
+            "workflow.setup",
+            "Setup local readiness",
+            "Create or update local OpenRouter-first config, then report setup readiness.",
+            CapabilityCategory::Workflow,
+            vec![OutputMode::Text],
+            SafetyProfile {
+                file_mutation: MutationLevel::WritesProjectFiles,
+                ..SafetyProfile::read_only()
+            },
+            cli(),
+        ),
+        spec(
             "control.ops",
             "Open ops",
             "Inspect and interact with project sessions, traces, costs, approvals, and builds.",
