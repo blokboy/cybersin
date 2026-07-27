@@ -16,8 +16,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `internal-test-bins` gates the test-support harness binaries
+      # (grpc_stub_harness, scripted_harness) that run_live_grpc.rs and
+      # friends spawn; without it `cargo test` compiles those tests but
+      # never builds the binaries they exec.
       - name: cargo test --workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --features cybersin/internal-test-bins
 
   postgres-parity:
     name: Test (Postgres/SQLite parity)

@@ -11,6 +11,7 @@ use cybersin_runtime::{Availability, LocalConfigFile, ProviderConfig};
 
 pub const OPENROUTER_PROVIDER: &str = "openrouter";
 pub const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+pub const OPENROUTER_BASE_URL_ENV: &str = "OPENROUTER_BASE_URL";
 
 #[derive(Clone, Debug, Default)]
 pub struct DotenvReadiness {

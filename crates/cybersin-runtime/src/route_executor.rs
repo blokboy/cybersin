@@ -3,6 +3,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use cybersin_router::{CascadeStep, RouteDecision, RouteModel, RoutingArtifact};
@@ -116,9 +117,65 @@ pub struct ExecutionRequest {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ModelUsage {
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub usd_cost: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelOutput {
     pub response: Value,
     pub confidence: f64,
+    pub usage: Option<ModelUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelErrorClass {
+    Transient { retry_after: Option<Duration> },
+    Permanent,
+}
+
+impl ModelErrorClass {
+    pub fn transient() -> Self {
+        Self::Transient { retry_after: None }
+    }
+
+    pub fn transient_with_retry_after(retry_after: Duration) -> Self {
+        Self::Transient {
+            retry_after: Some(retry_after),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{message}")]
+pub struct ModelCallError {
+    pub class: ModelErrorClass,
+    pub message: String,
+}
+
+impl ModelCallError {
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            class: ModelErrorClass::transient(),
+            message: message.into(),
+        }
+    }
+
+    pub fn transient_with_retry_after(message: impl Into<String>, retry_after: Duration) -> Self {
+        Self {
+            class: ModelErrorClass::transient_with_retry_after(retry_after),
+            message: message.into(),
+        }
+    }
+
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            class: ModelErrorClass::Permanent,
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,6 +184,7 @@ pub struct ExecutionResponse {
     pub model: Option<String>,
     pub cache_hit: bool,
     pub usd_cost: f64,
+    pub usage: Option<ModelUsage>,
 }
 
 /// The model a "normal" (non-degraded) call to `route` would use: its
@@ -181,7 +239,7 @@ pub trait ModelCaller: Send + Sync {
         inputs: &Value,
         confidence_instruction: Option<&str>,
         grounded: bool,
-    ) -> Result<ModelOutput, String>;
+    ) -> Result<ModelOutput, ModelCallError>;
 }
 
 #[async_trait]
@@ -334,6 +392,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                             CacheStatus::Hit,
                             request.default_model.as_ref(),
                             0.0,
+                            None,
                             serde_json::json!({ "decision": "cache_hit" }),
                         )
                         .await?;
@@ -379,12 +438,16 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                 if force_accept
                                     || output.confidence >= step.confidence.minimum_score =>
                             {
+                                let usage = output.usage.clone();
+                                let usd_cost =
+                                    observed_usd_cost(&usage, step.model.estimated_cost_usd);
                                 self.record(
                                     request,
                                     SpanKind::LlmCall,
                                     CacheStatus::Miss,
                                     Some(&step.model),
                                     step.model.estimated_cost_usd,
+                                    usage.as_ref(),
                                     serde_json::json!({
                                         "decision": if force_accept { "degrade_forced" } else { "cascade_accept" },
                                         "model": step.model.name,
@@ -398,16 +461,19 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     response: output.response,
                                     model: Some(step.model.name.clone()),
                                     cache_hit: false,
-                                    usd_cost: step.model.estimated_cost_usd,
+                                    usd_cost,
+                                    usage,
                                 });
                             }
                             Ok(output) => {
+                                let usage = output.usage.clone();
                                 self.record(
                                     request,
                                     SpanKind::LlmCall,
                                     CacheStatus::Miss,
                                     Some(&step.model),
                                     step.model.estimated_cost_usd,
+                                    usage.as_ref(),
                                     serde_json::json!({
                                         "decision": "cascade_escalation",
                                         "model": step.model.name,
@@ -425,10 +491,11 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     CacheStatus::Miss,
                                     Some(&step.model),
                                     step.model.estimated_cost_usd,
+                                    None,
                                     serde_json::json!({
                                         "decision": "cascade_error",
                                         "model": step.model.name,
-                                        "error": error,
+                                        "error": error.to_string(),
                                         "grounded": step.grounded,
                                     }),
                                 )
@@ -448,12 +515,15 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                             .await
                         {
                             Ok(output) => {
+                                let usage = output.usage.clone();
+                                let usd_cost = observed_usd_cost(&usage, model.estimated_cost_usd);
                                 self.record(
                                     request,
                                     SpanKind::LlmCall,
                                     CacheStatus::Miss,
                                     Some(model),
                                     model.estimated_cost_usd,
+                                    usage.as_ref(),
                                     serde_json::json!({
                                         "decision": "fallback_accept",
                                         "model": model.name,
@@ -466,7 +536,8 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     response: output.response,
                                     model: Some(model.name.clone()),
                                     cache_hit: false,
-                                    usd_cost: model.estimated_cost_usd,
+                                    usd_cost,
+                                    usage,
                                 });
                             }
                             Err(error) => {
@@ -476,10 +547,11 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     CacheStatus::Miss,
                                     Some(model),
                                     model.estimated_cost_usd,
+                                    None,
                                     serde_json::json!({
                                         "decision": "fallback_error",
                                         "model": model.name,
-                                        "error": error,
+                                        "error": error.to_string(),
                                         "grounded": false,
                                     }),
                                 )
@@ -505,6 +577,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 CacheStatus::Miss,
                 None,
                 0.0,
+                None,
                 serde_json::json!({"decision": "bypass", "similarity": Value::Null}),
             )
             .await?;
@@ -517,6 +590,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 CacheStatus::Miss,
                 None,
                 0.0,
+                None,
                 serde_json::json!({
                     "decision": "namespace_invalidated",
                     "similarity": Value::Null,
@@ -541,6 +615,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 CacheStatus::Hit,
                 None,
                 0.0,
+                None,
                 serde_json::json!({"decision": "hash_hit", "similarity": 1.0}),
             )
             .await?;
@@ -559,6 +634,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 CacheStatus::Miss,
                 None,
                 0.0,
+                None,
                 serde_json::json!({"decision": "miss", "similarity": Value::Null}),
             )
             .await?;
@@ -572,6 +648,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 CacheStatus::Hit,
                 None,
                 0.0,
+                None,
                 serde_json::json!({"decision": "knn_hit", "similarity": similarity}),
             )
             .await?;
@@ -600,6 +677,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 },
                 Some(&cache.judge),
                 0.0,
+                None,
                 serde_json::json!({
                     "decision": if accepted { "judge_hit" } else { "judge_reject" },
                     "similarity": similarity,
@@ -620,6 +698,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
             CacheStatus::Miss,
             None,
             0.0,
+            None,
             serde_json::json!({"decision": "miss", "similarity": similarity}),
         )
         .await?;
@@ -634,6 +713,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
         cache_status: CacheStatus,
         model: Option<&RouteModel>,
         usd_cost: f64,
+        usage: Option<&ModelUsage>,
         mut attributes: Value,
     ) -> Result<(), RouteExecutorError> {
         let now = now_unix_ms();
@@ -643,15 +723,31 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
         let (tokens_prompt, tokens_completion, evicted_sections) = if kind == SpanKind::LlmCall {
             if let Value::Object(map) = &mut attributes {
                 map.insert("context".to_string(), request.context_attributes.clone());
+                map.insert(
+                    "usage_source".to_string(),
+                    Value::String(
+                        if usage.is_some() {
+                            "provider"
+                        } else {
+                            "route_estimate"
+                        }
+                        .to_string(),
+                    ),
+                );
             }
             (
-                Some(request.prompt_tokens),
-                request.completion_tokens,
+                usage
+                    .and_then(|usage| usage.prompt_tokens)
+                    .or(Some(request.prompt_tokens)),
+                usage
+                    .and_then(|usage| usage.completion_tokens)
+                    .or(request.completion_tokens),
                 request.evicted_sections.clone(),
             )
         } else {
             (None, None, Vec::new())
         };
+        let usd_cost = usage.and_then(|usage| usage.usd_cost).unwrap_or(usd_cost);
         self.spans
             .insert(&Span {
                 id: format!(
@@ -700,7 +796,15 @@ fn cache_response(response: Value) -> ExecutionResponse {
         model: None,
         cache_hit: true,
         usd_cost: 0.0,
+        usage: None,
     }
+}
+
+fn observed_usd_cost(usage: &Option<ModelUsage>, estimate: f64) -> f64 {
+    usage
+        .as_ref()
+        .and_then(|usage| usage.usd_cost)
+        .unwrap_or(estimate)
 }
 
 fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f64> {
@@ -793,11 +897,36 @@ mod tests {
             _inputs: &Value,
             _confidence_instruction: Option<&str>,
             _grounded: bool,
-        ) -> Result<ModelOutput, String> {
+        ) -> Result<ModelOutput, ModelCallError> {
             self.0.lock().unwrap().push(model.name.clone());
             Ok(ModelOutput {
                 response: serde_json::json!({"from": model.name}),
                 confidence: if model.name == "cheap" { 0.4 } else { 0.95 },
+                usage: None,
+            })
+        }
+    }
+
+    struct UsageCalls;
+
+    #[async_trait]
+    impl ModelCaller for UsageCalls {
+        async fn call(
+            &self,
+            model: &RouteModel,
+            _prompt_name: &str,
+            _inputs: &Value,
+            _confidence_instruction: Option<&str>,
+            _grounded: bool,
+        ) -> Result<ModelOutput, ModelCallError> {
+            Ok(ModelOutput {
+                response: serde_json::json!({"from": model.name}),
+                confidence: 0.95,
+                usage: Some(ModelUsage {
+                    prompt_tokens: Some(7),
+                    completion_tokens: Some(11),
+                    usd_cost: Some(0.00042),
+                }),
             })
         }
     }
@@ -848,15 +977,16 @@ mod tests {
             _inputs: &Value,
             _confidence_instruction: Option<&str>,
             _grounded: bool,
-        ) -> Result<ModelOutput, String> {
+        ) -> Result<ModelOutput, ModelCallError> {
             self.0.lock().unwrap().push(model.name.clone());
             if model.name == "backup" {
                 Ok(ModelOutput {
                     response: serde_json::json!("fallback"),
                     confidence: 0.1,
+                    usage: None,
                 })
             } else {
-                Err("unavailable".into())
+                Err(ModelCallError::permanent("unavailable"))
             }
         }
     }
@@ -878,11 +1008,12 @@ mod tests {
             _inputs: &Value,
             _confidence_instruction: Option<&str>,
             grounded: bool,
-        ) -> Result<ModelOutput, String> {
+        ) -> Result<ModelOutput, ModelCallError> {
             self.0.lock().unwrap().push((model.name.clone(), grounded));
             Ok(ModelOutput {
                 response: serde_json::json!({"from": model.name}),
                 confidence: if model.name == "cheap" { 0.4 } else { 0.95 },
+                usage: None,
             })
         }
     }
@@ -904,15 +1035,16 @@ mod tests {
             _inputs: &Value,
             _confidence_instruction: Option<&str>,
             grounded: bool,
-        ) -> Result<ModelOutput, String> {
+        ) -> Result<ModelOutput, ModelCallError> {
             self.0.lock().unwrap().push((model.name.clone(), grounded));
             if model.name == "backup" {
                 Ok(ModelOutput {
                     response: serde_json::json!("fallback"),
                     confidence: 0.1,
+                    usage: None,
                 })
             } else {
-                Err("unavailable".into())
+                Err(ModelCallError::permanent("unavailable"))
             }
         }
     }
@@ -1056,6 +1188,52 @@ mod tests {
             span.attributes["decision"] == "cascade_escalation"
                 && span.attributes["model"] == "cheap"
         }));
+    }
+
+    #[tokio::test]
+    async fn provider_usage_overrides_route_estimates_in_llm_span() {
+        let mut req = request();
+        req.bypass = true;
+        req.prompt_tokens = 999;
+        req.completion_tokens = Some(1_000);
+        let spans = SpanStore::in_memory().await.unwrap();
+        let executor = RouteExecutor::new(
+            routing(),
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "v1".into(),
+                entries: vec![],
+            },
+            UsageCalls,
+            AcceptJudge,
+            spans.clone(),
+        );
+
+        let response = executor.execute(&req).await.unwrap();
+
+        assert_eq!(response.usd_cost, 0.00042);
+        assert_eq!(
+            response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.prompt_tokens),
+            Some(7)
+        );
+        let recorded = spans
+            .list(&SpanFilter {
+                kind: Some(SpanKind::LlmCall),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let accepted = recorded
+            .iter()
+            .find(|span| span.attributes["decision"] == "cascade_accept")
+            .expect("accepted llm span");
+        assert_eq!(accepted.tokens_prompt, Some(7));
+        assert_eq!(accepted.tokens_completion, Some(11));
+        assert_eq!(accepted.usd_cost, 0.00042);
+        assert_eq!(accepted.attributes["usage_source"], "provider");
     }
 
     #[tokio::test]

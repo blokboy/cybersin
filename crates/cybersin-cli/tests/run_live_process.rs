@@ -195,8 +195,8 @@ fn run_without_an_agent_path_infers_the_single_runnable_target() {
 }
 
 #[tokio::test]
-async fn convert_build_run_uses_builtin_starter_without_external_harness() {
-    let convert_server = MockServer::start().await;
+async fn setup_golden_path_runs_end_to_end_without_extra_project_files() {
+    let provider_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(header("authorization", "Bearer test-key"))
@@ -208,12 +208,12 @@ async fn convert_build_run_uses_builtin_starter_without_external_harness() {
                 }
             }]
         })))
-        .mount(&convert_server)
+        .mount(&provider_server)
         .await;
-    let run_server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(header("authorization", "Bearer test-key"))
+        .and(body_partial_json(json!({"model": "openai/gpt-4o-mini"})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "choices": [{
                 "message": {
@@ -221,19 +221,45 @@ async fn convert_build_run_uses_builtin_starter_without_external_harness() {
                 }
             }]
         })))
-        .mount(&run_server)
+        .mount(&provider_server)
         .await;
 
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project");
     let db = project.join(".cybersin/cybersin.db");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(
+        project.join(".env"),
+        format!(
+            "OPENROUTER_API_KEY=\"test-key\"\nOPENROUTER_BASE_URL=\"{}\"\n",
+            provider_server.uri()
+        ),
+    )
+    .unwrap();
 
-    cybersin().arg("init").arg(&project).assert().success();
+    // The golden path is intentionally exactly these five user commands,
+    // in order: no `check`, no agent creation, no explicit agent path, no
+    // user-authored harness file, and no starter template.
+    cybersin()
+        .current_dir(&project)
+        .arg("init")
+        .arg(".")
+        .assert()
+        .success();
 
     cybersin()
         .current_dir(&project)
-        .env("OPENROUTER_API_KEY", "test-key")
-        .env("OPENROUTER_BASE_URL", convert_server.uri())
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("OPENROUTER_BASE_URL")
+        .arg("setup")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Cybersin doctor"));
+
+    cybersin()
+        .current_dir(&project)
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("OPENROUTER_BASE_URL")
         .arg("convert")
         .arg("--model")
         .arg("test-converter")
@@ -257,18 +283,10 @@ async fn convert_build_run_uses_builtin_starter_without_external_harness() {
         .assert()
         .success();
 
-    std::fs::write(
-        project.join("cybersin.local.yaml"),
-        format!(
-            "providers:\n  openrouter:\n    api_key: ${{OPENROUTER_API_KEY}}\n    base_url: {}\n",
-            run_server.uri()
-        ),
-    )
-    .unwrap();
-
     cybersin()
         .current_dir(&project)
-        .env("OPENROUTER_API_KEY", "test-key")
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("OPENROUTER_BASE_URL")
         .arg("run")
         .arg("--session-id")
         .arg("sess-starter")
@@ -297,7 +315,7 @@ async fn convert_build_run_uses_builtin_starter_without_external_harness() {
         .assert()
         .success()
         .stdout(predicate::str::contains("llm_call"))
-        .stdout(predicate::str::contains("stub-medium"));
+        .stdout(predicate::str::contains("openai/gpt-4o-mini"));
 
     cybersin()
         .current_dir(&project)
@@ -310,6 +328,79 @@ async fn convert_build_run_uses_builtin_starter_without_external_harness() {
         .stdout(predicate::str::contains("TOTAL"));
 
     assert!(db.is_file(), "runtime session should create the normal db");
+    assert!(project.join("dist/manifest.json").is_file());
+    assert!(project.join("dist/routing.json").is_file());
+    assert!(project.join("dist/cache.json").is_file());
+    assert!(project.join("dist/budget/starter-draft.json").is_file());
+    assert!(project.join("dist/prompts/starter-draft.json").is_file());
+    assert!(project
+        .join("dist/prompts/starter-draft/generic.json")
+        .is_file());
+    assert!(!project.join("agents/starter-draft.agent.yaml").exists());
+    assert!(!project.join("loop.py").exists());
+}
+
+#[tokio::test]
+async fn init_starter_template_builds_and_runs_without_external_harness() {
+    let run_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"summary\":\"starter template completed\", \"next_steps\":[\"build\", \"run\"], \"__cascade_confidence\": 0.99}"
+                }
+            }]
+        })))
+        .mount(&run_server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    cybersin()
+        .arg("init")
+        .arg(&project)
+        .arg("--template")
+        .arg("starter")
+        .assert()
+        .success();
+
+    cybersin()
+        .arg("build")
+        .arg(&project)
+        .arg("--profile")
+        .arg("dev")
+        .arg("--frozen")
+        .assert()
+        .success();
+    assert!(
+        !project.join("agents/cybersin-starter.agent.yaml").exists(),
+        "starter init should not require a user-authored harness file"
+    );
+
+    std::fs::write(
+        project.join("cybersin.local.yaml"),
+        format!(
+            "providers:\n  openrouter:\n    api_key: ${{OPENROUTER_API_KEY}}\n    base_url: {}\n",
+            run_server.uri()
+        ),
+    )
+    .unwrap();
+
+    cybersin()
+        .current_dir(&project)
+        .env("OPENROUTER_API_KEY", "test-key")
+        .arg("run")
+        .arg("--session-id")
+        .arg("sess-init-starter")
+        .arg("--input")
+        .arg("inputs/cybersin-starter.input.json")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("built-in starter harness"))
+        .stdout(predicate::str::contains("sess-init-starter completed"))
+        .stdout(predicate::str::contains("spans recorded"));
 }
 
 #[test]

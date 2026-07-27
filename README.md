@@ -75,8 +75,9 @@ skipped: none
 Create the files:
 
 ```sh
-cybersin init myagent
+mkdir myagent
 cd myagent
+cybersin init .
 ```
 
 The scaffold is intentionally minimal:
@@ -98,6 +99,83 @@ Plain `init` is safe for an existing codebase: existing files are skipped and
 reported in the command output. Use `--force` only when you intentionally want
 to overwrite scaffold files.
 
+### Run the Golden Path
+
+For a new project, the simple setup path is:
+
+```sh
+cybersin init .
+cybersin setup
+cybersin convert "Write a concise project brief for durable agent runtimes."
+cybersin build
+cybersin run
+```
+
+Those are the only required workflow commands. A successful `convert` writes
+and validates a prompt source under `prompts/`; `build` validates what it
+compiles into `dist/`; and `run` can infer the built-in starter harness when
+there is exactly one compiled prompt and no explicit `agents/*.agent.yaml`
+target.
+
+`cybersin setup` creates or updates `cybersin.local.yaml`, loads a project-root
+`.env` if present, and then runs the same readiness report as `cybersin
+doctor`. By default it records OpenRouter as the live provider, keeps the
+scaffolded `stub` provider allowed for generated starter/default artifacts,
+and stores API-key references instead of raw secrets:
+
+```yaml
+providers:
+  openrouter:
+    availability: available
+    api_key: ${OPENROUTER_API_KEY}
+defaults:
+  provider: openrouter
+  model: openai/gpt-4o-mini
+permissions:
+  routing:
+    allowed_providers: [openrouter, stub]
+```
+
+Put the actual key in your shell or in the project `.env`:
+
+```sh
+cat > .env <<'EOF'
+OPENROUTER_API_KEY=...
+EOF
+```
+
+Create `.env` before running `cybersin setup` if you want the setup readiness
+report to pass on the first try. The golden path commands stay the same; the
+key is local machine input, not a portable project file.
+
+`cybersin.local.yaml` and `.env` are gitignored by the scaffold. Raw secrets in
+local YAML are a deliberate opt-in in the local-config model; the current
+`cybersin setup` command only writes environment-variable references and rejects
+`--raw-openrouter-api-key`.
+
+Use `cybersin doctor` any time setup or a focused command says the project is
+not ready. It reports project spine, provider keys, local config, build
+artifacts, runtime, trace/cost, and sandbox readiness with next actions.
+
+### Optional Starter Template
+
+Plain `cybersin init .` creates only the basic project spine. If you want a
+complete runnable loop immediately without first using `convert`, opt into the
+starter template:
+
+```sh
+cybersin init myagent --template starter
+cd myagent
+cybersin setup
+cybersin build
+cybersin run --input inputs/cybersin-starter.input.json
+```
+
+The starter template keeps its prompt, fragment, eval, and sample input names
+under the `cybersin-starter` prefix. It does not add a user-authored harness
+file; after `build`, `cybersin run` uses the built-in starter harness for the
+single compiled prompt.
+
 The generated `cybersin.yaml` starts with local SQLite storage, a conservative
 static cost model, and the container sandbox backend:
 
@@ -115,23 +193,43 @@ sandbox:
   backend: docker+gvisor
 ```
 
-### Local Setup
+### Check, Build Profiles, and Release Builds
 
-For live providers and built-in web tools, keep machine-local readiness
-settings out of the portable project config:
+`cybersin check <path>` is still available for CI, manual preflight, and
+hand-edited prompt sources, but it is not required after a successful
+`cybersin convert`. The happy path is `convert`, `build`, then `run`.
+
+`cybersin build` defaults to the dev profile:
 
 ```sh
-cp cybersin.local.example.yaml cybersin.local.yaml
-cat > .env <<'EOF'
-OPENROUTER_API_KEY=...
-TAVILY_API_KEY=...
-EOF
+cybersin build
 ```
 
-`cybersin.local.yaml` is gitignored by the scaffold. Store secret
-references there as environment-variable names, not raw secrets. A local
-config can declare provider/tool availability, sandbox defaults, and
-routing/tool permissions:
+That is the local iteration mode: it validates prompt sources and writes
+normal build artifacts without model-assisted release work. Use the explicit
+release profile when you are preparing production artifacts:
+
+```sh
+cybersin build --profile release
+```
+
+Use frozen release builds in CI or reviewable artifact generation, where any
+network/model-assisted pass must already be pinned in `cybersin.lock`:
+
+```sh
+cybersin build --profile release --frozen
+```
+
+Runtime commands discover the project root by walking up from the current
+directory until they find `cybersin.yaml`. That means defaults such as
+`.cybersin/cybersin.db`, `.cybersin/sandbox`, and `dist/` resolve relative to
+the initialized project unless you override them with CLI flags.
+
+### Local Config Details
+
+For live providers and built-in web tools, keep machine-local readiness
+settings out of the portable project config. A fuller local config can declare
+provider/tool availability, sandbox defaults, and routing/tool permissions:
 
 ```yaml
 providers:
@@ -151,22 +249,9 @@ permissions:
     allowed_providers: [openrouter]
 ```
 
-Cybersin still honors the existing process environment, and it now loads
-an optional project-root `.env` before OpenRouter and Tavily readiness
-checks without overriding variables that are already set.
-
-Add prompt sources under `prompts/`, then check and build from inside the
-project:
-
-```sh
-cybersin check .
-cybersin build . --profile dev --frozen
-```
-
-Runtime commands discover the project root by walking up from the current
-directory until they find `cybersin.yaml`. That means defaults such as
-`.cybersin/cybersin.db`, `.cybersin/sandbox`, and `dist/` resolve relative to
-the initialized project unless you override them with CLI flags.
+Cybersin still honors the ambient process environment, and it loads optional
+project-root `.env` values before OpenRouter and Tavily readiness checks
+without overriding variables that are already set.
 
 ### Build and run the sample project
 

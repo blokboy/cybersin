@@ -133,7 +133,7 @@ enum Command {
         input: String,
     },
     /// Scaffold a new project spine (spec §5): core config plus empty
-    /// source directories, without starter prompts or build output.
+    /// source directories, with an opt-in runnable starter template.
     Init {
         /// Directory to scaffold the project into (created if missing).
         dir: PathBuf,
@@ -143,6 +143,9 @@ enum Command {
         /// Report what would be created or skipped without writing files.
         #[arg(long)]
         dry_run: bool,
+        /// Optional template content to add after the basic project spine.
+        #[arg(long, value_enum, default_value = "basic")]
+        template: commands::init::InitTemplate,
         /// After scaffolding, write local readiness defaults and run doctor.
         #[arg(long)]
         setup: bool,
@@ -286,11 +289,16 @@ async fn main() -> ExitCode {
             dir,
             force,
             dry_run,
+            template,
             setup,
         } => {
             let init = commands::init::run_with_options(
                 &dir,
-                commands::init::InitOptions { force, dry_run },
+                commands::init::InitOptions {
+                    force,
+                    dry_run,
+                    template,
+                },
             );
             match init {
                 Ok(message) => {
@@ -532,7 +540,10 @@ fn from_async(result: anyhow::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("error: {err}");
+            // `:#` prints the whole anyhow context chain ("configuring live
+            // model calling: OPENROUTER_API_KEY is not set; ...") — the root
+            // cause is usually the only actionable part.
+            eprintln!("error: {err:#}");
             ExitCode::FAILURE
         }
     }

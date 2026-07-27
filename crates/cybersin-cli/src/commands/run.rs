@@ -11,6 +11,8 @@
 //! stdin/stdout; `grpc` spawns the process with its connect address in
 //! `CYBERSIN_ADAPTER_ADDR` and accepts its `Session` RPC instead.
 
+use std::env;
+use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -25,6 +27,7 @@ use cybersin_adapter::stub_harness::{CallOutcomeOrPark, StubHarness};
 use cybersin_adapter::transport::grpc;
 use cybersin_adapter::transport::stdio::in_memory_pair;
 use cybersin_adapter::transport::stdio::StdioDaemonChannel;
+use cybersin_router::{ModelKind, RouteDecision};
 use cybersin_runtime::{
     stub_agent, DaemonHandle, DistFixture, LocalConfigFile, ModelAllowlist, OpenRouterModelCaller,
     RuntimeSessionSummary,
@@ -201,11 +204,49 @@ fn runnable_agent_targets(project_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     for candidate in candidates {
         let yaml_source = std::fs::read_to_string(&candidate)
             .with_context(|| format!("reading {}", candidate.display()))?;
-        AgentMeta::from_agent_yaml(&yaml_source)
+        let meta = AgentMeta::from_agent_yaml(&yaml_source)
             .with_context(|| format!("parsing {}", candidate.display()))?;
-        runnable.push(candidate);
+        if inferred_harness_is_launchable(project_dir, &meta) {
+            runnable.push(candidate);
+        }
     }
     Ok(runnable)
+}
+
+fn inferred_harness_is_launchable(project_dir: &Path, meta: &AgentMeta) -> bool {
+    command_program_is_launchable(project_dir, &meta.harness.command[0])
+        && command_local_file_args_exist(project_dir, &meta.harness.command[1..])
+}
+
+fn command_program_is_launchable(project_dir: &Path, program: &str) -> bool {
+    let path = Path::new(program);
+    if path.is_absolute() {
+        return path.exists();
+    }
+    if program.contains(std::path::MAIN_SEPARATOR) {
+        return project_dir.join(path).exists();
+    }
+    env::var_os("PATH")
+        .map(|paths| env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+        .unwrap_or(false)
+}
+
+fn command_local_file_args_exist(project_dir: &Path, args: &[String]) -> bool {
+    args.iter().all(|arg| {
+        let path = Path::new(arg);
+        if path.is_absolute() || arg.contains(std::path::MAIN_SEPARATOR) || looks_like_script(arg) {
+            path.exists() || project_dir.join(path).exists()
+        } else {
+            true
+        }
+    })
+}
+
+fn looks_like_script(arg: &str) -> bool {
+    matches!(
+        Path::new(arg).extension().and_then(OsStr::to_str),
+        Some("py" | "js" | "mjs" | "cjs" | "sh" | "bash" | "zsh")
+    )
 }
 
 fn project_dir_from_dist(dist_dir: &Path) -> &Path {
@@ -409,7 +450,7 @@ async fn run_builtin_starter(
     prompt_name: String,
     args: RunArgs,
 ) -> anyhow::Result<RuntimeSessionSummary> {
-    let dist = Arc::new(DistFixture::load_dir(&dist_dir)?);
+    let mut dist_fixture = DistFixture::load_dir(&dist_dir)?;
     let agent_name = args
         .agent
         .clone()
@@ -433,6 +474,8 @@ async fn run_builtin_starter(
             project_dir.join("cybersin.local.yaml").display()
         )
     })?;
+    retarget_scaffolded_stub_routes(&mut dist_fixture, local_config.as_ref());
+    let dist = Arc::new(dist_fixture);
     let model_caller = openrouter_from_local_config(dist.clone(), local_config.as_ref())
         .context("configuring live model calling")?;
     let allowlist = local_config
@@ -474,6 +517,47 @@ async fn run_builtin_starter(
     let starter_fut = run_starter_harness(harness_io, session_id, prompt_name, inputs);
     let (summary, ()) = tokio::try_join!(daemon_fut, starter_fut)?;
     Ok(summary)
+}
+
+fn retarget_scaffolded_stub_routes(dist: &mut DistFixture, config: Option<&LocalConfigFile>) {
+    let Some(config) = config else {
+        return;
+    };
+    let (Some(provider), Some(model_name)) = (&config.defaults.provider, &config.defaults.model)
+    else {
+        return;
+    };
+    if provider == "stub" || model_name == "stub-medium" {
+        return;
+    }
+
+    for route in dist.routing_artifact.prompts.values_mut() {
+        for decision in &mut route.decisions {
+            match decision {
+                RouteDecision::Cache(cache) => {
+                    retarget_model(&mut cache.judge, provider, model_name);
+                }
+                RouteDecision::Cascade(cascade) => {
+                    for step in &mut cascade.steps {
+                        retarget_model(&mut step.model, provider, model_name);
+                    }
+                }
+                RouteDecision::Fallbacks(fallbacks) => {
+                    for model in &mut fallbacks.providers {
+                        retarget_model(model, provider, model_name);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn retarget_model(model: &mut cybersin_router::RouteModel, provider: &str, model_name: &str) {
+    if model.provider == "stub" && model.name == "stub-medium" {
+        model.provider = provider.to_string();
+        model.name = model_name.to_string();
+        model.model_kind = ModelKind::Provider;
+    }
 }
 
 async fn run_starter_harness<C>(
@@ -718,5 +802,42 @@ tools: []
         assert!(message.contains("multiple runnable agent targets found"));
         assert!(message.contains("cybersin run agents/alpha.agent.yaml"));
         assert!(message.contains("cybersin run agents/fleet/beta.agent.yaml"));
+    }
+
+    #[test]
+    fn stale_scaffolded_agent_does_not_preempt_single_prompt_starter() {
+        let project = tempfile::tempdir().unwrap();
+        crate::commands::init::run(project.path()).expect("init");
+        std::fs::write(
+            project.path().join("prompts/current.prompt.yaml"),
+            r#"name: current
+quality: medium
+sections:
+  - id: body
+    priority: 100
+    body: Write a concise project brief.
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("agents/hello.agent.yaml"),
+            r#"name: hello-agent
+harness: { adapter: process, command: ["python", "loop.py"] }
+budget: { usd_per_session: 1.00, on_breach: degrade }
+tools: []
+"#,
+        )
+        .unwrap();
+        crate::commands::build::run(
+            project.path(),
+            crate::commands::build::BuildProfile::Dev,
+            true,
+        )
+        .expect("build");
+
+        match infer_run_target(&project.path().join("dist")).expect("run target") {
+            RunTarget::BuiltInStarter { prompt_name } => assert_eq!(prompt_name, "current"),
+            RunTarget::Agent(path) => panic!("unexpected stale agent target: {}", path.display()),
+        }
     }
 }

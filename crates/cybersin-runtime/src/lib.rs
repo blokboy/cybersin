@@ -56,8 +56,8 @@ pub use orchestration::{
 pub use pg_storage::PgStorage;
 pub use route_executor::{
     cache_key, default_model, CacheArtifact, CacheEntry, ExecutionRequest, ExecutionResponse,
-    Judge, KnnBackend, ModelCaller, ModelOutput, RouteExecutor, RouteExecutorError,
-    SQLITE_VEC_EVALUATION,
+    Judge, KnnBackend, ModelCallError, ModelCaller, ModelErrorClass, ModelOutput, RouteExecutor,
+    RouteExecutorError, SQLITE_VEC_EVALUATION,
 };
 pub use sandbox_executor::RuntimeSandbox;
 pub use session::{estimate_tokens, RuntimeDaemon, RuntimeSessionSummary};
