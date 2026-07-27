@@ -4,7 +4,11 @@ use std::path::PathBuf;
 
 use clap::Subcommand;
 use cybersin_runtime::DaemonHandle;
-use cybersin_trace::SpanFilter;
+
+use crate::capabilities::{
+    execute_trace_ls, trace_ls_output_stream, trace_ls_result, CapabilityEvent, OutputMode,
+    TraceLsInput,
+};
 
 #[derive(Debug, Subcommand)]
 pub enum TraceCommand {
@@ -47,40 +51,23 @@ pub async fn execute(db_path: PathBuf, cmd: TraceCommand) -> anyhow::Result<()> 
             model,
             limit,
         } => {
-            let filter = SpanFilter {
-                session_id: session,
-                agent_name: agent,
-                kind: None,
-                model,
-                since_unix_ms: None,
-                limit,
-            };
-            let spans = daemon.spans().list(&filter).await?;
-            if spans.is_empty() {
-                println!("no spans recorded yet — try `cybersin run --stub` first");
-                return Ok(());
-            }
-            println!(
-                "{:<24} {:<14} {:<16} {:<16} {:>6} {:>6} {:>10} {:<8}",
-                "ID", "KIND", "NAME", "MODEL", "PTOK", "CTOK", "USD", "CACHE"
-            );
-            for span in spans {
-                println!(
-                    "{:<24} {:<14} {:<16} {:<16} {:>6} {:>6} {:>10.6} {:<8}",
-                    span.id,
-                    span.kind.as_str(),
-                    span.name,
-                    span.model.as_deref().unwrap_or("-"),
-                    span.tokens_prompt
-                        .map(|t| t.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                    span.tokens_completion
-                        .map(|t| t.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                    span.usd_cost,
-                    span.cache_status.as_str(),
-                );
-            }
+            let spans = daemon.spans();
+            let execution = execute_trace_ls(
+                &spans,
+                TraceLsInput {
+                    session,
+                    agent,
+                    model,
+                    limit,
+                },
+            )
+            .await;
+            render_trace_ls_events(&execution.events);
+            trace_ls_result(&execution.events)
+                .unwrap_or_else(|| {
+                    Err("trace ls failed: capability did not emit a terminal event".to_string())
+                })
+                .map_err(anyhow::Error::msg)?;
         }
         TraceCommand::Show { id } => match daemon.spans().get(&id).await? {
             Some(span) => println!("{}", serde_json::to_string_pretty(&span)?),
@@ -126,4 +113,85 @@ pub async fn execute(db_path: PathBuf, cmd: TraceCommand) -> anyhow::Result<()> 
         }
     }
     Ok(())
+}
+
+fn render_trace_ls_events(events: &[CapabilityEvent]) {
+    print!("{}", trace_ls_rendered_text(events));
+}
+
+fn trace_ls_rendered_text(events: &[CapabilityEvent]) -> String {
+    let mut rendered = String::new();
+    for event in events {
+        if let CapabilityEvent::Output {
+            mode: OutputMode::Text,
+            value,
+        } = event
+        {
+            if let Some((stream, text)) = trace_ls_output_stream(value) {
+                if stream == "stdout" {
+                    rendered.push_str(text);
+                }
+            }
+        }
+    }
+    rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use cybersin_trace::{CacheStatus, Span, SpanKind, SpanStatus, SpanStore};
+
+    use super::*;
+
+    fn sample_span(id: &str, start_unix_ms: i64) -> Span {
+        Span {
+            id: id.to_string(),
+            session_id: "sess-1".to_string(),
+            agent_name: "agent-a".to_string(),
+            kind: SpanKind::LlmCall,
+            name: "researcher".to_string(),
+            start_unix_ms,
+            end_unix_ms: start_unix_ms + 10,
+            model: Some("gpt-4o-mini".to_string()),
+            tokens_prompt: Some(120),
+            tokens_completion: Some(40),
+            usd_cost: 0.000432,
+            cache_status: CacheStatus::Miss,
+            retries: 0,
+            evicted_sections: vec![],
+            status: SpanStatus::Ok,
+            attributes: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_adapter_text_matches_direct_trace_ls_capability() {
+        let store = SpanStore::in_memory().await.unwrap();
+        store.insert(&sample_span("older", 1)).await.unwrap();
+        store.insert(&sample_span("newer", 2)).await.unwrap();
+
+        let input = TraceLsInput {
+            session: Some("sess-1".to_string()),
+            limit: Some(1),
+            ..Default::default()
+        };
+        let direct = execute_trace_ls(&store, input).await;
+        let capability_text = direct
+            .events
+            .iter()
+            .find_map(|event| match event {
+                CapabilityEvent::Output {
+                    mode: OutputMode::Text,
+                    value,
+                } => trace_ls_output_stream(value).map(|(_, text)| text.to_string()),
+                _ => None,
+            })
+            .expect("trace ls capability should emit text output");
+
+        assert_eq!(trace_ls_result(&direct.events), Some(Ok(())));
+        assert_eq!(trace_ls_rendered_text(&direct.events), capability_text);
+        assert!(capability_text.contains("ID"));
+        assert!(capability_text.contains("newer"));
+        assert!(!capability_text.contains("older"));
+    }
 }

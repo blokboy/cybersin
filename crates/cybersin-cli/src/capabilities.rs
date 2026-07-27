@@ -6,9 +6,12 @@
 
 use std::path::PathBuf;
 
+use cybersin_trace::{Span, SpanFilter, SpanStore};
 use serde_json::{json, Value};
+use std::fmt::Write as _;
 
 pub const CHECK_CAPABILITY_ID: &str = "compile.check";
+pub const TRACE_LS_CAPABILITY_ID: &str = "inspection.trace.ls";
 
 /// A user-facing operation that can be invoked through one or more adapters.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +192,113 @@ impl CapabilityExecution {
             .iter()
             .any(|event| matches!(event, CapabilityEvent::Completed { .. }))
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TraceLsInput {
+    pub session: Option<String>,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub limit: Option<u32>,
+}
+
+impl TraceLsInput {
+    pub fn filter(&self) -> SpanFilter {
+        SpanFilter {
+            session_id: self.session.clone(),
+            agent_name: self.agent.clone(),
+            kind: None,
+            model: self.model.clone(),
+            since_unix_ms: None,
+            limit: self.limit,
+        }
+    }
+}
+
+pub async fn execute_trace_ls(spans: &SpanStore, input: TraceLsInput) -> CapabilityExecution {
+    let mut events = vec![CapabilityEvent::Started {
+        capability_id: CapabilityId::new(TRACE_LS_CAPABILITY_ID),
+    }];
+
+    let listed = match spans.list(&input.filter()).await {
+        Ok(spans) => spans,
+        Err(e) => {
+            events.push(CapabilityEvent::Failed {
+                message: e.to_string(),
+            });
+            return CapabilityExecution::new(events);
+        }
+    };
+
+    events.push(CapabilityEvent::Output {
+        mode: OutputMode::Text,
+        value: json!({
+            "stream": "stdout",
+            "text": render_trace_ls_text(&listed),
+        }),
+    });
+    events.push(CapabilityEvent::Output {
+        mode: OutputMode::Json,
+        value: json!({
+            "spans": listed,
+        }),
+    });
+    events.push(CapabilityEvent::Completed {
+        value: Some(json!({
+            "spans": listed.len(),
+        })),
+    });
+
+    CapabilityExecution::new(events)
+}
+
+pub fn trace_ls_result(events: &[CapabilityEvent]) -> Option<Result<(), String>> {
+    for event in events.iter().rev() {
+        match event {
+            CapabilityEvent::Completed { .. } => return Some(Ok(())),
+            CapabilityEvent::Failed { message } => return Some(Err(message.clone())),
+            _ => {}
+        }
+    }
+    None
+}
+
+pub fn trace_ls_output_stream(value: &Value) -> Option<(&str, &str)> {
+    check_output_stream(value)
+}
+
+fn render_trace_ls_text(spans: &[Span]) -> String {
+    if spans.is_empty() {
+        return "no spans recorded yet — try `cybersin run --stub` first\n".to_string();
+    }
+
+    let mut text = String::new();
+    writeln!(
+        &mut text,
+        "{:<24} {:<14} {:<16} {:<16} {:>6} {:>6} {:>10} {:<8}",
+        "ID", "KIND", "NAME", "MODEL", "PTOK", "CTOK", "USD", "CACHE"
+    )
+    .expect("writing to String should not fail");
+    for span in spans {
+        writeln!(
+            &mut text,
+            "{:<24} {:<14} {:<16} {:<16} {:>6} {:>6} {:>10.6} {:<8}",
+            span.id,
+            span.kind.as_str(),
+            span.name,
+            span.model.as_deref().unwrap_or("-"),
+            span.tokens_prompt
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            span.tokens_completion
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            span.usd_cost,
+            span.cache_status.as_str(),
+        )
+        .expect("writing to String should not fail");
+    }
+    text
 }
 
 pub fn execute_check(input: CheckInput) -> CapabilityExecution {
@@ -442,7 +552,7 @@ pub fn registry() -> CapabilityRegistry {
             cli(),
         ),
         spec(
-            "inspection.trace.ls",
+            TRACE_LS_CAPABILITY_ID,
             "List traces",
             "List recorded spans from the trace store.",
             CapabilityCategory::Inspection,
