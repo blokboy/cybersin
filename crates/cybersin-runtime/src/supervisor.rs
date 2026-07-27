@@ -139,7 +139,7 @@ impl SessionSupervisor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SqliteStorage;
+    use crate::{DistArtifactBundle, DistArtifactFile, SqliteStorage};
 
     #[tokio::test]
     async fn resume_requires_pinned_hash_until_explicit_migration() {
@@ -155,6 +155,17 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("sessions migrate"));
+        storage
+            .ingest_artifact_bundle(&DistArtifactBundle {
+                config_hash: "new".to_string(),
+                files: vec![DistArtifactFile {
+                    path: "manifest.json".to_string(),
+                    sha256: "sha".to_string(),
+                    bytes: b"manifest".to_vec(),
+                }],
+            })
+            .await
+            .unwrap();
         storage.migrate_session("s", "new").await.unwrap();
         storage
             .set_state("s", "memory", "answer", &serde_json::json!(42))

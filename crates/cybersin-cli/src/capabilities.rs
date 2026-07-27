@@ -1260,6 +1260,15 @@ pub fn registry() -> CapabilityRegistry {
             cli(),
         ),
         spec(
+            "control.sessions.materialize",
+            "Materialize session artifacts",
+            "Write a stored config artifact bundle back to a directory.",
+            CapabilityCategory::Control,
+            vec![OutputMode::Text],
+            writes_project_files(NetworkRequirement::None, LongRunningBehavior::Finite),
+            cli(),
+        ),
+        spec(
             "control.notify",
             "Notify session",
             "Deliver a durable steering signal to a runtime session.",

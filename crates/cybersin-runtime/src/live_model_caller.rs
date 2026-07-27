@@ -381,6 +381,7 @@ mod tests {
             manifest: DistManifest {
                 build_hash: "test".into(),
                 git_sha: "test".into(),
+                artifacts: StdBTreeMap::new(),
             },
             prompts,
             routing: StdBTreeMap::new(),

@@ -885,10 +885,42 @@ fn durable_session_cli_lists_shows_notifies_migrates_and_resumes() {
             "migrate",
             "durable-1",
             "--config-hash",
-            "next",
+            "missing-hash",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("missing-hash"));
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "sessions",
+            "migrate",
+            "durable-1",
+            "--config-hash",
+            "stub-manual-0001",
         ])
         .assert()
         .success();
+    let materialized = tmp.path().join("materialized-dist");
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "sessions",
+            "materialize",
+            "--session",
+            "durable-1",
+            "--out",
+            materialized.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("materialized"));
+    assert_eq!(
+        fs::read(materialized.join("manifest.json")).unwrap(),
+        fs::read(dist.join("manifest.json")).unwrap()
+    );
     cybersin()
         .args([
             "--db",
@@ -897,7 +929,7 @@ fn durable_session_cli_lists_shows_notifies_migrates_and_resumes() {
             "resume",
             "durable-1",
             "--config-hash",
-            "next",
+            "stub-manual-0001",
         ])
         .assert()
         .success()

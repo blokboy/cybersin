@@ -679,6 +679,7 @@ mod tests {
             ("sandbox snapshot", &["sandbox.snapshot"]),
             ("sessions kill", &["control.sessions.kill"]),
             ("sessions ls", &["control.sessions.ls"]),
+            ("sessions materialize", &["control.sessions.materialize"]),
             ("sessions migrate", &["control.sessions.migrate"]),
             ("sessions resume", &["control.sessions.resume"]),
             ("sessions show", &["control.sessions.show"]),
