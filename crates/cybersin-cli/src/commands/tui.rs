@@ -34,6 +34,10 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 use serde::Deserialize;
 
+use crate::capabilities::{
+    check_output_stream, execute_check, execute_trace_ls, registry, AdapterSupport,
+    CapabilityEvent, CapabilitySpec, TraceLsInput, CHECK_CAPABILITY_ID, TRACE_LS_CAPABILITY_ID,
+};
 use crate::commands::build::{self, BuildProfile, BuildProgress};
 use crate::commands::convert::{
     self, ConvertReport, OpenRouterPromptConversionModel, PromptConversionModel,
@@ -42,11 +46,13 @@ use crate::commands::ops;
 use crate::commands::run::{self, RunArgs};
 use crate::project::ProjectDefaults;
 use crate::project::{self};
+use cybersin_runtime::DaemonHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
     Home,
     Workspace,
+    CapabilityBrowser,
 }
 
 /// The tab selected inside `Screen::Workspace`. `Convert` is the only
@@ -159,6 +165,14 @@ enum OpsRunStatus {
     Failure(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapabilityStatus {
+    Idle,
+    Running(String),
+    Success(String),
+    Failure(String),
+}
+
 #[derive(Debug)]
 struct App {
     project_start: PathBuf,
@@ -176,6 +190,8 @@ struct App {
     ops_builds: Vec<ops::OpsBuild>,
     selected_ops_build: usize,
     ops_run_status: OpsRunStatus,
+    selected_capability: usize,
+    capability_status: CapabilityStatus,
     show_help: bool,
     should_quit: bool,
 }
@@ -206,6 +222,8 @@ impl App {
             ops_builds: Vec::new(),
             selected_ops_build: 0,
             ops_run_status: OpsRunStatus::Idle,
+            selected_capability: 0,
+            capability_status: CapabilityStatus::Idle,
             show_help: false,
             should_quit: false,
         }
@@ -272,6 +290,7 @@ enum AppAction {
     Build,
     RefreshOps,
     RunOpsBuild(PathBuf),
+    ExecuteCapability,
 }
 
 impl App {
@@ -292,6 +311,10 @@ impl App {
                 self.request_action()
             }
             KeyCode::F(5) => self.request_action(),
+            KeyCode::Char('b') if self.screen == Screen::Home => {
+                self.enter_capability_browser();
+                AppAction::None
+            }
             KeyCode::Esc => {
                 self.go_back();
                 AppAction::None
@@ -322,6 +345,17 @@ impl App {
                 self.move_selection_down();
                 AppAction::None
             }
+            KeyCode::Up if self.screen == Screen::CapabilityBrowser => {
+                self.selected_capability = self.selected_capability.saturating_sub(1);
+                self.capability_status = CapabilityStatus::Idle;
+                AppAction::None
+            }
+            KeyCode::Down if self.screen == Screen::CapabilityBrowser => {
+                let max_index = registry().specs().len().saturating_sub(1);
+                self.selected_capability = (self.selected_capability + 1).min(max_index);
+                self.capability_status = CapabilityStatus::Idle;
+                AppAction::None
+            }
             KeyCode::Char('q') if self.focus != Focus::Prompt => {
                 self.should_quit = true;
                 AppAction::None
@@ -330,9 +364,11 @@ impl App {
                 self.enter_convert();
                 AppAction::None
             }
+            KeyCode::Enter if self.screen == Screen::CapabilityBrowser => self.request_action(),
             KeyCode::Enter if self.workspace_tab == WorkspaceTab::Build => self.request_action(),
             KeyCode::Enter
-                if self.workspace_tab == WorkspaceTab::Ops && self.focus == Focus::OpsBuildsList =>
+                if self.workspace_tab == WorkspaceTab::Ops
+                    && self.focus == Focus::OpsBuildsList =>
             {
                 self.request_run_selected_build()
             }
@@ -366,6 +402,11 @@ impl App {
         self.switch_tab(WorkspaceTab::Convert);
     }
 
+    fn enter_capability_browser(&mut self) {
+        self.screen = Screen::CapabilityBrowser;
+        self.focus = Focus::Navigation;
+    }
+
     fn switch_tab(&mut self, tab: WorkspaceTab) {
         self.workspace_tab = tab;
         self.focus = match tab {
@@ -383,6 +424,9 @@ impl App {
     }
 
     fn request_action(&mut self) -> AppAction {
+        if self.screen == Screen::CapabilityBrowser {
+            return AppAction::ExecuteCapability;
+        }
         if self.screen != Screen::Workspace {
             return AppAction::None;
         }
@@ -436,6 +480,10 @@ impl App {
         match self.screen {
             Screen::Home => self.should_quit = true,
             Screen::Workspace => {
+                self.screen = Screen::Home;
+                self.focus = Focus::Navigation;
+            }
+            Screen::CapabilityBrowser => {
                 self.screen = Screen::Home;
                 self.focus = Focus::Navigation;
             }
@@ -599,11 +647,125 @@ async fn run_terminal(app: &mut App) -> Result<()> {
                         Err(error) => OpsRunStatus::Failure(error),
                     };
                 }
+                AppAction::ExecuteCapability => {
+                    let Some(spec) = selected_capability_spec(app) else {
+                        app.capability_status =
+                            CapabilityStatus::Failure("No capability selected.".to_string());
+                        continue;
+                    };
+                    app.capability_status =
+                        CapabilityStatus::Running(format!("Running {}", spec.id.as_str()));
+                    terminal.draw(|frame| render(frame, app))?;
+                    app.capability_status =
+                        match run_generic_capability(&app.project_start, &spec).await {
+                            Ok(output) => CapabilityStatus::Success(output),
+                            Err(error) => CapabilityStatus::Failure(error),
+                        };
+                }
                 AppAction::None => {}
             }
         }
     }
     Ok(())
+}
+
+fn selected_capability_spec(app: &App) -> Option<CapabilitySpec> {
+    let registry = registry();
+    let selected = app
+        .selected_capability
+        .min(registry.specs().len().saturating_sub(1));
+    registry.specs().get(selected).cloned()
+}
+
+async fn run_generic_capability(
+    project_start: &Path,
+    spec: &CapabilitySpec,
+) -> Result<String, String> {
+    match &spec.adapters.tui {
+        AdapterSupport::Generic => {}
+        AdapterSupport::Unavailable { reason } => return Err(reason.clone()),
+        AdapterSupport::Available | AdapterSupport::Custom => {
+            return Err("this capability is not available through the generic browser".to_string())
+        }
+    }
+
+    let events = match spec.id.as_str() {
+        CHECK_CAPABILITY_ID => {
+            let project_root = resolve_project_root(project_start)?;
+            execute_check(crate::capabilities::CheckInput::new(project_root)).events
+        }
+        TRACE_LS_CAPABILITY_ID => {
+            let project_root = resolve_project_root(project_start)?;
+            let defaults =
+                ProjectDefaults::detect(&project_root).map_err(|error| error.to_string())?;
+            let daemon = DaemonHandle::auto_start(&defaults.db_default())
+                .await
+                .map_err(|error| error.to_string())?;
+            execute_trace_ls(
+                &daemon.spans(),
+                TraceLsInput {
+                    limit: Some(25),
+                    ..Default::default()
+                },
+            )
+            .await
+            .events
+        }
+        _ => {
+            return Err(
+                "this capability is listed but not wired into the generic browser yet".to_string(),
+            )
+        }
+    };
+
+    Ok(render_capability_events(&events))
+}
+
+fn render_capability_events(events: &[CapabilityEvent]) -> String {
+    let mut lines = Vec::new();
+    for event in events {
+        match event {
+            CapabilityEvent::Started { capability_id } => {
+                lines.push(format!("started {}", capability_id.as_str()));
+            }
+            CapabilityEvent::Progress {
+                message,
+                current,
+                total,
+            } => {
+                let prefix = match (current, total) {
+                    (Some(current), Some(total)) => format!("[{current}/{total}] "),
+                    _ => String::new(),
+                };
+                lines.push(format!("{prefix}{message}"));
+            }
+            CapabilityEvent::Prompt { message, .. } => {
+                lines.push(format!("prompt: {message}"));
+            }
+            CapabilityEvent::Output {
+                mode: crate::capabilities::OutputMode::Text,
+                value,
+            } => {
+                if let Some((_stream, text)) = check_output_stream(value) {
+                    lines.push(text.trim_end().to_string());
+                }
+            }
+            CapabilityEvent::Output { mode, .. } => {
+                lines.push(format!("output: {mode:?}"));
+            }
+            CapabilityEvent::Completed { value } => {
+                if let Some(value) = value {
+                    lines.push(format!("completed: {value}"));
+                } else {
+                    lines.push("completed".to_string());
+                }
+            }
+            CapabilityEvent::Failed { message } => {
+                lines.push(format!("failed: {message}"));
+            }
+        }
+    }
+    lines.join("\n")
 }
 
 async fn load_ops_entries(project_start: &Path) -> Result<Vec<OpsEntry>, String> {
@@ -712,7 +874,11 @@ async fn run_ops_build(project_start: &Path, agent_yaml: PathBuf) -> Result<Stri
     Ok(format!(
         "{} {}: {} span(s)",
         summary.session_id,
-        if summary.completed { "completed" } else { "aborted" },
+        if summary.completed {
+            "completed"
+        } else {
+            "aborted"
+        },
         summary.spans_recorded
     ))
 }
@@ -1061,6 +1227,7 @@ fn render(frame: &mut Frame, app: &App) {
     let title = match app.screen {
         Screen::Home => "Cybersin".to_string(),
         Screen::Workspace => format!("Cybersin / {}", app.workspace_tab.title()),
+        Screen::CapabilityBrowser => "Cybersin / Capabilities".to_string(),
     };
     frame.render_widget(
         Paragraph::new(title)
@@ -1076,6 +1243,7 @@ fn render(frame: &mut Frame, app: &App) {
     match app.screen {
         Screen::Home => render_home(frame, app, chunks[1]),
         Screen::Workspace => render_workspace(frame, app, chunks[1]),
+        Screen::CapabilityBrowser => render_capability_browser(frame, app, chunks[1]),
     }
 
     frame.render_widget(Paragraph::new(footer_text(app)), chunks[2]);
@@ -1133,12 +1301,131 @@ fn render_home(frame: &mut Frame, _app: &App, area: Rect) {
     let panel = centered_rect(rows[2], panel_width, panel_height);
     frame.render_widget(Clear, pad_rect(panel, 1, area));
     frame.render_widget(
-        Paragraph::new("Press Enter to start converting a prompt")
+        Paragraph::new("Enter converts a prompt · b browses capabilities")
             .alignment(Alignment::Center)
             .style(Style::default().bg(Color::Black))
             .block(focused_block(" Cybersin ", true)),
         panel,
     );
+}
+
+fn render_capability_browser(frame: &mut Frame, app: &App, area: Rect) {
+    let registry = registry();
+    let specs = registry.specs();
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .split(area);
+
+    let selected = app.selected_capability.min(specs.len().saturating_sub(1));
+    let items = specs.iter().map(|spec| {
+        ListItem::new(format!(
+            "{:<24} {:<10} {:<18} {}",
+            spec.title,
+            category_label(&spec.category),
+            availability_label(&spec.adapters.tui),
+            safety_label(&spec.safety),
+        ))
+    });
+    let mut state = ListState::default().with_selected((!specs.is_empty()).then_some(selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Capabilities "),
+            )
+            .highlight_symbol("> ")
+            .highlight_style(Style::default().fg(Color::Yellow)),
+        chunks[0],
+        &mut state,
+    );
+
+    let detail = specs
+        .get(selected)
+        .map(|spec| capability_detail_text(spec, &app.capability_status))
+        .unwrap_or_else(|| "No capabilities registered.".to_string());
+    frame.render_widget(
+        Paragraph::new(detail)
+            .block(Block::default().borders(Borders::ALL).title(" Detail "))
+            .wrap(Wrap { trim: false }),
+        chunks[1],
+    );
+}
+
+fn capability_detail_text(spec: &CapabilitySpec, status: &CapabilityStatus) -> String {
+    let action = match &spec.adapters.tui {
+        AdapterSupport::Generic => match spec.id.as_str() {
+            CHECK_CAPABILITY_ID => "Enter runs check against the current project.",
+            TRACE_LS_CAPABILITY_ID => "Enter lists the most recent 25 trace spans.",
+            _ => "Generic TUI adapter is declared, but no executor is registered here.",
+        },
+        AdapterSupport::Unavailable { reason } => reason,
+        AdapterSupport::Available => "This capability is CLI-available, not generic TUI-ready.",
+        AdapterSupport::Custom => "This capability has a custom TUI surface.",
+    };
+    format!(
+        "{}\n{}\n\nid: {}\ncategory: {}\nsafety: {}\navailability: {}\noutputs: {}\n\n{}\n\n{}",
+        spec.title,
+        spec.summary,
+        spec.id.as_str(),
+        category_label(&spec.category),
+        safety_label(&spec.safety),
+        availability_label(&spec.adapters.tui),
+        spec.output_modes
+            .iter()
+            .map(|mode| format!("{mode:?}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        action,
+        capability_status_text(status),
+    )
+}
+
+fn capability_status_text(status: &CapabilityStatus) -> String {
+    match status {
+        CapabilityStatus::Idle => "No capability run yet.".to_string(),
+        CapabilityStatus::Running(message) => message.clone(),
+        CapabilityStatus::Success(output) => output.clone(),
+        CapabilityStatus::Failure(error) => format!("error: {error}"),
+    }
+}
+
+fn category_label(category: &crate::capabilities::CapabilityCategory) -> &'static str {
+    match category {
+        crate::capabilities::CapabilityCategory::Compile => "compile",
+        crate::capabilities::CapabilityCategory::Runtime => "runtime",
+        crate::capabilities::CapabilityCategory::Inspection => "inspect",
+        crate::capabilities::CapabilityCategory::Control => "control",
+        crate::capabilities::CapabilityCategory::Sandbox => "sandbox",
+        crate::capabilities::CapabilityCategory::Workflow => "workflow",
+    }
+}
+
+fn availability_label(support: &AdapterSupport) -> &'static str {
+    match support {
+        AdapterSupport::Available => "available",
+        AdapterSupport::Generic => "generic TUI",
+        AdapterSupport::Custom => "custom TUI",
+        AdapterSupport::Unavailable { .. } => "not invokable",
+    }
+}
+
+fn safety_label(safety: &crate::capabilities::SafetyProfile) -> &'static str {
+    if matches!(
+        safety.confirmation,
+        crate::capabilities::ConfirmationPolicy::Required { .. }
+    ) {
+        "confirmation required"
+    } else if safety.file_mutation == crate::capabilities::MutationLevel::Destructive {
+        "destructive"
+    } else if safety.file_mutation != crate::capabilities::MutationLevel::None {
+        "writes project"
+    } else if safety.runtime_state_mutation != crate::capabilities::MutationLevel::None {
+        "writes runtime"
+    } else {
+        "read only"
+    }
 }
 
 /// A procedurally generated wall of glowing "monitors" behind the
@@ -1462,7 +1749,10 @@ fn render_ops(frame: &mut Frame, app: &App, area: Rect) {
                 chunks[0],
                 &mut state,
             );
-            if entries.get(selected).is_some_and(|entry| entry.title == "Builds") {
+            if entries
+                .get(selected)
+                .is_some_and(|entry| entry.title == "Builds")
+            {
                 render_ops_builds_panel(frame, app, chunks[1]);
             } else {
                 let detail = entries
@@ -1498,9 +1788,7 @@ fn render_ops_builds_panel(frame: &mut Frame, app: &App, area: Rect) {
         .selected_ops_build
         .min(app.ops_builds.len().saturating_sub(1));
     let items: Vec<ListItem> = if app.ops_builds.is_empty() {
-        vec![ListItem::new(
-            "no agents found in agents/**/*.agent.yaml",
-        )]
+        vec![ListItem::new("no agents found in agents/**/*.agent.yaml")]
     } else {
         app.ops_builds
             .iter()
@@ -1794,7 +2082,10 @@ fn format_build_progress(project_start: &Path, progress: BuildProgress) -> Strin
 
 fn footer_text(app: &App) -> String {
     match app.screen {
-        Screen::Home => "Enter convert \u{00b7} ? help \u{00b7} q quit".to_string(),
+        Screen::Home => "Enter convert \u{00b7} b capabilities \u{00b7} ? help \u{00b7} q quit".to_string(),
+        Screen::CapabilityBrowser => {
+            "\u{2191}/\u{2193} select \u{00b7} Enter/Ctrl+R/F5 run generic \u{00b7} Esc back \u{00b7} ? help \u{00b7} q quit".to_string()
+        }
         Screen::Workspace => match app.workspace_tab {
             WorkspaceTab::Convert => {
                 "Ctrl+R/F5 convert \u{00b7} Tab/Shift-Tab focus \u{00b7} \u{2190}/\u{2192} tab \u{00b7} Enter type/act \u{00b7} Esc back \u{00b7} ? help \u{00b7} q quit".to_string()
@@ -1822,7 +2113,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(
-            "Ctrl+R or F5 runs the active tab's primary action\n\u{2190}/\u{2192} switches Convert/Build/Ops tabs\n\u{2191}/\u{2193} selects rows in Build/Ops\nTab / Shift-Tab moves focus inside Convert, or, on Ops's Builds row, into its build list\nEnter starts converting from Home, runs the focused Convert action, builds, refreshes Ops, or runs the selected Ops build\nEsc goes back or dismisses overlays\nq quits when focus is outside the prompt editor\n-help, -h, and --help print CLI help",
+            "Ctrl+R or F5 runs the active tab's primary action\nb opens the capability browser from Home\n\u{2190}/\u{2192} switches Convert/Build/Ops tabs\n\u{2191}/\u{2193} selects rows in Build/Ops/capabilities\nTab / Shift-Tab moves focus inside Convert, or, on Ops's Builds row, into its build list\nEnter starts converting from Home, runs the focused Convert action, builds, refreshes Ops, runs the selected Ops build, or invokes a generic capability\nEsc goes back or dismisses overlays\nq quits when focus is outside the prompt editor\n-help, -h, and --help print CLI help",
         )
         .block(Block::default().borders(Borders::ALL).title(" Help "))
         .wrap(Wrap { trim: false }),
@@ -1895,6 +2186,34 @@ mod tests {
 
         assert_eq!(app.screen, Screen::Workspace);
         assert_eq!(app.workspace_tab, WorkspaceTab::Convert);
+    }
+
+    #[test]
+    fn home_opens_capability_browser_without_disturbing_convert_entry() {
+        let mut app = App::default();
+
+        app.handle_key(key(KeyCode::Char('b')));
+
+        assert_eq!(app.screen, Screen::CapabilityBrowser);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Home);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.screen, Screen::Workspace);
+        assert_eq!(app.workspace_tab, WorkspaceTab::Convert);
+    }
+
+    #[test]
+    fn capability_browser_moves_selection_and_requests_execution() {
+        let mut app = App::default();
+        app.enter_capability_browser();
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.selected_capability, 1);
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.selected_capability, 0);
+
+        let action = app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(action, AppAction::ExecuteCapability));
     }
 
     #[test]
@@ -2312,7 +2631,7 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         let rendered = format!("{buffer:?}");
-        assert!(rendered.contains("Press Enter to start converting a prompt"));
+        assert!(rendered.contains("Enter converts a prompt"));
         assert!(rendered.contains('┌'));
     }
 
@@ -2339,6 +2658,84 @@ mod tests {
         assert!(rendered.contains("Convert"));
         assert!(rendered.contains("Build"));
         assert!(rendered.contains("Ops"));
+    }
+
+    #[test]
+    fn render_capability_browser_lists_catalog_metadata() {
+        let backend = TestBackend::new(110, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::default();
+        app.enter_capability_browser();
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = format!("{buffer:?}");
+        assert!(rendered.contains("Capabilities"));
+        assert!(rendered.contains("Build project"));
+        assert!(rendered.contains("Check prompt sources"));
+        assert!(rendered.contains("List traces"));
+        assert!(rendered.contains("generic TUI"));
+        assert!(rendered.contains("not invokable"));
+        assert!(rendered.contains("writes project"));
+    }
+
+    #[tokio::test]
+    async fn generic_browser_runs_check_capability_and_reports_unavailable_entries() {
+        let project = tempfile::tempdir().unwrap();
+        crate::commands::init::run(project.path()).unwrap();
+        let mut app = App::new(project.path().to_path_buf());
+        app.enter_capability_browser();
+        let registry = registry();
+        app.selected_capability = registry
+            .specs()
+            .iter()
+            .position(|spec| spec.id.as_str() == CHECK_CAPABILITY_ID)
+            .unwrap();
+
+        let check = selected_capability_spec(&app).unwrap();
+        let output = run_generic_capability(&app.project_start, &check)
+            .await
+            .unwrap();
+
+        assert!(output.contains("started compile.check"));
+        assert!(output.contains("ok"));
+        assert!(output.contains("completed"));
+
+        app.selected_capability = registry
+            .specs()
+            .iter()
+            .position(|spec| spec.id.as_str() == "compile.build")
+            .unwrap();
+        let build = selected_capability_spec(&app).unwrap();
+
+        let error = run_generic_capability(&app.project_start, &build)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("not wired into the TUI adapter yet"));
+    }
+
+    #[tokio::test]
+    async fn generic_browser_runs_trace_ls_capability() {
+        let project = tempfile::tempdir().unwrap();
+        crate::commands::init::run(project.path()).unwrap();
+        let mut app = App::new(project.path().to_path_buf());
+        app.enter_capability_browser();
+        app.selected_capability = registry()
+            .specs()
+            .iter()
+            .position(|spec| spec.id.as_str() == TRACE_LS_CAPABILITY_ID)
+            .unwrap();
+
+        let trace_ls = selected_capability_spec(&app).unwrap();
+        let output = run_generic_capability(&app.project_start, &trace_ls)
+            .await
+            .unwrap();
+
+        assert!(output.contains("started inspection.trace.ls"));
+        assert!(output.contains("no spans recorded yet"));
+        assert!(output.contains("completed"));
     }
 
     #[test]

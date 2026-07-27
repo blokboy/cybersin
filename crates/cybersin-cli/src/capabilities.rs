@@ -733,7 +733,7 @@ pub fn registry() -> CapabilityRegistry {
             CapabilityCategory::Inspection,
             vec![OutputMode::Table, OutputMode::Text],
             runtime_read(),
-            cli(),
+            generic_tui(),
         ),
         spec(
             "inspection.trace.show",
@@ -1097,7 +1097,7 @@ fn check_spec() -> CapabilitySpec {
         }),
         output_modes: vec![OutputMode::Text, OutputMode::Json],
         safety: read_only(),
-        adapters: cli(),
+        adapters: generic_tui(),
     }
 }
 
@@ -1107,6 +1107,13 @@ fn cli() -> AdapterCoverage {
         tui: AdapterSupport::Unavailable {
             reason: "capability invocation is not wired into the TUI adapter yet".to_string(),
         },
+    }
+}
+
+fn generic_tui() -> AdapterCoverage {
+    AdapterCoverage {
+        cli: AdapterSupport::Available,
+        tui: AdapterSupport::Generic,
     }
 }
 
@@ -1351,6 +1358,11 @@ mod tests {
                 spec.id.as_str()
             );
             match &spec.adapters.tui {
+                AdapterSupport::Generic
+                    if matches!(
+                        spec.id.as_str(),
+                        CHECK_CAPABILITY_ID | TRACE_LS_CAPABILITY_ID
+                    ) => {}
                 AdapterSupport::Unavailable { reason } => assert!(
                     !reason.is_empty(),
                     "{} should explain why TUI capability invocation is unavailable",
@@ -1364,6 +1376,18 @@ mod tests {
         }
 
         assert!(registry.get("compile.build").is_some());
+        assert_eq!(
+            registry
+                .get(CHECK_CAPABILITY_ID)
+                .map(|spec| &spec.adapters.tui),
+            Some(&AdapterSupport::Generic)
+        );
+        assert_eq!(
+            registry
+                .get(TRACE_LS_CAPABILITY_ID)
+                .map(|spec| &spec.adapters.tui),
+            Some(&AdapterSupport::Generic)
+        );
         assert!(registry.get("runtime.run.stub").is_some());
         assert!(registry.get("runtime.run.agent").is_some());
         assert!(registry.get("sandbox.restore").is_some());
