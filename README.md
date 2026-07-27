@@ -15,9 +15,27 @@ Cybersin is a Rust-based prompt compiler and durable agent runtime that turns ty
 
 Docker is only required for the container-backed sandbox tests; the quickstart below uses the local SQLite runtime.
 
-### Create a project spine
+### Install
 
-Clone the repository and build the workspace:
+Install the published CLI from crates.io:
+
+```sh
+cargo install cybersin
+```
+
+Then check the installed binary and command surface:
+
+```sh
+cybersin --help
+```
+
+To update an existing install later:
+
+```sh
+cargo install cybersin --force
+```
+
+For contributor builds from source:
 
 ```sh
 git clone https://github.com/blokboy/cybersin.git
@@ -25,26 +43,86 @@ cd cybersin
 cargo build --workspace
 ```
 
-Create the basic Cybersin project spine:
+### Create a Project
+
+`cybersin init <dir>` creates the basic Cybersin project spine. It creates
+the directory if needed, writes the portable project files, and leaves prompt
+sources and build output empty until you add them.
+
+Preview the scaffold first:
 
 ```sh
-./target/debug/cybersin init myagent
+cybersin init myagent --dry-run
 ```
 
-Plain `init` is safe for an existing codebase. It creates core project
-files (`cybersin.yaml`, `cybersin.lock`, `cybersin.local.example.yaml`,
-and `.gitignore`) plus empty `prompts/`, `fragments/`, `evals/`,
-`agents/`, and `tools/` directories. It does not create starter prompt
-sources, evals, agents, harness files, sample inputs, or `dist/`.
-Existing files are skipped by default and reported in the command output;
-use `--dry-run` to preview or `--force` to overwrite scaffold files.
+The dry run reports exactly what would be written:
+
+```sh
+would scaffold cybersin project spine at myagent
+created:
+  cybersin.yaml
+  cybersin.lock
+  cybersin.local.example.yaml
+  .gitignore
+  prompts
+  fragments
+  evals
+  agents
+  tools
+skipped: none
+```
+
+Create the files:
+
+```sh
+cybersin init myagent
+cd myagent
+```
+
+The scaffold is intentionally minimal:
+
+```text
+myagent/
+  cybersin.yaml                 # portable project config
+  cybersin.lock                 # pinned model/cost/pass data
+  cybersin.local.example.yaml   # example machine-local runtime config
+  .gitignore                    # ignores local state, local config, dist
+  prompts/                      # prompt sources live here
+  fragments/                    # included markdown/json snippets
+  evals/                        # regression eval fixtures
+  agents/                       # live agent harness configs
+  tools/                        # custom tool executables/assets
+```
+
+Plain `init` is safe for an existing codebase: existing files are skipped and
+reported in the command output. Use `--force` only when you intentionally want
+to overwrite scaffold files.
+
+The generated `cybersin.yaml` starts with local SQLite storage, a conservative
+static cost model, and the container sandbox backend:
+
+```yaml
+name: myagent
+targets:
+  - generic
+cost_model:
+  cache_similarity_threshold: 0.97
+  judge_trigger_band: [0.90, 0.97]
+  judge_model: cache-judge
+storage:
+  backend: sqlite
+sandbox:
+  backend: docker+gvisor
+```
+
+### Local Setup
 
 For live providers and built-in web tools, keep machine-local readiness
 settings out of the portable project config:
 
 ```sh
-cp myagent/cybersin.local.example.yaml myagent/cybersin.local.yaml
-cat > myagent/.env <<'EOF'
+cp cybersin.local.example.yaml cybersin.local.yaml
+cat > .env <<'EOF'
 OPENROUTER_API_KEY=...
 TAVILY_API_KEY=...
 EOF
@@ -77,20 +155,33 @@ Cybersin still honors the existing process environment, and it now loads
 an optional project-root `.env` before OpenRouter and Tavily readiness
 checks without overriding variables that are already set.
 
-Add prompt sources under `myagent/prompts/`, then check and build:
+Add prompt sources under `prompts/`, then check and build from inside the
+project:
 
 ```sh
-./target/debug/cybersin check myagent
-./target/debug/cybersin build myagent --profile dev --frozen
+cybersin check .
+cybersin build . --profile dev --frozen
 ```
+
+Runtime commands discover the project root by walking up from the current
+directory until they find `cybersin.yaml`. That means defaults such as
+`.cybersin/cybersin.db`, `.cybersin/sandbox`, and `dist/` resolve relative to
+the initialized project unless you override them with CLI flags.
 
 ### Build and run the sample project
 
-Check and compile the included research-team project:
+Clone the repository if you want to try the included research-team fixture:
 
 ```sh
-./target/debug/cybersin check fixtures/ic1-research-team
-./target/debug/cybersin build fixtures/ic1-research-team \
+git clone https://github.com/blokboy/cybersin.git
+cd cybersin
+```
+
+Check and compile the sample project:
+
+```sh
+cybersin check fixtures/ic1-research-team
+cybersin build fixtures/ic1-research-team \
   --profile release \
   --frozen
 ```
@@ -98,7 +189,7 @@ Check and compile the included research-team project:
 Run the compiled project. The runtime automatically creates and uses the SQLite database at `.cybersin/cybersin.db`.
 
 ```sh
-./target/debug/cybersin \
+cybersin \
   --db .cybersin/cybersin.db \
   run \
   --stub \
@@ -110,7 +201,7 @@ Run the compiled project. The runtime automatically creates and uses the SQLite 
 Inspect the compiled routing, token counts, traces, and observed cost:
 
 ```sh
-./target/debug/cybersin \
+cybersin \
   --db .cybersin/cybersin.db \
   explain researcher fixtures/ic1-research-team \
   --plain
@@ -119,7 +210,7 @@ Inspect the compiled routing, token counts, traces, and observed cost:
 Run the sample project's recorded regression suite:
 
 ```sh
-./target/debug/cybersin eval gate fixtures/ic1-research-team
+cybersin eval gate fixtures/ic1-research-team
 ```
 
 ### Interactive shell and help
@@ -144,7 +235,7 @@ directory are packaged into `dist/tools/`. DLQ retries and approved calls
 execute those commands in the selected Docker sandbox:
 
 ```sh
-./target/debug/cybersin \
+cybersin \
   --dist fixtures/ic1-research-team/dist \
   --sandbox-backend docker \
   dlq retry '<call-id>'

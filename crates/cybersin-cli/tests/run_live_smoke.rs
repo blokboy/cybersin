@@ -6,7 +6,7 @@
 //! `#[ignore]`d — needs a real Docker daemon (for `citation_lookup`'s
 //! sandboxed execution) and a real `OPENROUTER_API_KEY` (for the
 //! `researcher`/`synthesizer` `llm.request`s), so it doesn't run in
-//! default `cargo test`/CI. Run explicitly: `cargo test -p cybersin-cli
+//! default `cargo test`/CI. Run explicitly: `cargo test -p cybersin
 //! --test run_live_smoke -- --ignored`.
 
 use std::path::Path;

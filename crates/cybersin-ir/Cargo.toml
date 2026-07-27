@@ -2,6 +2,10 @@
 name = "cybersin-ir"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "Cybersin IR types: prompt IR, sections, budget plans. Serde on both sides of the compiler/runtime boundary. Zero heavy deps."
 
 [dependencies]

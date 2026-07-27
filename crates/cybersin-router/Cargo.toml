@@ -2,9 +2,14 @@
 name = "cybersin-router"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Cybersin routing profile parsing and model/tool route selection support."
 
 [dependencies]
-cybersin-ir = { path = "../cybersin-ir" }
+cybersin-ir = { path = "../cybersin-ir", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"

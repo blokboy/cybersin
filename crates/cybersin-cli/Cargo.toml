@@ -1,8 +1,17 @@
 [package]
-name = "cybersin-cli"
+name = "cybersin"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "The `cybersin` binary: compiler/runtime commands and ratatui explain/control-room views."
+keywords = ["agents", "prompts", "compiler", "runtime"]
+categories = ["command-line-utilities", "development-tools"]
+
+[features]
+internal-test-bins = []
 
 [[bin]]
 name = "cybersin"
@@ -15,6 +24,7 @@ path = "src/main.rs"
 [[bin]]
 name = "grpc_stub_harness"
 path = "src/bin/grpc_stub_harness.rs"
+required-features = ["internal-test-bins"]
 
 # Reusable, transport-agnostic scripted harness (issue #41): drives any
 # compiled agent's live session from a YAML script instead of a bespoke
@@ -22,18 +32,19 @@ path = "src/bin/grpc_stub_harness.rs"
 [[bin]]
 name = "scripted_harness"
 path = "src/bin/scripted_harness.rs"
+required-features = ["internal-test-bins"]
 
 [dependencies]
-cybersin-frontend = { path = "../cybersin-frontend" }
-cybersin-adapter = { path = "../cybersin-adapter" }
-cybersin-backends = { path = "../cybersin-backends" }
-cybersin-gateway = { path = "../cybersin-gateway" }
-cybersin-ir = { path = "../cybersin-ir" }
-cybersin-passes = { path = "../cybersin-passes" }
-cybersin-router = { path = "../cybersin-router" }
-cybersin-runtime = { path = "../cybersin-runtime" }
-cybersin-sandbox = { path = "../cybersin-sandbox" }
-cybersin-trace = { path = "../cybersin-trace" }
+cybersin-frontend = { path = "../cybersin-frontend", version = "0.1.0" }
+cybersin-adapter = { path = "../cybersin-adapter", version = "0.1.0" }
+cybersin-backends = { path = "../cybersin-backends", version = "0.1.0" }
+cybersin-gateway = { path = "../cybersin-gateway", version = "0.1.0" }
+cybersin-ir = { path = "../cybersin-ir", version = "0.1.0" }
+cybersin-passes = { path = "../cybersin-passes", version = "0.1.0" }
+cybersin-router = { path = "../cybersin-router", version = "0.1.0" }
+cybersin-runtime = { path = "../cybersin-runtime", version = "0.1.0" }
+cybersin-sandbox = { path = "../cybersin-sandbox", version = "0.1.0" }
+cybersin-trace = { path = "../cybersin-trace", version = "0.1.0" }
 
 anyhow = "1"
 async-trait = "0.1"

@@ -1,7 +1,11 @@
 [package]
 name = "cybersin-adapter"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "Harness<->daemon adapter protocol v0: message types, stdio and gRPC transports, conformance scenarios (spec §10)."
 
 [dependencies]

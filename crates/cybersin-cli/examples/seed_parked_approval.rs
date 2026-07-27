@@ -5,7 +5,7 @@
 //! developer convenience for exercising the Approvals tab by hand.
 //!
 //! Usage:
-//!   cargo run -p cybersin-cli --example seed_parked_approval -- <db-path> <session-id> <tool> <idem-key-seed>
+//!   cargo run -p cybersin --example seed_parked_approval -- <db-path> <session-id> <tool> <idem-key-seed>
 //!
 //! Then point `cybersin ops` at the same `--db` to see (and
 //! approve/deny) the parked row.

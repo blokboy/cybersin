@@ -2,15 +2,19 @@
 name = "cybersin-runtime"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "cybersind daemon skeleton (spec §8): Storage trait + SQLite impl, event-sourced session loop, stub agent driven against a hand-written dist/ fixture, recording real spans into cybersin-trace."
 
 [dependencies]
-cybersin-adapter = { path = "../cybersin-adapter" }
-cybersin-backends = { path = "../cybersin-backends" }
-cybersin-ir = { path = "../cybersin-ir" }
-cybersin-router = { path = "../cybersin-router" }
-cybersin-sandbox = { path = "../cybersin-sandbox" }
-cybersin-trace = { path = "../cybersin-trace" }
+cybersin-adapter = { path = "../cybersin-adapter", version = "0.1.0" }
+cybersin-backends = { path = "../cybersin-backends", version = "0.1.0" }
+cybersin-ir = { path = "../cybersin-ir", version = "0.1.0" }
+cybersin-router = { path = "../cybersin-router", version = "0.1.0" }
+cybersin-sandbox = { path = "../cybersin-sandbox", version = "0.1.0" }
+cybersin-trace = { path = "../cybersin-trace", version = "0.1.0" }
 
 async-trait = "0.1"
 minijinja = "2"
@@ -34,14 +38,3 @@ tokio-rustls = "0.26"
 [dev-dependencies]
 tempfile = "3"
 wiremock = "0.6"
-# Dev-only, and deliberately the reverse of this crate's normal
-# dependency direction (cybersin-gateway depends on cybersin-runtime):
-# cargo explicitly supports this cycle for dev-dependencies (the lib
-# target builds first, then feeds cybersin-gateway, then both feed this
-# crate's own test binaries). Used so this issue's approval-parking tests
-# can drive real `ToolGateway::approve`/`deny` against ledger rows
-# `RuntimeDaemon` itself parked — proving `cybersin approve <call-id>`
-# (which is exactly `ToolGateway::approve`, see cybersin-cli's
-# `commands::approval`) actually resumes them, without duplicating that
-# logic by hand in a test-only stand-in.
-cybersin-gateway = { path = "../cybersin-gateway" }

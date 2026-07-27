@@ -20,6 +20,6 @@ format.
 Regenerate the committed artifacts from the repository root:
 
 ```sh
-cargo run -p cybersin-cli -- build fixtures/ic1-research-team \
+cargo run -p cybersin -- build fixtures/ic1-research-team \
   --profile release --frozen
 ```

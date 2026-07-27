@@ -17,3 +17,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/blokboy/cybersin"
+homepage = "https://github.com/blokboy/cybersin"
+readme = "README.md"

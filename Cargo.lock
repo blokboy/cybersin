@@ -520,33 +520,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cybersin-adapter"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "prost",
- "protoc-bin-vendored",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-build",
-]
-
-[[package]]
-name = "cybersin-backends"
-version = "0.1.0"
-dependencies = [
- "cybersin-ir",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "cybersin-cli"
+name = "cybersin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -579,6 +553,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "cybersin-adapter"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "prost",
+ "protoc-bin-vendored",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+]
+
+[[package]]
+name = "cybersin-backends"
+version = "0.1.0"
+dependencies = [
+ "cybersin-ir",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cybersin-frontend"
 version = "0.1.0"
 dependencies = [
@@ -598,9 +598,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cybersin-adapter",
+ "cybersin-router",
  "cybersin-runtime",
+ "cybersin-trace",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -643,7 +646,6 @@ dependencies = [
  "async-trait",
  "cybersin-adapter",
  "cybersin-backends",
- "cybersin-gateway",
  "cybersin-ir",
  "cybersin-router",
  "cybersin-sandbox",
