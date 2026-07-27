@@ -10,6 +10,9 @@ use cybersin_trace::{Span, SpanFilter, SpanStore};
 use serde_json::{json, Value};
 use std::fmt::Write as _;
 
+use crate::commands::build::{self, BuildProfile, BuildProgress};
+
+pub const BUILD_CAPABILITY_ID: &str = "compile.build";
 pub const CHECK_CAPABILITY_ID: &str = "compile.check";
 pub const TRACE_LS_CAPABILITY_ID: &str = "inspection.trace.ls";
 
@@ -177,6 +180,30 @@ impl CheckInput {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildInput {
+    pub project_path: PathBuf,
+    pub profile: BuildProfile,
+    pub frozen: bool,
+    pub selected_prompt_source: Option<PathBuf>,
+}
+
+impl BuildInput {
+    pub fn new(project_path: impl Into<PathBuf>, profile: BuildProfile, frozen: bool) -> Self {
+        Self {
+            project_path: project_path.into(),
+            profile,
+            frozen,
+            selected_prompt_source: None,
+        }
+    }
+
+    pub fn with_selected_prompt_source(mut self, source: impl Into<PathBuf>) -> Self {
+        self.selected_prompt_source = Some(source.into());
+        self
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CapabilityExecution {
     pub events: Vec<CapabilityEvent>,
@@ -191,6 +218,165 @@ impl CapabilityExecution {
         self.events
             .iter()
             .any(|event| matches!(event, CapabilityEvent::Completed { .. }))
+    }
+}
+
+pub fn execute_build(input: BuildInput) -> CapabilityExecution {
+    let mut events = vec![CapabilityEvent::Started {
+        capability_id: CapabilityId::new(BUILD_CAPABILITY_ID),
+    }];
+
+    let dist_dir = input.project_path.join("dist");
+    let mut progress_events = Vec::new();
+    let result = if let Some(source) = &input.selected_prompt_source {
+        build::run_source_into_with_progress(
+            &input.project_path,
+            &dist_dir,
+            source,
+            input.profile,
+            input.frozen,
+            None,
+            |progress| progress_events.push(build_progress_event(progress)),
+        )
+    } else {
+        build::run_into_with_progress(
+            &input.project_path,
+            &dist_dir,
+            input.profile,
+            input.frozen,
+            None,
+            |progress| progress_events.push(build_progress_event(progress)),
+        )
+    };
+    events.extend(progress_events);
+
+    match result {
+        Ok(message) => {
+            let manifest = read_build_manifest(&dist_dir);
+            let completed = json!({
+                "project_path": input.project_path.display().to_string(),
+                "dist_dir": dist_dir.display().to_string(),
+                "profile": build_profile_name(input.profile),
+                "frozen": input.frozen,
+                "selected_prompt_source": input
+                    .selected_prompt_source
+                    .as_ref()
+                    .map(|source| source.display().to_string()),
+                "message": message,
+                "build_hash": manifest
+                    .as_ref()
+                    .and_then(|value| value.get("build_hash"))
+                    .and_then(Value::as_str),
+                "artifacts": manifest
+                    .as_ref()
+                    .and_then(|value| value.get("artifacts"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            });
+            events.push(CapabilityEvent::Output {
+                mode: OutputMode::Text,
+                value: json!({
+                    "stream": "stdout",
+                    "text": completed
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("build complete"),
+                }),
+            });
+            events.push(CapabilityEvent::Output {
+                mode: OutputMode::Json,
+                value: completed.clone(),
+            });
+            events.push(CapabilityEvent::Completed {
+                value: Some(completed),
+            });
+        }
+        Err(message) => {
+            events.push(CapabilityEvent::Failed { message });
+        }
+    }
+
+    CapabilityExecution::new(events)
+}
+
+pub fn build_summary(events: &[CapabilityEvent]) -> Option<Result<String, String>> {
+    for event in events.iter().rev() {
+        match event {
+            CapabilityEvent::Completed {
+                value: Some(value), ..
+            } => {
+                let message = value.get("message")?;
+                if message.is_null() {
+                    return Some(Ok("build complete".to_string()));
+                }
+                return Some(Ok(message.as_str()?.to_string()));
+            }
+            CapabilityEvent::Failed { message } => return Some(Err(message.clone())),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn build_progress_event(progress: BuildProgress) -> CapabilityEvent {
+    match progress {
+        BuildProgress::DiscoveredPrompts(sources) => CapabilityEvent::Progress {
+            message: format!("discovered {} prompt source(s)", sources.len()),
+            current: Some(0),
+            total: Some(sources.len() as u64),
+        },
+        BuildProgress::ClearingDist(path) => CapabilityEvent::Progress {
+            message: format!("clearing {}", path.display()),
+            current: None,
+            total: None,
+        },
+        BuildProgress::PromptStarted { name, source } => CapabilityEvent::Progress {
+            message: format!("building {name} from {}", source.display()),
+            current: None,
+            total: None,
+        },
+        BuildProgress::PassFinished { prompt, pass } => CapabilityEvent::Progress {
+            message: format!("{prompt}: {pass} pass finished"),
+            current: None,
+            total: None,
+        },
+        BuildProgress::PromptWritten(prompt) => CapabilityEvent::Progress {
+            message: format!("wrote prompt artifact for {prompt}"),
+            current: None,
+            total: None,
+        },
+        BuildProgress::Routing => CapabilityEvent::Progress {
+            message: "wrote routing artifact".to_string(),
+            current: None,
+            total: None,
+        },
+        BuildProgress::Cache => CapabilityEvent::Progress {
+            message: "wrote cache seed".to_string(),
+            current: None,
+            total: None,
+        },
+        BuildProgress::Tools => CapabilityEvent::Progress {
+            message: "wrote tool policy artifacts".to_string(),
+            current: None,
+            total: None,
+        },
+        BuildProgress::Manifest => CapabilityEvent::Progress {
+            message: "wrote build manifest".to_string(),
+            current: None,
+            total: None,
+        },
+    }
+}
+
+fn read_build_manifest(dist_dir: &std::path::Path) -> Option<Value> {
+    let text = std::fs::read_to_string(dist_dir.join("manifest.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn build_profile_name(profile: BuildProfile) -> &'static str {
+    match profile {
+        BuildProfile::Dev => "dev",
+        BuildProfile::Release => "release",
     }
 }
 
@@ -455,18 +641,7 @@ impl CapabilityRegistry {
 
 pub fn registry() -> CapabilityRegistry {
     CapabilityRegistry::new(vec![
-        spec(
-            "compile.build",
-            "Build project",
-            "Compile a project into dist artifacts.",
-            CapabilityCategory::Compile,
-            vec![OutputMode::Text, OutputMode::Artifact],
-            writes_project_files(
-                NetworkRequirement::Optional,
-                LongRunningBehavior::StreamsUntilComplete,
-            ),
-            cli(),
-        ),
+        build_spec(),
         spec(
             "compile.build.watch",
             "Watch build",
@@ -861,6 +1036,45 @@ fn spec(
         output_modes,
         safety,
         adapters,
+    }
+}
+
+fn build_spec() -> CapabilitySpec {
+    CapabilitySpec {
+        id: CapabilityId::new(BUILD_CAPABILITY_ID),
+        title: "Build project".to_string(),
+        summary: "Compile a project into dist artifacts.".to_string(),
+        category: CapabilityCategory::Compile,
+        input_schema: json!({
+            "type": "object",
+            "required": ["project_path", "profile", "frozen"],
+            "additionalProperties": false,
+            "properties": {
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory containing cybersin.yaml, cybersin.lock, and prompt sources."
+                },
+                "profile": {
+                    "type": "string",
+                    "enum": ["dev", "release"],
+                    "description": "Build profile; dev excludes model-assisted compression."
+                },
+                "frozen": {
+                    "type": "boolean",
+                    "description": "Refuse build passes that would require network-backed updates."
+                },
+                "selected_prompt_source": {
+                    "type": ["string", "null"],
+                    "description": "Optional single *.prompt.yaml source to compile instead of all discovered prompts."
+                }
+            }
+        }),
+        output_modes: vec![OutputMode::Text, OutputMode::Json, OutputMode::Artifact],
+        safety: writes_project_files(
+            NetworkRequirement::Optional,
+            LongRunningBehavior::StreamsUntilComplete,
+        ),
+        adapters: cli(),
     }
 }
 

@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::capabilities::{build_summary, execute_build, BuildInput};
 use crate::git;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -94,7 +95,12 @@ impl CompressionProvider for UnavailableProvider {
 /// cold-start routing defaults only (no observed trace overrides — see
 /// [`run_into`]).
 pub fn run(project: &Path, profile: BuildProfile, frozen: bool) -> Result<Option<String>, String> {
-    run_into(project, &project.join("dist"), profile, frozen, None)
+    let execution = execute_build(BuildInput::new(project, profile, frozen));
+    build_summary(&execution.events)
+        .unwrap_or_else(|| {
+            Err("cybersin build failed: capability did not emit a terminal event".to_string())
+        })
+        .map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -889,6 +895,8 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
+    use crate::capabilities::{build_summary, execute_build, BuildInput, CapabilityEvent};
+
     fn init_project(dir: &Path) {
         crate::commands::init::run(dir).expect("init");
     }
@@ -917,6 +925,73 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("routing.json"));
+    }
+
+    #[test]
+    fn cli_adapter_summary_matches_direct_build_capability() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        init_project(&project);
+
+        let direct = execute_build(BuildInput::new(&project, BuildProfile::Dev, true));
+        let direct_summary = build_summary(&direct.events)
+            .expect("build capability should emit a terminal event")
+            .map(Some);
+        let direct_completed = direct
+            .events
+            .iter()
+            .find_map(|event| match event {
+                CapabilityEvent::Completed { value } => value.as_ref(),
+                _ => None,
+            })
+            .expect("build capability should complete with result information");
+        let direct_hash = direct_completed
+            .get("build_hash")
+            .and_then(serde_json::Value::as_str)
+            .expect("build capability should report build hash")
+            .to_string();
+
+        assert_eq!(run(&project, BuildProfile::Dev, true), direct_summary);
+
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(project.join("dist/manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["build_hash"], direct_hash);
+        assert!(direct_completed["artifacts"]
+            .as_object()
+            .unwrap()
+            .contains_key("routing.json"));
+    }
+
+    #[test]
+    fn direct_build_capability_can_compile_a_selected_prompt_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        init_project(&project);
+        let second = project.join("prompts/bye.prompt.yaml");
+        fs::write(
+            &second,
+            r#"
+name: bye
+quality: medium
+sections:
+  - id: style
+    priority: 100
+    body: "Say goodbye."
+"#,
+        )
+        .unwrap();
+
+        let direct = execute_build(
+            BuildInput::new(&project, BuildProfile::Dev, true).with_selected_prompt_source(&second),
+        );
+
+        assert_eq!(
+            build_summary(&direct.events),
+            Some(Ok(format!("built {}", project.display())))
+        );
+        assert!(project.join("dist/prompts/bye.json").exists());
+        assert!(!project.join("dist/prompts/hello.json").exists());
     }
 
     #[test]
