@@ -15,7 +15,7 @@ Cybersin is a Rust-based prompt compiler and durable agent runtime that turns ty
 
 Docker is only required for the container-backed sandbox tests; the quickstart below uses the local SQLite runtime.
 
-### Build and run the sample project
+### Create a project spine
 
 Clone the repository and build the workspace:
 
@@ -24,6 +24,67 @@ git clone https://github.com/blokboy/cybersin.git
 cd cybersin
 cargo build --workspace
 ```
+
+Create the basic Cybersin project spine:
+
+```sh
+./target/debug/cybersin init myagent
+```
+
+Plain `init` is safe for an existing codebase. It creates core project
+files (`cybersin.yaml`, `cybersin.lock`, `cybersin.local.example.yaml`,
+and `.gitignore`) plus empty `prompts/`, `fragments/`, `evals/`,
+`agents/`, and `tools/` directories. It does not create starter prompt
+sources, evals, agents, harness files, sample inputs, or `dist/`.
+Existing files are skipped by default and reported in the command output;
+use `--dry-run` to preview or `--force` to overwrite scaffold files.
+
+For live providers and built-in web tools, keep machine-local readiness
+settings out of the portable project config:
+
+```sh
+cp myagent/cybersin.local.example.yaml myagent/cybersin.local.yaml
+cat > myagent/.env <<'EOF'
+OPENROUTER_API_KEY=...
+TAVILY_API_KEY=...
+EOF
+```
+
+`cybersin.local.yaml` is gitignored by the scaffold. Store secret
+references there as environment-variable names, not raw secrets. A local
+config can declare provider/tool availability, sandbox defaults, and
+routing/tool permissions:
+
+```yaml
+providers:
+  openrouter:
+    availability: available
+    api_key: ${OPENROUTER_API_KEY}
+tools:
+  tavily:
+    availability: auto
+    api_key:
+      env: TAVILY_API_KEY
+defaults:
+  provider: openrouter
+  model: openai/gpt-4o-mini
+permissions:
+  routing:
+    allowed_providers: [openrouter]
+```
+
+Cybersin still honors the existing process environment, and it now loads
+an optional project-root `.env` before OpenRouter and Tavily readiness
+checks without overriding variables that are already set.
+
+Add prompt sources under `myagent/prompts/`, then check and build:
+
+```sh
+./target/debug/cybersin check myagent
+./target/debug/cybersin build myagent --profile dev --frozen
+```
+
+### Build and run the sample project
 
 Check and compile the included research-team project:
 
@@ -67,8 +128,9 @@ Run `cybersin` with no arguments from an interactive terminal to open the
 Ratatui application shell. The first workflow is prompt conversion: enter
 a multiline raw prompt, keep or change the standalone conversion model,
 optionally set an output path, and run the same conversion pipeline used
-by `cybersin convert`. Live conversion uses OpenRouter and requires
-`OPENROUTER_API_KEY`.
+by `cybersin convert`. Live conversion uses OpenRouter and reads its key
+from the environment directly or through the project's `.env` and
+`cybersin.local.yaml` provider config.
 
 Use `cybersin -help`, `cybersin -h`, or `cybersin --help` to print CLI
 help and exit. Bare `cybersin` in a non-interactive context fails clearly
