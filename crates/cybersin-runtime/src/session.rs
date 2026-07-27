@@ -1020,6 +1020,18 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         } else {
             CacheStatus::Miss
         };
+        let usage = response.usage.as_ref();
+        let event_prompt_tokens = usage
+            .and_then(|usage| usage.prompt_tokens)
+            .unwrap_or(assembled.prompt_tokens);
+        let event_completion_tokens = usage
+            .and_then(|usage| usage.completion_tokens)
+            .unwrap_or(routing.completion_tokens_estimate);
+        let event_usage_source = if usage.is_some() {
+            "provider"
+        } else {
+            "route_estimate"
+        };
 
         self.storage
             .append_event(
@@ -1030,8 +1042,9 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                     "model": response.model,
                     "cache_status": cache_status.as_str(),
                     "usd_cost": response.usd_cost,
-                    "tokens_prompt": assembled.prompt_tokens,
-                    "tokens_completion": routing.completion_tokens_estimate,
+                    "tokens_prompt": event_prompt_tokens,
+                    "tokens_completion": event_completion_tokens,
+                    "usage_source": event_usage_source,
                     "evicted_sections": assembled.evicted_sections,
                     "evicted_live_sections": assembled.evicted_live_sections,
                     "response": response.response,

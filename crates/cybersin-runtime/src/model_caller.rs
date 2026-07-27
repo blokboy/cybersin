@@ -55,6 +55,7 @@ impl ModelCaller for StubModelCaller {
                 "model": model.name,
             }),
             confidence: stub_confidence(model.quality),
+            usage: None,
         })
     }
 }

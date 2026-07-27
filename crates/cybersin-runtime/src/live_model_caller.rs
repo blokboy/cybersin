@@ -54,7 +54,7 @@ use cybersin_router::RouteModel;
 use serde_json::{json, Value};
 
 use crate::dist::DistFixture;
-use crate::route_executor::{ModelCaller, ModelOutput};
+use crate::route_executor::{ModelCaller, ModelOutput, ModelUsage};
 
 const DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
@@ -318,10 +318,12 @@ impl ModelCaller for OpenRouterModelCaller {
         if let Some(obj) = parsed.as_object_mut() {
             obj.remove(CASCADE_CONFIDENCE_KEY);
         }
+        let usage = provider_usage(&payload);
 
         Ok(ModelOutput {
             response: parsed,
             confidence,
+            usage,
         })
     }
 }
@@ -331,6 +333,33 @@ fn openrouter_model_id(model: &RouteModel) -> String {
         model.name.clone()
     } else {
         format!("{}/{}", model.provider, model.name)
+    }
+}
+
+fn provider_usage(payload: &Value) -> Option<ModelUsage> {
+    let usage = payload.get("usage")?;
+    let prompt_tokens = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok());
+    let usd_cost = usage
+        .get("cost")
+        .or_else(|| usage.get("total_cost"))
+        .or_else(|| usage.get("estimated_cost"))
+        .and_then(Value::as_f64);
+
+    if prompt_tokens.is_none() && completion_tokens.is_none() && usd_cost.is_none() {
+        None
+    } else {
+        Some(ModelUsage {
+            prompt_tokens,
+            completion_tokens,
+            usd_cost,
+        })
     }
 }
 
@@ -410,7 +439,13 @@ mod tests {
                         "role": "assistant",
                         "content": "{\"summary\": \"done\", \"__cascade_confidence\": 0.91}"
                     }
-                }]
+                }],
+                "usage": {
+                    "prompt_tokens": 17,
+                    "completion_tokens": 23,
+                    "total_tokens": 40,
+                    "cost": 0.000123
+                }
             })))
             .mount(&server)
             .await;
@@ -431,6 +466,21 @@ mod tests {
 
         assert_eq!(output.confidence, 0.91);
         assert_eq!(output.response["summary"], "done");
+        assert_eq!(
+            output.usage.as_ref().and_then(|usage| usage.prompt_tokens),
+            Some(17)
+        );
+        assert_eq!(
+            output
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.completion_tokens),
+            Some(23)
+        );
+        assert_eq!(
+            output.usage.as_ref().and_then(|usage| usage.usd_cost),
+            Some(0.000123)
+        );
         // The reserved routing-layer field never leaks into the domain
         // response a harness actually sees.
         assert!(output.response.get("__cascade_confidence").is_none());
