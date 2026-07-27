@@ -1103,6 +1103,15 @@ pub fn registry() -> CapabilityRegistry {
             cli(),
         ),
         spec(
+            "inspection.doctor",
+            "Doctor setup",
+            "Report local project setup readiness and focused next actions.",
+            CapabilityCategory::Inspection,
+            vec![OutputMode::Text],
+            read_only(),
+            cli(),
+        ),
+        spec(
             "control.ops",
             "Open ops",
             "Inspect and interact with project sessions, traces, costs, approvals, and builds.",

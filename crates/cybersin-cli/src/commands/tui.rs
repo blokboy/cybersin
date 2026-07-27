@@ -900,7 +900,16 @@ fn resolve_project_root(project_start: &Path) -> Result<PathBuf, String> {
 
 async fn run_conversion(app: &App) -> Result<ConvertReport, String> {
     let project_root = resolve_project_root(&app.project_start)?;
-    let converter = OpenRouterPromptConversionModel::from_env(app.model.trim().to_string())?;
+    ProjectDefaults::detect(&project_root)
+        .map_err(|error| error.to_string())?
+        .load_dotenv()
+        .map_err(|error| error.to_string())?;
+    let local_config = cybersin_runtime::LocalConfigFile::load_optional(&project_root)
+        .map_err(|error| error.to_string())?;
+    let converter = OpenRouterPromptConversionModel::from_local_config(
+        app.model.trim().to_string(),
+        local_config.as_ref(),
+    )?;
     run_conversion_with_model(&converter, &project_root, app).await
 }
 

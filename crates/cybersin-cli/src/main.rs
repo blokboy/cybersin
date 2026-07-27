@@ -22,6 +22,7 @@ mod commands;
 mod git;
 mod harness_config;
 mod project;
+mod readiness;
 mod tool_executor;
 
 use std::path::PathBuf;
@@ -87,7 +88,7 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
         /// Build profile. `dev` excludes model-assisted compression.
-        #[arg(long, value_enum, default_value = "release")]
+        #[arg(long, value_enum, default_value = "dev")]
         profile: commands::build::BuildProfile,
         /// Refuse any pass that would need a network call.
         #[arg(long)]
@@ -160,6 +161,8 @@ enum Command {
         #[command(subcommand)]
         command: commands::trace::TraceCommand,
     },
+    /// Report local setup readiness by project area.
+    Doctor,
     /// Cost rollups (spec §8.5: `cybersin cost --by <dim>`).
     Cost(commands::cost::CostArgs),
     /// Compile, run, and gate single-prompt output-quality eval suites.
@@ -272,9 +275,6 @@ async fn main() -> ExitCode {
         } => from_sync(commands::diff::run(&path, &reference, profile)),
         Command::Check { path } => from_sync(commands::check::run(&path)),
         Command::Convert { out, model, input } => {
-            if let Err(e) = load_project_dotenv(&project_start) {
-                return from_async(Err(e));
-            }
             from_async(commands::convert::execute(&project_start, input, out, model).await)
         }
         Command::Init {
@@ -306,6 +306,7 @@ async fn main() -> ExitCode {
                 };
             from_async(commands::trace::execute(db, command).await)
         }
+        Command::Doctor => from_async(commands::doctor::execute(&project_start)),
         Command::Cost(args) => {
             let (db, ..) =
                 match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
@@ -618,6 +619,7 @@ mod tests {
             ("daemon", &["control.daemon.server"]),
             ("deny", &["control.deny"]),
             ("diff", &["compile.diff"]),
+            ("doctor", &["inspection.doctor"]),
             ("dlq drop", &["control.dlq.drop"]),
             ("dlq ls", &["control.dlq.ls"]),
             ("dlq retry", &["control.dlq.retry"]),
