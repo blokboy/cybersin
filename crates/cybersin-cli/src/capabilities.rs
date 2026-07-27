@@ -4,7 +4,11 @@
 //! modules are CLI adapters, while these types describe the shared product
 //! surface that CLI and TUI adapters will eventually invoke.
 
+use std::path::PathBuf;
+
 use serde_json::{json, Value};
+
+pub const CHECK_CAPABILITY_ID: &str = "compile.check";
 
 /// A user-facing operation that can be invoked through one or more adapters.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -159,6 +163,152 @@ pub enum CapabilityEvent {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckInput {
+    pub path: PathBuf,
+}
+
+impl CheckInput {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapabilityExecution {
+    pub events: Vec<CapabilityEvent>,
+}
+
+impl CapabilityExecution {
+    pub fn new(events: Vec<CapabilityEvent>) -> Self {
+        Self { events }
+    }
+
+    pub fn is_success(&self) -> bool {
+        self.events
+            .iter()
+            .any(|event| matches!(event, CapabilityEvent::Completed { .. }))
+    }
+}
+
+pub fn execute_check(input: CheckInput) -> CapabilityExecution {
+    let mut events = vec![CapabilityEvent::Started {
+        capability_id: CapabilityId::new(CHECK_CAPABILITY_ID),
+    }];
+
+    let sources = match cybersin_frontend::discover_prompt_sources(&input.path) {
+        Ok(sources) => sources,
+        Err(e) => {
+            events.push(CapabilityEvent::Failed {
+                message: format!("error: could not read {}: {e}", input.path.display()),
+            });
+            return CapabilityExecution::new(events);
+        }
+    };
+
+    if sources.is_empty() {
+        events.push(CapabilityEvent::Failed {
+            message: format!(
+                "error: no *.prompt.yaml sources found at {}",
+                input.path.display()
+            ),
+        });
+        return CapabilityExecution::new(events);
+    }
+
+    let total = sources.len();
+    let mut failed = 0usize;
+    let mut results = Vec::new();
+    for source in &sources {
+        match cybersin_frontend::compile_prompt_source(source) {
+            Ok(ir) => {
+                events.push(check_text_output(
+                    "stdout",
+                    format!("ok    {}", source.display()),
+                ));
+                let ir = serde_json::to_value(ir).expect("PromptIr should serialize");
+                events.push(CapabilityEvent::Output {
+                    mode: OutputMode::Json,
+                    value: json!({
+                        "path": source.display().to_string(),
+                        "status": "ok",
+                        "ir": ir,
+                    }),
+                });
+                results.push(json!({
+                    "path": source.display().to_string(),
+                    "status": "ok",
+                    "ir": ir,
+                }));
+            }
+            Err(e) => {
+                failed += 1;
+                let error = e.to_string();
+                events.push(check_text_output(
+                    "stderr",
+                    format!("FAIL  {}\n{error}\n", source.display()),
+                ));
+                results.push(json!({
+                    "path": source.display().to_string(),
+                    "status": "failed",
+                    "error": error,
+                }));
+            }
+        }
+    }
+
+    let result = json!({
+        "path": input.path.display().to_string(),
+        "sources": total,
+        "failed": failed,
+        "results": results,
+    });
+
+    if failed == 0 {
+        events.push(CapabilityEvent::Completed {
+            value: Some(result),
+        });
+    } else {
+        events.push(CapabilityEvent::Failed {
+            message: format!("cybersin check failed: {failed} of {total} source(s) had errors"),
+        });
+    }
+
+    CapabilityExecution::new(events)
+}
+
+pub fn check_summary(events: &[CapabilityEvent]) -> Option<Result<String, String>> {
+    for event in events.iter().rev() {
+        match event {
+            CapabilityEvent::Completed {
+                value: Some(value), ..
+            } => {
+                let sources = value.get("sources")?.as_u64()?;
+                return Some(Ok(format!("cybersin check: {sources} source(s) ok")));
+            }
+            CapabilityEvent::Failed { message } => return Some(Err(message.clone())),
+            _ => {}
+        }
+    }
+    None
+}
+
+pub fn check_output_stream(value: &Value) -> Option<(&str, &str)> {
+    let stream = value.get("stream")?.as_str()?;
+    let text = value.get("text")?.as_str()?;
+    Some((stream, text))
+}
+
+fn check_text_output(stream: &str, text: String) -> CapabilityEvent {
+    CapabilityEvent::Output {
+        mode: OutputMode::Text,
+        value: json!({
+            "stream": stream,
+            "text": text,
+        }),
+    }
+}
+
 /// Data-only catalog of Cybersin's current user-facing product surface.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CapabilityRegistry {
@@ -228,15 +378,7 @@ pub fn registry() -> CapabilityRegistry {
             read_only(),
             cli(),
         ),
-        spec(
-            "compile.check",
-            "Check prompt sources",
-            "Parse, include-resolve, typecheck, and emit prompt IR.",
-            CapabilityCategory::Compile,
-            vec![OutputMode::Text, OutputMode::Json],
-            read_only(),
-            cli(),
-        ),
+        check_spec(),
         spec(
             "compile.convert",
             "Convert prompt",
@@ -609,6 +751,29 @@ fn spec(
         output_modes,
         safety,
         adapters,
+    }
+}
+
+fn check_spec() -> CapabilitySpec {
+    CapabilitySpec {
+        id: CapabilityId::new(CHECK_CAPABILITY_ID),
+        title: "Check prompt sources".to_string(),
+        summary: "Parse, include-resolve, typecheck, and emit prompt IR.".to_string(),
+        category: CapabilityCategory::Compile,
+        input_schema: json!({
+            "type": "object",
+            "required": ["path"],
+            "additionalProperties": false,
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Prompt source file, project directory, or prompts directory to check."
+                }
+            }
+        }),
+        output_modes: vec![OutputMode::Text, OutputMode::Json],
+        safety: read_only(),
+        adapters: cli(),
     }
 }
 
