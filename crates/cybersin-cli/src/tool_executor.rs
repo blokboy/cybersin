@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cybersin_gateway::{GatewayOutcome, RetryClass, ToolExecutor, ToolGateway};
-use cybersin_runtime::{DistFixture, Storage};
+use cybersin_runtime::{DistFixture, LocalConfigFile, Storage};
 use cybersin_sandbox::{
     DockerBackend, ExecRequest, GvisorBackend, SandboxBackend, SandboxScope, WorkspaceStore,
 };
@@ -54,6 +54,22 @@ impl TavilyClient {
 
     fn from_env() -> Self {
         Self::new(std::env::var("TAVILY_API_KEY").ok())
+    }
+
+    fn from_local_config(config: Option<&LocalConfigFile>) -> Self {
+        let Some(tool) = config.and_then(|config| config.tool("tavily")) else {
+            return Self::from_env();
+        };
+        let api_key = tool
+            .api_key
+            .as_ref()
+            .and_then(|reference| reference.read())
+            .or_else(|| std::env::var("TAVILY_API_KEY").ok());
+        let mut client = Self::new(api_key);
+        if let Some(base_url) = &tool.base_url {
+            client.base_url = base_url.clone();
+        }
+        client
     }
 
     #[cfg(test)]
@@ -167,6 +183,12 @@ fn default_builtins() -> HashMap<&'static str, Arc<dyn BuiltinTool>> {
     builtins_for(TavilyClient::from_env())
 }
 
+fn configured_builtins(
+    config: Option<&LocalConfigFile>,
+) -> HashMap<&'static str, Arc<dyn BuiltinTool>> {
+    builtins_for(TavilyClient::from_local_config(config))
+}
+
 fn builtins_for(tavily: TavilyClient) -> HashMap<&'static str, Arc<dyn BuiltinTool>> {
     let tavily = Arc::new(tavily);
     let mut map: HashMap<&'static str, Arc<dyn BuiltinTool>> = HashMap::new();
@@ -199,6 +221,11 @@ impl<B: ?Sized> SandboxToolExecutor<B> {
         }
     }
 
+    fn with_local_config(mut self, config: Option<&LocalConfigFile>) -> Self {
+        self.builtins = configured_builtins(config);
+        self
+    }
+
     /// Test-only override of the Tavily-backed built-ins, so unit tests
     /// can point `web_search`/`web_fetch` at a `wiremock` server instead
     /// of a real, unconfigured, or absent `TAVILY_API_KEY`.
@@ -214,6 +241,22 @@ pub(crate) fn configured_executor(
     sandbox_root: &Path,
     backend_kind: crate::commands::sandbox::Backend,
 ) -> anyhow::Result<Arc<dyn ToolExecutor>> {
+    let project_dir = dist_dir.parent().unwrap_or_else(|| Path::new("."));
+    let local_config = LocalConfigFile::load_optional(project_dir)?;
+    configured_executor_with_local_config(
+        dist_dir,
+        sandbox_root,
+        backend_kind,
+        local_config.as_ref(),
+    )
+}
+
+pub(crate) fn configured_executor_with_local_config(
+    dist_dir: &Path,
+    sandbox_root: &Path,
+    backend_kind: crate::commands::sandbox::Backend,
+    local_config: Option<&LocalConfigFile>,
+) -> anyhow::Result<Arc<dyn ToolExecutor>> {
     let dist = Arc::new(DistFixture::load_dir(dist_dir)?);
     let workspaces = Arc::new(WorkspaceStore::new(sandbox_root)?);
     let binary = std::env::var_os("CYBERSIN_CONTAINER_RUNTIME").unwrap_or_else(|| "docker".into());
@@ -223,12 +266,10 @@ pub(crate) fn configured_executor(
             Arc::new(GvisorBackend::with_binary(binary))
         }
     };
-    Ok(Arc::new(SandboxToolExecutor::new(
-        dist,
-        dist_dir.join("tools"),
-        backend,
-        workspaces,
-    )))
+    Ok(Arc::new(
+        SandboxToolExecutor::new(dist, dist_dir.join("tools"), backend, workspaces)
+            .with_local_config(local_config),
+    ))
 }
 
 /// Bridges `cybersin_gateway::ToolGateway` -> `cybersin_runtime::ToolCaller`,
@@ -691,6 +732,27 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(unconfigured, "web_search: no provider configured");
+    }
+
+    #[test]
+    fn tavily_placeholder_config_reads_referenced_environment_key() {
+        std::env::set_var("CYBERSIN_TEST_TAVILY_KEY", "test-tavily-key");
+        let config: LocalConfigFile = serde_yaml::from_str(
+            r#"
+tools:
+  tavily:
+    availability: auto
+    api_key: ${CYBERSIN_TEST_TAVILY_KEY}
+    base_url: https://tavily.local
+"#,
+        )
+        .unwrap();
+
+        let client = TavilyClient::from_local_config(Some(&config));
+
+        assert_eq!(client.require_key("web_search").unwrap(), "test-tavily-key");
+        assert_eq!(client.base_url, "https://tavily.local");
+        std::env::remove_var("CYBERSIN_TEST_TAVILY_KEY");
     }
 
     #[tokio::test]

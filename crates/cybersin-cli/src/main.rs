@@ -272,6 +272,9 @@ async fn main() -> ExitCode {
         } => from_sync(commands::diff::run(&path, &reference, profile)),
         Command::Check { path } => from_sync(commands::check::run(&path)),
         Command::Convert { out, model, input } => {
+            if let Err(e) = load_project_dotenv(&project_start) {
+                return from_async(Err(e));
+            }
             from_async(commands::convert::execute(&project_start, input, out, model).await)
         }
         Command::Init {
@@ -453,12 +456,17 @@ fn resolve_runtime_globals(
     project::ProjectDefaults,
 )> {
     let defaults = project::ProjectDefaults::detect(project_start)?;
+    load_project_dotenv(project_start)?;
     Ok((
         db.unwrap_or_else(|| defaults.db_default()),
         sandbox_root.unwrap_or_else(|| defaults.sandbox_root_default()),
         sandbox_backend.unwrap_or_else(|| defaults.sandbox_backend_default()),
         defaults,
     ))
+}
+
+fn load_project_dotenv(project_start: &std::path::Path) -> anyhow::Result<()> {
+    project::ProjectDefaults::detect(project_start)?.load_dotenv()
 }
 
 /// Resolves `--dist`: an explicit flag wins, otherwise `<project

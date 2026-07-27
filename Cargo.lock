@@ -564,6 +564,7 @@ dependencies = [
  "cybersin-runtime",
  "cybersin-sandbox",
  "cybersin-trace",
+ "dotenvy",
  "predicates",
  "ratatui",
  "reqwest",

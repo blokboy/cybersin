@@ -101,6 +101,27 @@ impl ProjectDefaults {
         self.sandbox_backend.unwrap_or(Backend::DockerGvisor)
     }
 
+    /// Load `<project root>/.env` if present, without overriding values
+    /// the caller's environment already set. This keeps existing
+    /// env-var configuration authoritative while letting local projects
+    /// provide optional readiness inputs before providers/tools inspect
+    /// the environment.
+    pub fn load_dotenv(&self) -> anyhow::Result<()> {
+        let path = self.root.join(".env");
+        if !path.is_file() {
+            return Ok(());
+        }
+        for item in
+            dotenvy::from_path_iter(&path).with_context(|| format!("reading {}", path.display()))?
+        {
+            let (key, value) = item.with_context(|| format!("parsing {}", path.display()))?;
+            if std::env::var_os(&key).is_none() {
+                std::env::set_var(key, value);
+            }
+        }
+        Ok(())
+    }
+
     /// `<root>/dist` if it's a real, already-built directory. Errors —
     /// rather than silently substituting the bundled stub fixture — when it
     /// isn't, whether or not a project root was actually discovered.
@@ -232,5 +253,33 @@ mod tests {
             defaults.sandbox_backend_default(),
             Backend::Docker
         ));
+    }
+
+    #[test]
+    fn dotenv_loading_sets_missing_values_without_overriding_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("cybersin.yaml"));
+        std::fs::write(
+            dir.path().join(".env"),
+            "CYBERSIN_TEST_DOTENV_ONLY=from-dotenv\nCYBERSIN_TEST_DOTENV_KEEP=from-dotenv\n",
+        )
+        .unwrap();
+        std::env::remove_var("CYBERSIN_TEST_DOTENV_ONLY");
+        std::env::set_var("CYBERSIN_TEST_DOTENV_KEEP", "from-env");
+
+        let defaults = ProjectDefaults::detect(dir.path()).unwrap();
+        defaults.load_dotenv().unwrap();
+
+        assert_eq!(
+            std::env::var("CYBERSIN_TEST_DOTENV_ONLY").unwrap(),
+            "from-dotenv"
+        );
+        assert_eq!(
+            std::env::var("CYBERSIN_TEST_DOTENV_KEEP").unwrap(),
+            "from-env"
+        );
+
+        std::env::remove_var("CYBERSIN_TEST_DOTENV_ONLY");
+        std::env::remove_var("CYBERSIN_TEST_DOTENV_KEEP");
     }
 }

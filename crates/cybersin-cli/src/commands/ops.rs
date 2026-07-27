@@ -93,6 +93,7 @@ pub(crate) async fn plain_sections_for_path(path: &Path) -> Result<PlainOpsSecti
     let start = std::fs::canonicalize(path)
         .with_context(|| format!("resolving project path {}", path.display()))?;
     let defaults = ProjectDefaults::detect(&start)?;
+    defaults.load_dotenv()?;
     let project_root = project::discover_project_root(&start).unwrap_or(start.clone());
     let daemon = DaemonHandle::auto_start(defaults.db_default()).await?;
     let model = OpsModel::load(&daemon, &project_root).await?;
@@ -360,6 +361,7 @@ pub async fn execute(
     let start = std::fs::canonicalize(&args.path)
         .with_context(|| format!("resolving project path {}", args.path.display()))?;
     let defaults = ProjectDefaults::detect(&start)?;
+    defaults.load_dotenv()?;
     let project_root = project::discover_project_root(&start).unwrap_or(start.clone());
     let db = db.unwrap_or_else(|| defaults.db_default());
 

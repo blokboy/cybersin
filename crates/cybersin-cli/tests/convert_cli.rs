@@ -92,6 +92,49 @@ async fn convert_project_flag_anchors_discovery_from_outside_the_project() {
         .contains("Otto Von Bismarck"));
 }
 
+#[tokio::test]
+async fn convert_loads_project_dotenv_before_openrouter_readiness_check() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{
+                "message": {
+                    "content": "{\"name\":\"dotenv-draft\",\"quality\":\"medium\",\"sections\":[{\"id\":\"prompt\",\"priority\":100,\"body\":\"ignored\"}]}"
+                }
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("cybersin.yaml"), "name: test\n").unwrap();
+    std::fs::write(
+        project.path().join(".env"),
+        format!(
+            "OPENROUTER_API_KEY=\"Bearer test-key\"\nOPENROUTER_BASE_URL=\"{}\"\n",
+            server.uri()
+        ),
+    )
+    .unwrap();
+
+    cybersin()
+        .current_dir(project.path())
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("OPENROUTER_BASE_URL")
+        .arg("convert")
+        .arg("Use dotenv credentials.")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("self-validation passed"));
+
+    assert!(project
+        .path()
+        .join("prompts/dotenv-draft.prompt.yaml")
+        .exists());
+}
+
 #[test]
 fn convert_reports_a_missing_project_with_a_nonzero_exit() {
     let outside_project = tempfile::tempdir().unwrap();
