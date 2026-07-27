@@ -33,7 +33,8 @@
               "confidence": {
                 "minimum_score": 0.9,
                 "instruction": "Score 0..1 whether the response satisfies the High quality contract; accept at or above 0.90."
-              }
+              },
+              "grounded": false
             },
             {
               "model": {
@@ -46,7 +47,8 @@
               "confidence": {
                 "minimum_score": 0.9,
                 "instruction": "Score 0..1 whether the response satisfies the High quality contract; accept at or above 0.90."
-              }
+              },
+              "grounded": false
             },
             {
               "model": {
@@ -59,7 +61,8 @@
               "confidence": {
                 "minimum_score": 0.82,
                 "instruction": "Score 0..1 whether the response satisfies the High quality contract; accept at or above 0.82."
-              }
+              },
+              "grounded": false
             }
           ]
         },
@@ -143,7 +146,8 @@
               "confidence": {
                 "minimum_score": 0.9,
                 "instruction": "Score 0..1 whether the response satisfies the Medium quality contract; accept at or above 0.90."
-              }
+              },
+              "grounded": false
             },
             {
               "model": {
@@ -156,7 +160,8 @@
               "confidence": {
                 "minimum_score": 0.78,
                 "instruction": "Score 0..1 whether the response satisfies the Medium quality contract; accept at or above 0.78."
-              }
+              },
+              "grounded": false
             }
           ]
         },
