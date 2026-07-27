@@ -23,7 +23,7 @@ use cybersin_adapter::channel::DaemonChannel;
 use cybersin_adapter::transport::grpc;
 use cybersin_adapter::transport::stdio::StdioDaemonChannel;
 use cybersin_runtime::{
-    stub_agent, DaemonHandle, DistFixture, ModelAllowlist, OpenRouterModelCaller,
+    stub_agent, DaemonHandle, DistFixture, LocalConfigFile, ModelAllowlist, OpenRouterModelCaller,
     RuntimeSessionSummary,
 };
 use tokio::process::{Child, Command};
@@ -169,18 +169,27 @@ async fn run_live(
     println!("cybersind: auto-starting (state: {})", db_path.display());
     let daemon = DaemonHandle::auto_start(&db_path).await?;
 
-    let model_caller =
-        OpenRouterModelCaller::from_env(dist.clone()).context("configuring live model calling")?;
     let project_dir: &Path = dist_dir.parent().unwrap_or_else(|| Path::new("."));
-    let allowlist = ModelAllowlist::load(project_dir).with_context(|| {
+    let local_config = LocalConfigFile::load_optional(project_dir).with_context(|| {
         format!(
             "reading {}",
             project_dir.join("cybersin.local.yaml").display()
         )
     })?;
+    let model_caller = openrouter_from_local_config(dist.clone(), local_config.as_ref())
+        .context("configuring live model calling")?;
+    let allowlist = local_config
+        .as_ref()
+        .map(LocalConfigFile::model_allowlist)
+        .unwrap_or_else(ModelAllowlist::allow_all);
 
-    let executor = tool_executor::configured_executor(&dist_dir, &sandbox_root, sandbox_backend)
-        .context("configuring live tool execution")?;
+    let executor = tool_executor::configured_executor_with_local_config(
+        &dist_dir,
+        &sandbox_root,
+        sandbox_backend,
+        local_config.as_ref(),
+    )
+    .context("configuring live tool execution")?;
     let tool_caller = GatewayToolCaller::new(executor, daemon.storage(), dist.clone());
 
     let session_id = args
@@ -276,6 +285,26 @@ async fn run_live(
     };
 
     Ok(summary)
+}
+
+fn openrouter_from_local_config(
+    dist: Arc<DistFixture>,
+    config: Option<&LocalConfigFile>,
+) -> Result<OpenRouterModelCaller, cybersin_runtime::MissingApiKey> {
+    let provider = config.and_then(|config| config.provider("openrouter"));
+    let api_key = provider
+        .and_then(|provider| provider.api_key.as_ref())
+        .and_then(|reference| reference.read());
+    let caller = match api_key {
+        Some(api_key) => OpenRouterModelCaller::new(dist, api_key),
+        None => OpenRouterModelCaller::from_env(dist)?,
+    };
+    Ok(
+        match provider.and_then(|provider| provider.base_url.as_ref()) {
+            Some(base_url) => caller.with_base_url(base_url.clone()),
+            None => caller,
+        },
+    )
 }
 
 /// Spawns `harness.command` and returns its process handle plus a

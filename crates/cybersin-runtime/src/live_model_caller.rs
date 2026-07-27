@@ -93,11 +93,12 @@ impl OpenRouterModelCaller {
     /// Read `OPENROUTER_API_KEY` from the environment.
     pub fn from_env(dist: Arc<DistFixture>) -> Result<Self, MissingApiKey> {
         let api_key = std::env::var("OPENROUTER_API_KEY").map_err(|_| MissingApiKey)?;
-        Ok(Self::new(dist, api_key))
+        let base_url =
+            std::env::var("OPENROUTER_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        Ok(Self::new(dist, api_key).with_base_url(base_url))
     }
 
-    #[cfg(test)]
-    fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }

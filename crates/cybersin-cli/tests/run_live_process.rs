@@ -51,6 +51,53 @@ tools: []
         .stderr(predicate::str::contains("code 3"));
 }
 
+#[test]
+fn project_dotenv_is_loaded_before_openrouter_readiness_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("cybersin.db");
+    std::fs::write(dir.path().join("cybersin.yaml"), "name: dotenv-test\n").unwrap();
+    std::fs::write(
+        dir.path().join(".env"),
+        "OPENROUTER_API_KEY=test-key-from-dotenv\n",
+    )
+    .unwrap();
+    let agent_yaml = dir.path().join("crash.agent.yaml");
+    std::fs::write(
+        &agent_yaml,
+        r#"
+name: crash-agent
+harness:
+  adapter: process
+  command: ["sh", "-c", "exit 3"]
+budget:
+  usd_per_session: 1.00
+  on_breach: degrade
+tools: []
+"#,
+    )
+    .unwrap();
+
+    let dist_dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/ic1-research-team/dist"
+    );
+
+    cybersin()
+        .current_dir(dir.path())
+        .env_remove("OPENROUTER_API_KEY")
+        .arg("--db")
+        .arg(&db)
+        .arg("--dist")
+        .arg(dist_dir)
+        .arg("run")
+        .arg(&agent_yaml)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("exited unexpectedly"))
+        .stderr(predicate::str::contains("code 3"))
+        .stderr(predicate::str::contains("OPENROUTER_API_KEY is not set").not());
+}
+
 /// Regression test: a harness that finishes every step and sends
 /// `session.complete` before exiting must be reported as a completed
 /// session, not a crash, even if the OS happens to reap the harness

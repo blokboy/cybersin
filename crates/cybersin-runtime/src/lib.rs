@@ -38,7 +38,10 @@ pub mod stub_agent;
 pub mod supervisor;
 pub mod tool_caller;
 
-pub use allowlist::{AllowlistError, ModelAllowlist};
+pub use allowlist::{
+    AllowlistError, Availability, DefaultsConfig, EnvRef, LocalConfigFile, ModelAllowlist,
+    PermissionsConfig, ProviderConfig, RoutingConfig, SandboxConfig, ToolConfig, ToolPermissions,
+};
 pub use budget::{BudgetConfig, OnBreach};
 pub use daemon::{serve_server, DaemonHandle, ServerConfig};
 pub use dist::{
