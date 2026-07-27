@@ -213,6 +213,7 @@ async fn setup_golden_path_runs_end_to_end_without_extra_project_files() {
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
         .and(header("authorization", "Bearer test-key"))
+        .and(body_partial_json(json!({"model": "openai/gpt-4o-mini"})))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "choices": [{
                 "message": {
@@ -314,7 +315,7 @@ async fn setup_golden_path_runs_end_to_end_without_extra_project_files() {
         .assert()
         .success()
         .stdout(predicate::str::contains("llm_call"))
-        .stdout(predicate::str::contains("stub-medium"));
+        .stdout(predicate::str::contains("openai/gpt-4o-mini"));
 
     cybersin()
         .current_dir(&project)

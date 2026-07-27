@@ -225,7 +225,7 @@ impl ModelCaller for OpenRouterModelCaller {
         }
 
         let mut body = json!({
-            "model": format!("{}/{}", model.provider, model.name),
+            "model": openrouter_model_id(model),
             "messages": messages,
             "response_format": response_format,
         });
@@ -323,6 +323,14 @@ impl ModelCaller for OpenRouterModelCaller {
             response: parsed,
             confidence,
         })
+    }
+}
+
+fn openrouter_model_id(model: &RouteModel) -> String {
+    if model.provider == "openrouter" && model.name.contains('/') {
+        model.name.clone()
+    } else {
+        format!("{}/{}", model.provider, model.name)
     }
 }
 
@@ -469,6 +477,40 @@ mod tests {
                 &model(),
                 "researcher",
                 &json!({"topic": "evidence quality"}),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sends_openrouter_default_model_id_without_double_prefixing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({"model": "openai/gpt-4o-mini"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": "{\"summary\": \"ok\", \"__cascade_confidence\": 0.9}"}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let caller = OpenRouterModelCaller::new(dist_with_prompt(researcher_prompt()), "test-key")
+            .with_base_url(server.uri());
+        let model = RouteModel {
+            name: "openai/gpt-4o-mini".into(),
+            provider: "openrouter".into(),
+            quality: QualityTier::Medium,
+            estimated_cost_usd: 0.01,
+            model_kind: ModelKind::Provider,
+        };
+
+        caller
+            .call(
+                &model,
+                "researcher",
+                &json!({"topic": "starter routing"}),
                 None,
                 false,
             )
