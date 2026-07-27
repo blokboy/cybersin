@@ -23,6 +23,15 @@ pub(crate) struct RawSource {
     pub inputs: BTreeMap<String, String>,
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Quality tier(s) this prompt wants its compiled cascade step grounded
+    /// in OpenRouter's web-search plugin (spec issue #80/#81/#82). Absent
+    /// (the default) means no grounding — fully backward compatible with
+    /// sources written before this field existed. Each entry uses the same
+    /// grammar as `quality:` (`low`/`medium`/`high`) and must name a tier
+    /// that is actually part of this prompt's own cascade, i.e. no higher
+    /// than `quality:` itself.
+    #[serde(default)]
+    pub grounded_tiers: Vec<String>,
     pub sections: Vec<RawSection>,
     #[serde(default)]
     pub output_contract: Option<RawOutputContract>,

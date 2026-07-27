@@ -2,8 +2,11 @@
 //!
 //! Deliberately simple, per the issue's scope: round-trip the source
 //! through a struct with a fixed field order (`name`, `quality`, `inputs`,
-//! `tools`, `sections`, `output_contract`) and deterministically sorted
-//! `inputs` keys, then re-serialize with `serde_yaml`. This normalizes key
+//! `tools`, `grounded_tiers`, `sections`, `output_contract`) and
+//! deterministically sorted `inputs` keys, then re-serialize with
+//! `serde_yaml`. `grounded_tiers` is omitted entirely when empty so
+//! sources written before it existed stay byte-for-byte unchanged
+//! (`cybersin fmt --check` idempotency). This normalizes key
 //! ordering and indentation without touching `!include` tags — formatting
 //! must not bake fragment contents into the source, so this module parses
 //! the raw YAML document directly and does **not** go through
@@ -26,6 +29,8 @@ struct FmtSource {
     inputs: BTreeMap<String, String>,
     #[serde(default)]
     tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    grounded_tiers: Vec<String>,
     sections: Vec<FmtSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_contract: Option<FmtOutputContract>,
@@ -122,6 +127,53 @@ sections:
             out.contains("!include fragments/research-method.md"),
             "expected include tag preserved verbatim, got:\n{out}"
         );
+    }
+
+    #[test]
+    fn preserves_grounded_tiers_and_keeps_canonical_order() {
+        let input = r#"
+name: researcher
+quality: high
+inputs:
+  topic: string
+tools: [web_search]
+grounded_tiers: [medium, high]
+sections:
+  - id: role
+    priority: 100
+    body: Hello {{ topic }}
+"#;
+        let out = format_prompt_source_str(input, Path::new("test.prompt.yaml")).unwrap();
+        assert!(out.contains("grounded_tiers"));
+        let tools_pos = out.find("tools:").unwrap();
+        let grounded_pos = out.find("grounded_tiers:").unwrap();
+        let sections_pos = out.find("sections:").unwrap();
+        assert!(
+            tools_pos < grounded_pos,
+            "grounded_tiers should follow tools"
+        );
+        assert!(
+            grounded_pos < sections_pos,
+            "grounded_tiers should precede sections"
+        );
+    }
+
+    #[test]
+    fn omits_grounded_tiers_when_absent_keeping_fmt_check_idempotent() {
+        let input = r#"
+name: researcher
+quality: high
+inputs:
+  topic: string
+sections:
+  - id: role
+    priority: 100
+    body: Hello {{ topic }}
+"#;
+        let once = format_prompt_source_str(input, Path::new("test.prompt.yaml")).unwrap();
+        assert!(!once.contains("grounded_tiers"));
+        let twice = format_prompt_source_str(&once, Path::new("test.prompt.yaml")).unwrap();
+        assert_eq!(once, twice);
     }
 
     #[test]
