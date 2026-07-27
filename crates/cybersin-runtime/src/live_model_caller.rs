@@ -190,6 +190,7 @@ impl ModelCaller for OpenRouterModelCaller {
         prompt_name: &str,
         inputs: &Value,
         confidence_instruction: Option<&str>,
+        grounded: bool,
     ) -> Result<ModelOutput, String> {
         let prompt = self
             .dist
@@ -228,6 +229,16 @@ impl ModelCaller for OpenRouterModelCaller {
             "messages": messages,
             "response_format": response_format,
         });
+        if grounded {
+            // OpenRouter's web-search grounding plugin (spec issue #80),
+            // requested via a `plugins` body field rather than appending
+            // `:online` to the model-identity string — that string
+            // (`model.name`/`model.provider`) is used elsewhere as a
+            // lookup key (e.g. allowlist matching, span `model`
+            // attribution) and must stay exactly what the compiled
+            // routing artifact declared.
+            body["plugins"] = json!([{"id": "web"}]);
+        }
         if !rendered.tools.is_empty() {
             body["tools"] = Value::Array(rendered.tools.clone());
             // This call is one-shot: it sends a request and returns
@@ -405,6 +416,7 @@ mod tests {
                 "researcher",
                 &json!({"topic": "evidence quality"}),
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -458,6 +470,7 @@ mod tests {
                 "researcher",
                 &json!({"topic": "evidence quality"}),
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -478,7 +491,7 @@ mod tests {
             .with_base_url(server.uri());
 
         let error = caller
-            .call(&model(), "researcher", &json!({"topic": "x"}), None)
+            .call(&model(), "researcher", &json!({"topic": "x"}), None, false)
             .await
             .unwrap_err();
         assert!(error.contains("did not self-report a confidence field"));
@@ -540,6 +553,7 @@ your JSON response using this rubric: Score 0..1 whether the response satisfies 
                     "Score 0..1 whether the response satisfies the High quality contract; \
 accept at or above 0.90.",
                 ),
+                false,
             )
             .await
             .unwrap();
@@ -616,6 +630,7 @@ accept at or above 0.90.",
                 "researcher",
                 &json!({"topic": "evidence quality"}),
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -690,10 +705,88 @@ accept at or above 0.90.",
                 "researcher",
                 &json!({"topic": "evidence quality"}),
                 None,
+                false,
             )
             .await
             .unwrap();
 
         assert_eq!(output.confidence, 0.95);
+    }
+
+    #[tokio::test]
+    async fn a_grounded_call_adds_the_web_search_plugin_field() {
+        // Issue #83: grounding is requested via a `plugins` body field, not
+        // a `:online` suffix on the model-identity string -- that string is
+        // used elsewhere as a lookup key and must stay untouched.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(json!({
+                "model": "anthropic/claude-3-5-sonnet",
+                "plugins": [{"id": "web"}],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {
+                    "content": "{\"summary\": \"done\", \"__cascade_confidence\": 0.9}"
+                }}]
+            })))
+            .mount(&server)
+            .await;
+
+        let caller = OpenRouterModelCaller::new(dist_with_prompt(researcher_prompt()), "test-key")
+            .with_base_url(server.uri());
+
+        let output = caller
+            .call(
+                &model(),
+                "researcher",
+                &json!({"topic": "evidence quality"}),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.confidence, 0.9);
+    }
+
+    #[tokio::test]
+    async fn an_ungrounded_call_omits_the_web_search_plugin_field() {
+        // A custom matcher (rather than `body_json`/`body_partial_json`,
+        // which only assert presence/equality of keys) is the
+        // straightforward way to assert a key's *absence* from the
+        // outgoing body.
+        let no_plugins_field = |request: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+            body.get("plugins").is_none()
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(no_plugins_field)
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {
+                    "content": "{\"summary\": \"done\", \"__cascade_confidence\": 0.9}"
+                }}]
+            })))
+            .mount(&server)
+            .await;
+
+        let caller = OpenRouterModelCaller::new(dist_with_prompt(researcher_prompt()), "test-key")
+            .with_base_url(server.uri());
+
+        let output = caller
+            .call(
+                &model(),
+                "researcher",
+                &json!({"topic": "evidence quality"}),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.confidence, 0.9);
     }
 }

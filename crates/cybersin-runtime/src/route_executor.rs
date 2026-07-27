@@ -165,12 +165,22 @@ pub trait ModelCaller: Send + Sync {
     /// with no such rubric (`RouteDecision::Fallbacks`, which accepts
     /// unconditionally and never compares confidence against a
     /// threshold at all).
+    ///
+    /// `grounded`: the cascade step's own `CascadeStep::grounded` (spec
+    /// issue #80/#83) for a real implementation to request OpenRouter's
+    /// web-search grounding plugin on this specific call. Plain `bool`,
+    /// not `Option`, because it is unconditionally either true or false —
+    /// unlike `confidence_instruction`, there's no "no such concept"
+    /// case: fallback-tier calls always pass `false`, since
+    /// `RouteModel`/`FallbackDecision::providers` structurally has no
+    /// grounding marker at all.
     async fn call(
         &self,
         model: &RouteModel,
         prompt_name: &str,
         inputs: &Value,
         confidence_instruction: Option<&str>,
+        grounded: bool,
     ) -> Result<ModelOutput, String>;
 }
 
@@ -360,6 +370,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                 &request.prompt_name,
                                 &request.inputs,
                                 Some(&step.confidence.instruction),
+                                step.grounded,
                             )
                             .await;
                         let force_accept = request.force_cheapest_cascade_step;
@@ -379,6 +390,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                         "model": step.model.name,
                                         "confidence": output.confidence,
                                         "minimum_confidence": step.confidence.minimum_score,
+                                        "grounded": step.grounded,
                                     }),
                                 )
                                 .await?;
@@ -401,6 +413,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                         "model": step.model.name,
                                         "confidence": output.confidence,
                                         "minimum_confidence": step.confidence.minimum_score,
+                                        "grounded": step.grounded,
                                     }),
                                 )
                                 .await?;
@@ -416,6 +429,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                         "decision": "cascade_error",
                                         "model": step.model.name,
                                         "error": error,
+                                        "grounded": step.grounded,
                                     }),
                                 )
                                 .await?;
@@ -430,7 +444,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                         }
                         match self
                             .models
-                            .call(model, &request.prompt_name, &request.inputs, None)
+                            .call(model, &request.prompt_name, &request.inputs, None, false)
                             .await
                         {
                             Ok(output) => {
@@ -444,6 +458,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                         "decision": "fallback_accept",
                                         "model": model.name,
                                         "confidence": output.confidence,
+                                        "grounded": false,
                                     }),
                                 )
                                 .await?;
@@ -465,6 +480,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                         "decision": "fallback_error",
                                         "model": model.name,
                                         "error": error,
+                                        "grounded": false,
                                     }),
                                 )
                                 .await?;
@@ -776,6 +792,7 @@ mod tests {
             _prompt_name: &str,
             _inputs: &Value,
             _confidence_instruction: Option<&str>,
+            _grounded: bool,
         ) -> Result<ModelOutput, String> {
             self.0.lock().unwrap().push(model.name.clone());
             Ok(ModelOutput {
@@ -830,8 +847,65 @@ mod tests {
             _prompt_name: &str,
             _inputs: &Value,
             _confidence_instruction: Option<&str>,
+            _grounded: bool,
         ) -> Result<ModelOutput, String> {
             self.0.lock().unwrap().push(model.name.clone());
+            if model.name == "backup" {
+                Ok(ModelOutput {
+                    response: serde_json::json!("fallback"),
+                    confidence: 0.1,
+                })
+            } else {
+                Err("unavailable".into())
+            }
+        }
+    }
+
+    /// Captures `(model_name, grounded)` per invocation — used to assert
+    /// which calls the executor actually requested grounding on (issue
+    /// #83), independent of `Calls`/`FallbackCalls`'s plain name log.
+    /// Mirrors `Calls`'s accept/escalate confidences (`cheap` under
+    /// threshold, everything else over).
+    #[derive(Default)]
+    struct GroundingCapturingCalls(Mutex<Vec<(String, bool)>>);
+
+    #[async_trait]
+    impl ModelCaller for GroundingCapturingCalls {
+        async fn call(
+            &self,
+            model: &RouteModel,
+            _prompt_name: &str,
+            _inputs: &Value,
+            _confidence_instruction: Option<&str>,
+            grounded: bool,
+        ) -> Result<ModelOutput, String> {
+            self.0.lock().unwrap().push((model.name.clone(), grounded));
+            Ok(ModelOutput {
+                response: serde_json::json!({"from": model.name}),
+                confidence: if model.name == "cheap" { 0.4 } else { 0.95 },
+            })
+        }
+    }
+
+    /// Same `(model_name, grounded)` capture as `GroundingCapturingCalls`,
+    /// but fails every candidate except `"backup"` — mirrors
+    /// `FallbackCalls`'s exhaust-the-cascade-then-fallback shape, so a
+    /// grounded cascade step can be made to fail and fall through to the
+    /// fallback tier while still recording what it was called with.
+    #[derive(Default)]
+    struct GroundingCapturingFallbackCalls(Mutex<Vec<(String, bool)>>);
+
+    #[async_trait]
+    impl ModelCaller for GroundingCapturingFallbackCalls {
+        async fn call(
+            &self,
+            model: &RouteModel,
+            _prompt_name: &str,
+            _inputs: &Value,
+            _confidence_instruction: Option<&str>,
+            grounded: bool,
+        ) -> Result<ModelOutput, String> {
+            self.0.lock().unwrap().push((model.name.clone(), grounded));
             if model.name == "backup" {
                 Ok(ModelOutput {
                     response: serde_json::json!("fallback"),
@@ -1084,6 +1158,120 @@ mod tests {
         assert!(recorded
             .iter()
             .any(|span| span.attributes["decision"] == "fallback_accept"));
+    }
+
+    #[tokio::test]
+    async fn a_grounded_cascade_step_is_called_with_grounded_true_and_tags_its_span() {
+        // Issue #83: the executor reads `CascadeStep::grounded` (issue #81)
+        // and threads it through both to the model caller and onto the
+        // recorded span's attributes.
+        let mut artifact = routing();
+        let route = artifact.prompts.get_mut("answer").unwrap();
+        let RouteDecision::Cascade(cascade) = &mut route.decisions[1] else {
+            panic!("expected a cascade decision");
+        };
+        cascade.steps[0].grounded = true; // "cheap" -- under threshold, escalates
+        cascade.steps[1].grounded = false; // "strong" -- accepted
+
+        let mut req = request();
+        req.bypass = true;
+        let spans = SpanStore::in_memory().await.unwrap();
+        let executor = RouteExecutor::new(
+            artifact,
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "v1".into(),
+                entries: vec![],
+            },
+            GroundingCapturingCalls::default(),
+            AcceptJudge,
+            spans.clone(),
+        );
+
+        let response = executor.execute(&req).await.unwrap();
+
+        assert_eq!(response.model.as_deref(), Some("strong"));
+        assert_eq!(
+            *executor.models.0.lock().unwrap(),
+            vec![("cheap".to_string(), true), ("strong".to_string(), false)]
+        );
+
+        let recorded = spans.list(&SpanFilter::default()).await.unwrap();
+        let escalation = recorded
+            .iter()
+            .find(|span| span.attributes["decision"] == "cascade_escalation")
+            .expect("cascade_escalation span");
+        assert_eq!(escalation.attributes["model"], "cheap");
+        assert_eq!(escalation.attributes["grounded"], true);
+
+        let accept = recorded
+            .iter()
+            .find(|span| span.attributes["decision"] == "cascade_accept")
+            .expect("cascade_accept span");
+        assert_eq!(accept.attributes["model"], "strong");
+        assert_eq!(accept.attributes["grounded"], false);
+    }
+
+    #[tokio::test]
+    async fn fallback_calls_are_never_grounded_even_after_a_grounded_cascade_step_fails() {
+        // Issue #83 acceptance criterion: fallback-tier calls must never
+        // carry the grounding marker, regardless of which cascade step
+        // failed first -- confirmed with a real test rather than just
+        // relying on `RouteModel` having no `grounded` field to set.
+        let mut artifact = routing();
+        let route = artifact.prompts.get_mut("answer").unwrap();
+        let RouteDecision::Cascade(cascade) = &mut route.decisions[1] else {
+            panic!("expected a cascade decision");
+        };
+        cascade.steps[0].grounded = true; // "cheap" -- grounded, and fails
+        route.decisions[2] = RouteDecision::Fallbacks(FallbackDecision {
+            providers: vec![model("backup", ModelKind::Provider)],
+        });
+
+        let mut req = request();
+        req.bypass = true;
+        let spans = SpanStore::in_memory().await.unwrap();
+        let executor = RouteExecutor::new(
+            artifact,
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "v1".into(),
+                entries: vec![],
+            },
+            GroundingCapturingFallbackCalls::default(),
+            AcceptJudge,
+            spans.clone(),
+        );
+
+        let response = executor.execute(&req).await.unwrap();
+
+        assert_eq!(response.response, "fallback");
+        assert_eq!(response.model.as_deref(), Some("backup"));
+        assert_eq!(
+            *executor.models.0.lock().unwrap(),
+            vec![
+                ("cheap".to_string(), true),
+                ("strong".to_string(), false),
+                ("backup".to_string(), false),
+            ]
+        );
+
+        let recorded = spans.list(&SpanFilter::default()).await.unwrap();
+        let fallback_accept = recorded
+            .iter()
+            .find(|span| span.attributes["decision"] == "fallback_accept")
+            .expect("fallback_accept span");
+        assert_eq!(fallback_accept.attributes["model"], "backup");
+        assert_eq!(fallback_accept.attributes["grounded"], false);
+
+        let cascade_error = recorded
+            .iter()
+            .find(|span| {
+                span.attributes["decision"] == "cascade_error"
+                    && span.attributes["model"] == "cheap"
+            })
+            .expect("cascade_error span for the grounded, failing step");
+        assert_eq!(cascade_error.attributes["grounded"], true);
     }
 
     #[tokio::test]

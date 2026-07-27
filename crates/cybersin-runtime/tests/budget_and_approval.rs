@@ -579,6 +579,7 @@ impl ModelCaller for AlwaysFailsModelCaller {
         _prompt_name: &str,
         _inputs: &Value,
         _confidence_instruction: Option<&str>,
+        _grounded: bool,
     ) -> Result<ModelOutput, String> {
         Err(format!("simulated provider outage for {}", model.name))
     }

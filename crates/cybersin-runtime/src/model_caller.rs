@@ -47,6 +47,7 @@ impl ModelCaller for StubModelCaller {
         prompt_name: &str,
         _inputs: &Value,
         _confidence_instruction: Option<&str>,
+        _grounded: bool,
     ) -> Result<ModelOutput, String> {
         Ok(ModelOutput {
             response: serde_json::json!({
@@ -93,9 +94,10 @@ impl ModelCaller for Box<dyn ModelCaller> {
         prompt_name: &str,
         inputs: &Value,
         confidence_instruction: Option<&str>,
+        grounded: bool,
     ) -> Result<ModelOutput, String> {
         (**self)
-            .call(model, prompt_name, inputs, confidence_instruction)
+            .call(model, prompt_name, inputs, confidence_instruction, grounded)
             .await
     }
 }
