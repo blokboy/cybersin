@@ -8,8 +8,34 @@ fn cybersin() -> Command {
     Command::cargo_bin("cybersin").expect("find cybersin binary")
 }
 
+fn write_hello_sources(project: &std::path::Path) {
+    fs::write(
+        project.join("fragments/tone.md"),
+        "You are a friendly, concise assistant.\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("prompts/hello.prompt.yaml"),
+        r#"name: hello
+quality: medium
+inputs:
+  name: string
+sections:
+  - id: role
+    priority: 100
+    body: !include ../fragments/tone.md
+  - id: instructions
+    priority: 90
+    body: |
+      Greet {{ name }} warmly and briefly.
+"#,
+    )
+    .unwrap();
+}
+
 fn scaffold_and_build(project: &std::path::Path) {
     cybersin().arg("init").arg(project).assert().success();
+    write_hello_sources(project);
     let config_path = project.join("cybersin.yaml");
     let config = fs::read_to_string(&config_path).unwrap();
     fs::write(
@@ -113,6 +139,7 @@ fn explain_plain_reports_compiled_tool_execution_policy() {
     let project = temp.path().join("project");
     let db = temp.path().join("control-room.db");
     cybersin().arg("init").arg(&project).assert().success();
+    write_hello_sources(&project);
 
     let prompt_path = project.join("prompts/hello.prompt.yaml");
     let prompt = fs::read_to_string(&prompt_path).unwrap();

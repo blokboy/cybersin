@@ -1,8 +1,7 @@
-//! `cybersin init <dir>` (spec §11, §5): scaffolds a project layout —
-//! `cybersin.yaml`, `cybersin.lock`, `prompts/`, `fragments/`, `evals/`,
-//! `agents/`, `dist/` — minimal but real: the scaffolded
-//! `prompts/hello.prompt.yaml` is a working source with an `!include`d
-//! fragment, so `cybersin check <dir>` passes against it immediately.
+//! `cybersin init <dir>` (spec §11, §5): safely creates the basic project
+//! spine: core config, lockfile, local-config example, ignore rules, and
+//! empty source directories. Plain init deliberately avoids starter
+//! prompt/eval/agent/harness/sample-input files and build output.
 
 use std::fs;
 use std::path::Path;
@@ -27,11 +26,9 @@ sandbox:
 "#;
 
 const CYBERSIN_LOCK: &str = r#"# Pinned models, prices, embedding model, and model-assisted pass
-# outputs (spec §7). `stub-medium` is priced so `cybersin build` has a
-# model to route the scaffolded `hello` prompt (quality: medium) to
-# out of the box; replace it with real pins before shipping. `passes`
-# stays empty until a release build runs a model-assisted pass or
-# `cybersin lock update` pins one.
+# outputs (spec §7). Replace these stub pins with real model pins before
+# shipping. `passes` stays empty until a release build runs a
+# model-assisted pass or `cybersin lock update` pins one.
 models:
   stub-medium:
     provider: stub
@@ -43,66 +40,108 @@ prices:
 passes: {}
 "#;
 
-const HELLO_PROMPT: &str = r#"name: hello
-quality: medium
-inputs:
-  name: string
-sections:
-  - id: role
-    priority: 100
-    body: !include ../fragments/tone.md
-  - id: instructions
-    priority: 90
-    body: |
-      Greet {{ name }} warmly and briefly.
+const CYBERSIN_LOCAL_EXAMPLE: &str = r#"# Copy to cybersin.local.yaml for machine-local runtime settings.
+# This file is safe to commit; cybersin.local.yaml is ignored.
+runtime: {}
 "#;
 
-const TONE_FRAGMENT: &str = "You are a friendly, concise assistant.\n";
-
-const HELLO_EVAL: &str = r#"# Eval source (spec §5.2). Eval compilation is a later issue; this file
-# is scaffolding only.
-prompt: hello
-cases:
-  - name: basic_greeting
-    inputs: { name: "Ada" }
-    assertions:
-      - type: contains_none
-        values: ["error", "sorry"]
-runs_per_case: 1
+const GITIGNORE: &str = r#"/.cybersin/
+/cybersin.local.yaml
+/dist/
 "#;
 
-const HELLO_AGENT: &str = r#"# Agent runtime config (spec §5.3). Runtime consumption is a later
-# issue; this file is scaffolding only.
-name: hello-agent
-harness: { adapter: process, command: ["python", "loop.py"] }
-budget: { usd_per_session: 1.00, on_breach: degrade }
-tools: []
-"#;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InitOptions {
+    pub force: bool,
+    pub dry_run: bool,
+}
 
-pub fn run(dir: &Path) -> Result<Option<String>, String> {
-    let write = |rel: &str, contents: &str| -> Result<(), String> {
-        let path = dir.join(rel);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("error: failed to create {}: {e}", parent.display()))?;
+enum ScaffoldEntry {
+    File(&'static str, &'static str),
+    Dir(&'static str),
+}
+
+impl ScaffoldEntry {
+    fn rel(&self) -> &'static str {
+        match self {
+            ScaffoldEntry::File(rel, _) | ScaffoldEntry::Dir(rel) => rel,
         }
-        fs::write(&path, contents)
-            .map_err(|e| format!("error: failed to write {}: {e}", path.display()))
+    }
+}
+
+const SCAFFOLD: &[ScaffoldEntry] = &[
+    ScaffoldEntry::File("cybersin.yaml", CYBERSIN_YAML),
+    ScaffoldEntry::File("cybersin.lock", CYBERSIN_LOCK),
+    ScaffoldEntry::File("cybersin.local.example.yaml", CYBERSIN_LOCAL_EXAMPLE),
+    ScaffoldEntry::File(".gitignore", GITIGNORE),
+    ScaffoldEntry::Dir("prompts"),
+    ScaffoldEntry::Dir("fragments"),
+    ScaffoldEntry::Dir("evals"),
+    ScaffoldEntry::Dir("agents"),
+    ScaffoldEntry::Dir("tools"),
+];
+
+#[cfg(test)]
+pub fn run(dir: &Path) -> Result<Option<String>, String> {
+    run_with_options(dir, InitOptions::default())
+}
+
+pub fn run_with_options(dir: &Path, options: InitOptions) -> Result<Option<String>, String> {
+    let mut created = Vec::new();
+    let mut skipped = Vec::new();
+
+    for entry in SCAFFOLD {
+        let rel = entry.rel();
+        let path = dir.join(rel);
+        let exists = path.exists();
+        if exists && !options.force {
+            skipped.push(rel);
+            continue;
+        }
+
+        created.push(rel);
+        if options.dry_run {
+            continue;
+        }
+
+        match entry {
+            ScaffoldEntry::File(_, contents) => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|e| {
+                        format!("error: failed to create {}: {e}", parent.display())
+                    })?;
+                }
+                fs::write(&path, contents)
+                    .map_err(|e| format!("error: failed to write {}: {e}", path.display()))?;
+            }
+            ScaffoldEntry::Dir(_) => {
+                fs::create_dir_all(&path)
+                    .map_err(|e| format!("error: failed to create {}: {e}", path.display()))?;
+            }
+        }
+    }
+
+    let verb = if options.dry_run {
+        "would scaffold"
+    } else {
+        "scaffolded"
     };
-
-    write("cybersin.yaml", CYBERSIN_YAML)?;
-    write("cybersin.lock", CYBERSIN_LOCK)?;
-    write("prompts/hello.prompt.yaml", HELLO_PROMPT)?;
-    write("fragments/tone.md", TONE_FRAGMENT)?;
-    write("evals/hello.eval.yaml", HELLO_EVAL)?;
-    write("agents/hello.agent.yaml", HELLO_AGENT)?;
-
-    let dist = dir.join("dist");
-    fs::create_dir_all(&dist)
-        .map_err(|e| format!("error: failed to create {}: {e}", dist.display()))?;
-
-    Ok(Some(format!(
-        "scaffolded a new cybersin project at {}",
-        dir.display()
-    )))
+    let mut message = format!("{verb} cybersin project spine at {}", dir.display());
+    message.push_str("\ncreated:");
+    if created.is_empty() {
+        message.push_str(" none");
+    } else {
+        for rel in created {
+            message.push_str(&format!("\n  {rel}"));
+        }
+    }
+    message.push_str("\nskipped:");
+    if skipped.is_empty() {
+        message.push_str(" none");
+    } else {
+        for rel in skipped {
+            message.push_str(&format!("\n  {rel}"));
+        }
+    }
+    Ok(Some(message))
 }

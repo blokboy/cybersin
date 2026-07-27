@@ -21,6 +21,40 @@ fn cybersin() -> Command {
     Command::cargo_bin("cybersin").expect("find cybersin binary")
 }
 
+fn write_hello_project_sources(project: &std::path::Path) {
+    std::fs::write(
+        project.join("fragments/tone.md"),
+        "You are a friendly, concise assistant.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("prompts/hello.prompt.yaml"),
+        r#"name: hello
+quality: medium
+inputs:
+  name: string
+sections:
+  - id: role
+    priority: 100
+    body: !include ../fragments/tone.md
+  - id: instructions
+    priority: 90
+    body: |
+      Greet {{ name }} warmly and briefly.
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("agents/hello.agent.yaml"),
+        r#"name: hello-agent
+harness: { adapter: process, command: ["python", "loop.py"] }
+budget: { usd_per_session: 1.00, on_breach: degrade }
+tools: []
+"#,
+    )
+    .unwrap();
+}
+
 #[test]
 fn ops_plain_resolves_db_against_the_discovered_project_root_from_a_nested_subdir() {
     let tmp = tempfile::tempdir().unwrap();
@@ -97,6 +131,7 @@ fn ops_plain_lists_runnable_builds_by_agent_name() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("myagent");
     cybersin().arg("init").arg(&project).assert().success();
+    write_hello_project_sources(&project);
     cybersin()
         .arg("build")
         .arg(&project)
@@ -127,6 +162,7 @@ fn ops_plain_lists_runnable_builds_from_nested_agent_dirs() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("myagent");
     cybersin().arg("init").arg(&project).assert().success();
+    write_hello_project_sources(&project);
 
     let nested_agents = project.join("agents/fleet");
     std::fs::create_dir_all(&nested_agents).unwrap();

@@ -9,10 +9,36 @@ fn cybersin() -> Command {
     Command::cargo_bin("cybersin").expect("find cybersin binary")
 }
 
+fn write_hello_prompt(project: &std::path::Path) {
+    fs::write(
+        project.join("fragments/tone.md"),
+        "You are a friendly, concise assistant.\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("prompts/hello.prompt.yaml"),
+        r#"name: hello
+quality: medium
+inputs:
+  name: string
+sections:
+  - id: role
+    priority: 100
+    body: !include ../fragments/tone.md
+  - id: instructions
+    priority: 90
+    body: |
+      Greet {{ name }} warmly and briefly.
+"#,
+    )
+    .unwrap();
+}
+
 fn project() -> (tempfile::TempDir, std::path::PathBuf) {
     let temp = tempfile::tempdir().unwrap();
     let project = temp.path().join("project");
     cybersin().arg("init").arg(&project).assert().success();
+    write_hello_prompt(&project);
     cybersin()
         .args(["build", "--profile", "dev", "--frozen"])
         .arg(&project)

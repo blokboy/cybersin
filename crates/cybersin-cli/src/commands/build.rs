@@ -899,6 +899,37 @@ mod tests {
 
     fn init_project(dir: &Path) {
         crate::commands::init::run(dir).expect("init");
+        fs::write(
+            dir.join("fragments/tone.md"),
+            "You are a friendly, concise assistant.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("prompts/hello.prompt.yaml"),
+            r#"name: hello
+quality: medium
+inputs:
+  name: string
+sections:
+  - id: role
+    priority: 100
+    body: !include ../fragments/tone.md
+  - id: instructions
+    priority: 90
+    body: |
+      Greet {{ name }} warmly and briefly.
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("agents/hello.agent.yaml"),
+            r#"name: hello-agent
+harness: { adapter: process, command: ["python", "loop.py"] }
+budget: { usd_per_session: 1.00, on_breach: degrade }
+tools: []
+"#,
+        )
+        .unwrap();
     }
 
     #[test]

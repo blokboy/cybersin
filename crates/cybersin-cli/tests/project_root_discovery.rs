@@ -15,6 +15,14 @@ fn cybersin() -> Command {
     Command::cargo_bin("cybersin").expect("find cybersin binary")
 }
 
+fn write_hello_prompt(project: &std::path::Path) {
+    std::fs::write(
+        project.join("prompts/hello.prompt.yaml"),
+        "name: hello\nquality: medium\nsections:\n- id: prompt\n  priority: 100\n  body: Hello.\n",
+    )
+    .unwrap();
+}
+
 #[test]
 fn db_resolves_against_the_discovered_project_root_from_a_nested_subdir() {
     let tmp = tempfile::tempdir().unwrap();
@@ -72,9 +80,6 @@ fn omitting_dist_when_root_dist_does_not_exist_produces_a_clear_error() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("myagent");
     cybersin().arg("init").arg(&project).assert().success();
-    // `init` scaffolds an empty `dist/` (unrelated to issue #50); remove it
-    // so this test exercises the genuinely-not-built case the issue names.
-    std::fs::remove_dir_all(project.join("dist")).unwrap();
 
     cybersin()
         .current_dir(&project)
@@ -91,6 +96,7 @@ fn dist_resolves_against_the_discovered_project_root_when_present() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("myagent");
     cybersin().arg("init").arg(&project).assert().success();
+    write_hello_prompt(&project);
     cybersin()
         .arg("build")
         .arg(&project)

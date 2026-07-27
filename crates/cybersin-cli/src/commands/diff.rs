@@ -201,7 +201,30 @@ mod tests {
         git(repo, &["init", "-q"]);
         git(repo, &["config", "user.email", "test@example.com"]);
         git(repo, &["config", "user.name", "Test"]);
-        crate::commands::init::run(&repo.join("project")).expect("init");
+        let project = repo.join("project");
+        crate::commands::init::run(&project).expect("init");
+        fs::write(
+            project.join("fragments/tone.md"),
+            "You are a friendly, concise assistant.\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join("prompts/hello.prompt.yaml"),
+            r#"name: hello
+quality: medium
+inputs:
+  name: string
+sections:
+  - id: role
+    priority: 100
+    body: !include ../fragments/tone.md
+  - id: instructions
+    priority: 90
+    body: |
+      Greet {{ name }} warmly and briefly.
+"#,
+        )
+        .unwrap();
         git(repo, &["add", "-A"]);
         git(repo, &["commit", "-q", "-m", "initial"]);
     }

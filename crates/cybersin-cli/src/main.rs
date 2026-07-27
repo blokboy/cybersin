@@ -131,12 +131,17 @@ enum Command {
         /// `-` for stdin, an existing file path, or literal prompt text.
         input: String,
     },
-    /// Scaffold a new project layout (spec §5): `cybersin.yaml`,
-    /// `cybersin.lock`, `prompts/`, `fragments/`, `evals/`, `agents/`,
-    /// `dist/`, plus one working example prompt.
+    /// Scaffold a new project spine (spec §5): core config plus empty
+    /// source directories, without starter prompts or build output.
     Init {
         /// Directory to scaffold the project into (created if missing).
         dir: PathBuf,
+        /// Overwrite scaffold files that already exist.
+        #[arg(long)]
+        force: bool,
+        /// Report what would be created or skipped without writing files.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Normalize the formatting of a `*.prompt.yaml` source file.
     Fmt {
@@ -269,7 +274,14 @@ async fn main() -> ExitCode {
         Command::Convert { out, model, input } => {
             from_async(commands::convert::execute(&project_start, input, out, model).await)
         }
-        Command::Init { dir } => from_sync(commands::init::run(&dir)),
+        Command::Init {
+            dir,
+            force,
+            dry_run,
+        } => from_sync(commands::init::run_with_options(
+            &dir,
+            commands::init::InitOptions { force, dry_run },
+        )),
         Command::Fmt { path, check } => from_sync(commands::fmt::run(&path, check)),
         Command::Run(args) => {
             let (db, sandbox_root, sandbox_backend, defaults) =

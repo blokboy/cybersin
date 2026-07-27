@@ -11,6 +11,31 @@ fn cybersin() -> Command {
     Command::cargo_bin("cybersin").unwrap()
 }
 
+fn write_hello_prompt(project: &std::path::Path) {
+    fs::write(
+        project.join("fragments/tone.md"),
+        "You are a friendly, concise assistant.\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("prompts/hello.prompt.yaml"),
+        r#"name: hello
+quality: medium
+inputs:
+  name: string
+sections:
+  - id: role
+    priority: 100
+    body: !include ../fragments/tone.md
+  - id: instructions
+    priority: 90
+    body: |
+      Greet {{ name }} warmly and briefly.
+"#,
+    )
+    .unwrap();
+}
+
 #[test]
 fn explicit_help_spellings_print_help_without_entering_tui() {
     for spelling in ["-help", "-h", "--help"] {
@@ -35,7 +60,7 @@ fn bare_non_tty_invocation_fails_clearly_instead_of_hanging() {
 }
 
 #[test]
-fn init_scaffolds_a_project_layout_that_passes_check() {
+fn init_scaffolds_only_the_basic_project_spine() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("myagent");
 
@@ -44,26 +69,81 @@ fn init_scaffolds_a_project_layout_that_passes_check() {
         .arg(&project)
         .assert()
         .success()
-        .stdout(predicate::str::contains("scaffolded"));
+        .stdout(predicate::str::contains("scaffolded"))
+        .stdout(predicate::str::contains("created:"))
+        .stdout(predicate::str::contains("skipped: none"));
 
     for expected in [
         "cybersin.yaml",
         "cybersin.lock",
+        "cybersin.local.example.yaml",
+        ".gitignore",
         "prompts",
         "fragments",
         "evals",
         "agents",
-        "dist",
+        "tools",
     ] {
         assert!(project.join(expected).exists(), "missing {expected}");
     }
 
+    for unexpected in [
+        "prompts/hello.prompt.yaml",
+        "fragments/tone.md",
+        "evals/hello.eval.yaml",
+        "agents/hello.agent.yaml",
+        "loop.py",
+        "inputs",
+        "dist",
+    ] {
+        assert!(
+            !project.join(unexpected).exists(),
+            "unexpected scaffolded path {unexpected}"
+        );
+    }
+}
+
+#[test]
+fn init_skips_existing_files_unless_forced_and_supports_dry_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("myagent");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("cybersin.yaml"), "name: existing\n").unwrap();
+
     cybersin()
-        .arg("check")
+        .arg("init")
         .arg(&project)
         .assert()
         .success()
-        .stdout(predicate::str::contains("ok"));
+        .stdout(predicate::str::contains("skipped:"))
+        .stdout(predicate::str::contains("cybersin.yaml"));
+    assert_eq!(
+        fs::read_to_string(project.join("cybersin.yaml")).unwrap(),
+        "name: existing\n"
+    );
+
+    let dry_run_project = tmp.path().join("dry-run");
+    cybersin()
+        .arg("init")
+        .arg("--dry-run")
+        .arg(&dry_run_project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would scaffold"))
+        .stdout(predicate::str::contains("created:"));
+    assert!(!dry_run_project.exists());
+
+    cybersin()
+        .arg("init")
+        .arg("--force")
+        .arg(&project)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skipped: none"));
+    assert_ne!(
+        fs::read_to_string(project.join("cybersin.yaml")).unwrap(),
+        "name: existing\n"
+    );
 }
 
 #[test]
@@ -205,6 +285,7 @@ fn build_frozen_fails_when_release_compression_is_not_pinned() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("project");
     cybersin().arg("init").arg(&project).assert().success();
+    write_hello_prompt(&project);
 
     cybersin()
         .arg("build")
@@ -220,6 +301,7 @@ fn dev_build_excludes_compression_and_succeeds_frozen_without_pins() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("project");
     cybersin().arg("init").arg(&project).assert().success();
+    write_hello_prompt(&project);
 
     cybersin()
         .arg("build")
@@ -237,6 +319,7 @@ fn build_writes_the_full_dist_shape_and_renders_every_configured_target() {
     let tmp = tempfile::tempdir().unwrap();
     let project = tmp.path().join("project");
     cybersin().arg("init").arg(&project).assert().success();
+    write_hello_prompt(&project);
 
     // Add `openai` alongside the default `generic` target so both a
     // concrete model family and the portable target render (spec §6.5).
@@ -302,6 +385,7 @@ fn diff_reports_a_change_against_head_via_the_cli() {
 
     let project = repo.join("project");
     cybersin().arg("init").arg(&project).assert().success();
+    write_hello_prompt(&project);
     git(&["add", "-A"]);
     git(&["commit", "-q", "-m", "initial"]);
 

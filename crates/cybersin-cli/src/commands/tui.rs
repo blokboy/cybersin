@@ -2164,6 +2164,14 @@ mod tests {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL)
     }
 
+    fn write_hello_prompt(project: &Path) {
+        std::fs::write(
+            project.join("prompts/hello.prompt.yaml"),
+            "name: hello\nquality: medium\nsections:\n- id: prompt\n  priority: 100\n  body: Hello.\n",
+        )
+        .unwrap();
+    }
+
     #[test]
     fn home_opens_conversion_and_back_preserves_draft() {
         let mut app = App::default();
@@ -2300,6 +2308,7 @@ mod tests {
     fn build_tab_enter_requests_build_and_up_down_select_sources() {
         let project = tempfile::tempdir().unwrap();
         crate::commands::init::run(project.path()).unwrap();
+        write_hello_prompt(project.path());
         std::fs::write(
             project.path().join("prompts/second.prompt.yaml"),
             "name: second\nquality: medium\nsections:\n- id: prompt\n  priority: 100\n  body: Build me.\n",
@@ -2499,6 +2508,7 @@ mod tests {
     fn build_tab_progress_lists_prompt_passes() {
         let project = tempfile::tempdir().unwrap();
         crate::commands::init::run(project.path()).unwrap();
+        write_hello_prompt(project.path());
         let mut lines = Vec::new();
 
         let result = run_build_from(project.path().to_path_buf(), |progress| {
@@ -2684,6 +2694,7 @@ mod tests {
     async fn generic_browser_runs_check_capability_and_reports_unavailable_entries() {
         let project = tempfile::tempdir().unwrap();
         crate::commands::init::run(project.path()).unwrap();
+        write_hello_prompt(project.path());
         let mut app = App::new(project.path().to_path_buf());
         app.enter_capability_browser();
         let registry = registry();
