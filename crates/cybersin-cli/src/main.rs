@@ -153,8 +153,8 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-    /// Run an agent session (spec §11: `cybersin run <agent.yaml>`; for
-    /// now: `cybersin run --stub`).
+    /// Run an agent session (spec §11: `cybersin run <agent.yaml>`) or
+    /// infer the single runnable agent target in a built project.
     Run(commands::run::RunArgs),
     /// Inspect recorded spans (spec §8.5: `cybersin trace ls|show`).
     Trace {

@@ -110,7 +110,7 @@ fn dist_resolves_against_the_discovered_project_root_when_present() {
     std::fs::create_dir_all(&nested).unwrap();
 
     // No `--dist` flag: `run` (without `--stub` or an agent path) must get
-    // past dist resolution and reach its own "needs --stub" validation,
+    // past dist resolution and reach its own no-runnable-target validation,
     // proving `<root>/dist` was found rather than erroring out for a
     // missing dist/.
     cybersin()
@@ -118,5 +118,5 @@ fn dist_resolves_against_the_discovered_project_root_when_present() {
         .arg("run")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("--stub"));
+        .stderr(predicate::str::contains("no runnable agent targets found"));
 }
