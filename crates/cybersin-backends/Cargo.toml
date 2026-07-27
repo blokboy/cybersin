@@ -9,6 +9,6 @@ readme.workspace = true
 description = "Cybersin backend models and emitters for compiled prompt artifacts."
 
 [dependencies]
-cybersin-ir = { path = "../cybersin-ir", version = "0.1.0" }
+cybersin-ir = { path = "../cybersin-ir", version = "0.1.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

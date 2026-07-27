@@ -35,16 +35,16 @@ path = "src/bin/scripted_harness.rs"
 required-features = ["internal-test-bins"]
 
 [dependencies]
-cybersin-frontend = { path = "../cybersin-frontend", version = "0.1.0" }
-cybersin-adapter = { path = "../cybersin-adapter", version = "0.1.0" }
-cybersin-backends = { path = "../cybersin-backends", version = "0.1.0" }
-cybersin-gateway = { path = "../cybersin-gateway", version = "0.1.0" }
-cybersin-ir = { path = "../cybersin-ir", version = "0.1.0" }
-cybersin-passes = { path = "../cybersin-passes", version = "0.1.0" }
-cybersin-router = { path = "../cybersin-router", version = "0.1.0" }
-cybersin-runtime = { path = "../cybersin-runtime", version = "0.1.0" }
-cybersin-sandbox = { path = "../cybersin-sandbox", version = "0.1.0" }
-cybersin-trace = { path = "../cybersin-trace", version = "0.1.0" }
+cybersin-frontend = { path = "../cybersin-frontend", version = "0.1.1" }
+cybersin-adapter = { path = "../cybersin-adapter", version = "0.1.1" }
+cybersin-backends = { path = "../cybersin-backends", version = "0.1.1" }
+cybersin-gateway = { path = "../cybersin-gateway", version = "0.1.1" }
+cybersin-ir = { path = "../cybersin-ir", version = "0.1.1" }
+cybersin-passes = { path = "../cybersin-passes", version = "0.1.1" }
+cybersin-router = { path = "../cybersin-router", version = "0.1.1" }
+cybersin-runtime = { path = "../cybersin-runtime", version = "0.1.1" }
+cybersin-sandbox = { path = "../cybersin-sandbox", version = "0.1.1" }
+cybersin-trace = { path = "../cybersin-trace", version = "0.1.1" }
 
 anyhow = "1"
 async-trait = "0.1"
