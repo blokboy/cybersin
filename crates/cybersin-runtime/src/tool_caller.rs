@@ -43,6 +43,7 @@ pub trait ToolCaller: Send + Sync {
         &self,
         session_id: &str,
         call_id: &str,
+        idem_key: Option<&str>,
         tool: &str,
         args: &Value,
     ) -> Result<ToolOutput, ToolCallFailure>;
@@ -61,6 +62,7 @@ impl ToolCaller for StubToolCaller {
         &self,
         _session_id: &str,
         _call_id: &str,
+        _idem_key: Option<&str>,
         tool: &str,
         _args: &Value,
     ) -> Result<ToolOutput, ToolCallFailure> {
@@ -81,10 +83,13 @@ impl ToolCaller for Box<dyn ToolCaller> {
         &self,
         session_id: &str,
         call_id: &str,
+        idem_key: Option<&str>,
         tool: &str,
         args: &Value,
     ) -> Result<ToolOutput, ToolCallFailure> {
-        (**self).call(session_id, call_id, tool, args).await
+        (**self)
+            .call(session_id, call_id, idem_key, tool, args)
+            .await
     }
 }
 
@@ -99,6 +104,7 @@ mod tests {
             .call(
                 "sess-1",
                 "web_search:sess-1:1",
+                None,
                 "web_search",
                 &serde_json::json!({}),
             )
@@ -119,6 +125,7 @@ mod tests {
             .call(
                 "sess-1",
                 "web_search:sess-1:1",
+                None,
                 "web_search",
                 &serde_json::json!({}),
             )

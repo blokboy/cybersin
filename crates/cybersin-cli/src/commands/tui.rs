@@ -866,6 +866,8 @@ async fn run_ops_build(project_start: &Path, agent_yaml: PathBuf) -> Result<Stri
             agent_yaml: Some(agent_yaml),
             stub: false,
             session_id: None,
+            resume: None,
+            force: false,
             agent: None,
             input: None,
         },

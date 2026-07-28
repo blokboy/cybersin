@@ -8,7 +8,9 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use crate::route_executor::RouteRetryPolicy;
 use cybersin_router::RouteModel;
 use serde::Deserialize;
 
@@ -28,6 +30,8 @@ pub struct LocalConfigFile {
     pub permissions: PermissionsConfig,
     #[serde(default)]
     pub routing: RoutingConfig,
+    #[serde(default)]
+    pub retry: RetryConfig,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -91,6 +95,13 @@ pub struct RoutingConfig {
     pub allowed_providers: Vec<String>,
     #[serde(default)]
     pub allowed_models: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RetryConfig {
+    pub max_attempts: Option<u32>,
+    pub backoff_base_ms: Option<u64>,
+    pub backoff_cap_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -270,6 +281,23 @@ impl LocalConfigFile {
         }
     }
 
+    pub fn retry_policy(&self) -> RouteRetryPolicy {
+        let defaults = RouteRetryPolicy::default();
+        RouteRetryPolicy {
+            max_attempts: self.retry.max_attempts.unwrap_or(defaults.max_attempts),
+            base_delay: self
+                .retry
+                .backoff_base_ms
+                .map(Duration::from_millis)
+                .unwrap_or(defaults.base_delay),
+            max_delay: self
+                .retry
+                .backoff_cap_ms
+                .map(Duration::from_millis)
+                .unwrap_or(defaults.max_delay),
+        }
+    }
+
     pub fn provider(&self, name: &str) -> Option<&ProviderConfig> {
         self.providers.get(name)
     }
@@ -393,6 +421,10 @@ permissions:
   tools:
     allowed: [web_search]
     denied: [wire_transfer]
+retry:
+  max_attempts: 7
+  backoff_base_ms: 25
+  backoff_cap_ms: 250
 "#,
         )
         .unwrap();
@@ -431,6 +463,30 @@ permissions:
         let allowlist = config.model_allowlist();
         assert!(allowlist.allows(&model("openrouter", "openai/gpt-4o-mini")));
         assert!(!allowlist.allows(&model("openrouter", "anthropic/claude-3-haiku")));
+        assert_eq!(
+            config.retry_policy(),
+            RouteRetryPolicy {
+                max_attempts: 7,
+                base_delay: Duration::from_millis(25),
+                max_delay: Duration::from_millis(250),
+            }
+        );
+    }
+
+    #[test]
+    fn retry_policy_defaults_missing_and_partial_blocks() {
+        let absent: LocalConfigFile = serde_yaml::from_str("").unwrap();
+        assert_eq!(absent.retry_policy(), RouteRetryPolicy::default());
+
+        let partial: LocalConfigFile =
+            serde_yaml::from_str("retry:\n  max_attempts: 42\n").unwrap();
+        assert_eq!(
+            partial.retry_policy(),
+            RouteRetryPolicy {
+                max_attempts: 42,
+                ..RouteRetryPolicy::default()
+            }
+        );
     }
 
     #[test]

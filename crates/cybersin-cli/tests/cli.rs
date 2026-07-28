@@ -1238,3 +1238,213 @@ fn run_start_ingests_artifacts_idempotently_and_audits_outcome() {
     assert_eq!(second_artifact["payload"]["outcome"], "reused");
     assert!(first_artifact["payload"]["file_count"].as_u64().unwrap() > 1);
 }
+
+#[test]
+fn run_resume_relaunches_from_latest_checkpoint_from_unrelated_cwd() {
+    use cybersin_runtime::Storage as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("state.db");
+    let sandbox_root = tmp.path().join("sandbox");
+    let project = tmp.path().join("project");
+    let unrelated = tmp.path().join("unrelated");
+    let agent_dir = project.join("agents");
+    let dist = project.join("dist");
+    let harness = tmp.path().join("checkpoint_harness.py");
+    let agent = agent_dir.join("resume.agent.yaml");
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::create_dir_all(&unrelated).unwrap();
+    copy_tree(&cybersin_runtime::bundled_stub_dist_dir(), &dist);
+    fs::write(
+        &harness,
+        r#"
+import json
+import os
+import sys
+
+def recv():
+    return json.loads(sys.stdin.readline())
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+start = recv()
+if not os.path.isfile(os.path.join(os.getcwd(), "dist", "manifest.json")):
+    raise SystemExit("harness did not run from a project with materialized dist")
+
+if "resume_state" not in start:
+    send({"type":"state.set","call_id":"state-1","namespace":"progress","key":"step","value":"checkpointed"})
+    recv()
+    send({"type":"checkpoint","call_id":"checkpoint-1","label":"boundary"})
+    recv()
+    raise SystemExit(42)
+
+if start["resume_state"]["progress"]["step"] != "checkpointed":
+    raise SystemExit("missing restored logical state")
+send({"type":"state.get","call_id":"state-2","namespace":"progress","key":"step"})
+state = recv()
+if state["outcome"]["value"] != "checkpointed":
+    raise SystemExit("state.get did not see restored checkpoint state")
+send({"type":"session.complete","session_id":start["session_id"],"result":{"status":"ok","resumed":True}})
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &agent,
+        format!(
+            r#"name: resume-agent
+harness:
+  adapter: process
+  command: ["python3", "{}"]
+"#,
+            harness.display()
+        ),
+    )
+    .unwrap();
+
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--dist",
+            dist.to_str().unwrap(),
+            "--sandbox-root",
+            sandbox_root.to_str().unwrap(),
+            "run",
+            agent.to_str().unwrap(),
+            "--session-id",
+            "resume-1",
+        ])
+        .current_dir(&project)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "harness process exited unexpectedly",
+        ));
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let storage = cybersin_runtime::SqliteStorage::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            db.display()
+        ))
+        .await
+        .unwrap();
+        storage
+            .write_session_heartbeat("resume-1", 1, "pid=old host=test")
+            .await
+            .unwrap();
+    });
+    fs::remove_dir_all(&dist).unwrap();
+
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--sandbox-root",
+            sandbox_root.to_str().unwrap(),
+            "run",
+            "--resume",
+            "resume-1",
+        ])
+        .current_dir(&unrelated)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("resume-1 completed"));
+
+    let session = show_session(&db, "resume-1");
+    assert_eq!(session["status"], "completed");
+    let events = session["events"].as_array().unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event["kind"] == "session.started"));
+    let resumed = events
+        .iter()
+        .find(|event| event["kind"] == "session.resumed")
+        .unwrap();
+    assert_eq!(resumed["payload"]["resume_kind"], "run_relaunch");
+    assert_eq!(resumed["payload"]["lease_outcome"], "stale");
+    assert_eq!(resumed["payload"]["heartbeat_holder"], "pid=old host=test");
+    assert_eq!(resumed["payload"]["restored_checkpoint_id"], 1);
+    assert!(events
+        .iter()
+        .any(|event| event["kind"] == "session.completed"));
+}
+
+#[test]
+fn run_resume_enforces_status_lease_hash_and_arg_gates() {
+    use cybersin_runtime::Storage as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("state.db");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let storage = cybersin_runtime::SqliteStorage::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            db.display()
+        ))
+        .await
+        .unwrap();
+        storage
+            .create_session_pinned("done", "agent", "hash-done")
+            .await
+            .unwrap();
+        storage
+            .set_session_status("done", "completed")
+            .await
+            .unwrap();
+        storage
+            .create_session_pinned("fresh", "agent", "hash-fresh")
+            .await
+            .unwrap();
+        storage
+            .write_session_heartbeat("fresh", now_unix_ms(), "pid=live host=test")
+            .await
+            .unwrap();
+        storage
+            .create_session_pinned("missing", "agent", "hash-missing")
+            .await
+            .unwrap();
+        storage
+            .set_session_status("missing", "failed")
+            .await
+            .unwrap();
+    });
+
+    cybersin()
+        .args(["--db", db.to_str().unwrap(), "run", "--resume", "done"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("completed"))
+        .stderr(predicate::str::contains("start a new run"));
+
+    cybersin()
+        .args(["--db", db.to_str().unwrap(), "run", "--resume", "fresh"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("fresh lease"))
+        .stderr(predicate::str::contains("pid=live host=test"))
+        .stderr(predicate::str::contains("--force"));
+
+    cybersin()
+        .args(["--db", db.to_str().unwrap(), "run", "--resume", "missing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("hash-missing"))
+        .stderr(predicate::str::contains("sessions migrate"))
+        .stderr(predicate::str::contains("re-ingest"));
+
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "run",
+            "--resume",
+            "fresh",
+            "--session-id",
+            "other",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}

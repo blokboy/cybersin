@@ -311,6 +311,7 @@ impl cybersin_runtime::ToolCaller for GatewayToolCaller {
         &self,
         session_id: &str,
         call_id: &str,
+        idem_key: Option<&str>,
         tool: &str,
         args: &Value,
     ) -> Result<cybersin_runtime::ToolOutput, cybersin_runtime::ToolCallFailure> {
@@ -322,7 +323,9 @@ impl cybersin_runtime::ToolCaller for GatewayToolCaller {
         // Session-scoped so the harness's own local call ids (e.g.
         // "call-2", not unique across sessions) can never collide in the
         // `(tool, idem_key)`-keyed ledger.
-        let idem_key = format!("{session_id}:{call_id}");
+        let idem_key = idem_key
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{session_id}:{call_id}"));
 
         let outcome = self
             .gateway
@@ -1087,7 +1090,7 @@ but egress allowlisting is not yet implemented — refusing to run with an ambig
 
     #[tokio::test]
     async fn gateway_tool_caller_maps_a_successful_execution() {
-        let (_state, _storage, bridge) = gateway_tool_caller(
+        let (_state, storage, bridge) = gateway_tool_caller(
             "citation_lookup",
             policy(Some(vec!["python3", "citation_lookup.py"]), vec![]),
             FlakyBackend::default(),
@@ -1098,6 +1101,7 @@ but egress allowlisting is not yet implemented — refusing to run with an ambig
             &bridge,
             "session-1",
             "call-1",
+            Some("explicit-key"),
             "citation_lookup",
             &serde_json::json!({}),
         )
@@ -1106,6 +1110,11 @@ but egress allowlisting is not yet implemented — refusing to run with an ambig
 
         assert_eq!(output.value, serde_json::json!({"ok": true}));
         assert_eq!(output.usd_cost, 0.0008);
+        assert!(storage
+            .get_tool_call("citation_lookup:explicit-key")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -1119,6 +1128,7 @@ but egress allowlisting is not yet implemented — refusing to run with an ambig
             &bridge,
             "session-1",
             "call-1",
+            None,
             "missing",
             &serde_json::json!({}),
         )
@@ -1150,6 +1160,7 @@ but egress allowlisting is not yet implemented — refusing to run with an ambig
             &bridge,
             "session-1",
             "call-1",
+            None,
             "citation_lookup",
             &serde_json::json!({}),
         )
@@ -1182,6 +1193,7 @@ but egress allowlisting is not yet implemented — refusing to run with an ambig
             &bridge,
             "session-1",
             "call-1",
+            None,
             "citation_lookup",
             &serde_json::json!({}),
         )

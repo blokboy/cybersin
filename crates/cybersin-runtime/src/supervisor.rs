@@ -46,6 +46,22 @@ impl SessionSupervisor {
     }
 
     pub async fn resume(&self, session_id: &str, config_hash: &str) -> Result<Value, RuntimeError> {
+        self.resume_with_payload(
+            session_id,
+            config_hash,
+            serde_json::json!({
+                "config_hash": config_hash,
+            }),
+        )
+        .await
+    }
+
+    pub async fn resume_with_payload(
+        &self,
+        session_id: &str,
+        config_hash: &str,
+        mut payload: Value,
+    ) -> Result<Value, RuntimeError> {
         let session =
             self.storage.get_session(session_id).await?.ok_or_else(|| {
                 RuntimeError::Session(format!("session {session_id:?} not found"))
@@ -85,15 +101,21 @@ impl SessionSupervisor {
         self.storage
             .set_session_status(session_id, "running")
             .await?;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "config_hash".to_string(),
+                Value::String(config_hash.to_string()),
+            );
+            object.insert(
+                "checkpoint_id".to_string(),
+                checkpoint
+                    .as_ref()
+                    .map(|c| Value::from(c.checkpoint_id))
+                    .unwrap_or(Value::Null),
+            );
+        }
         self.storage
-            .append_event(
-                session_id,
-                "session.resumed",
-                serde_json::json!({
-                    "config_hash": config_hash,
-                    "checkpoint_id": checkpoint.as_ref().map(|c| c.checkpoint_id)
-                }),
-            )
+            .append_event(session_id, "session.resumed", payload)
             .await?;
         Ok(replayed_state)
     }

@@ -196,6 +196,18 @@ pub struct ExecutionResponse {
     pub usage: Option<ModelUsage>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ModelCallAttemptResult {
+    output: ModelOutput,
+    attempts: Vec<ModelRetryAttemptEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ModelCallFailure {
+    error: ModelCallError,
+    attempts: Vec<ModelRetryAttemptEvent>,
+}
+
 /// The model a "normal" (non-degraded) call to `route` would use: its
 /// highest-quality cascade step, or failing that its first provider
 /// fallback. Shared by [`crate::dist::DistFixture`]'s own legacy-bridge
@@ -249,6 +261,39 @@ pub trait ModelCaller: Send + Sync {
         confidence_instruction: Option<&str>,
         grounded: bool,
     ) -> Result<ModelOutput, ModelCallError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRetryAttemptEvent {
+    pub prompt_name: String,
+    pub model: String,
+    pub attempt: u32,
+    pub error_class: Option<String>,
+    pub computed_delay_ms: Option<u64>,
+    pub outcome: String,
+}
+
+#[async_trait]
+pub trait RetryEventRecorder: Send + Sync {
+    async fn record_attempt(
+        &self,
+        session_id: &str,
+        event: &ModelRetryAttemptEvent,
+    ) -> Result<(), RouteExecutorError>;
+}
+
+#[derive(Debug, Default)]
+struct NoopRetryEventRecorder;
+
+#[async_trait]
+impl RetryEventRecorder for NoopRetryEventRecorder {
+    async fn record_attempt(
+        &self,
+        _session_id: &str,
+        _event: &ModelRetryAttemptEvent,
+    ) -> Result<(), RouteExecutorError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -359,6 +404,7 @@ pub struct RouteExecutor<M, J> {
     allowlist: ModelAllowlist,
     retry_policy: RouteRetryPolicy,
     sleeper: Arc<dyn AsyncSleeper>,
+    retry_events: Arc<dyn RetryEventRecorder>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -385,6 +431,8 @@ pub enum RouteExecutorError {
     ExhaustedWithLastErrors { prompt: String, last_errors: String },
     #[error("trace store error: {0}")]
     Trace(#[from] cybersin_trace::TraceError),
+    #[error("retry event recorder error: {0}")]
+    RetryEvent(String),
 }
 
 impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
@@ -404,6 +452,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
             allowlist: ModelAllowlist::allow_all(),
             retry_policy: RouteRetryPolicy::default(),
             sleeper: Arc::new(TokioSleeper),
+            retry_events: Arc::new(NoopRetryEventRecorder),
         }
     }
 
@@ -419,8 +468,17 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
         self
     }
 
+    pub fn set_retry_policy(&mut self, retry_policy: RouteRetryPolicy) {
+        self.retry_policy = retry_policy;
+    }
+
     pub fn with_sleeper(mut self, sleeper: Arc<dyn AsyncSleeper>) -> Self {
         self.sleeper = sleeper;
+        self
+    }
+
+    pub fn with_retry_event_recorder(mut self, retry_events: Arc<dyn RetryEventRecorder>) -> Self {
+        self.retry_events = retry_events;
         self
     }
 
@@ -507,6 +565,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                         }
                         let result = self
                             .call_model_with_retries(
+                                request,
                                 &step.model,
                                 &request.prompt_name,
                                 &request.inputs,
@@ -516,11 +575,21 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                             .await;
                         let force_accept = request.force_cheapest_cascade_step;
                         match result {
-                            Ok(output)
+                            Ok(call)
                                 if force_accept
-                                    || output.confidence >= step.confidence.minimum_score =>
+                                    || call.output.confidence >= step.confidence.minimum_score =>
                             {
-                                let usage = output.usage.clone();
+                                let mut attempts = call.attempts;
+                                attempts.push(
+                                    self.record_final_retry_attempt(
+                                        request,
+                                        &step.model,
+                                        attempts.len() as u32 + 1,
+                                        "success",
+                                    )
+                                    .await?,
+                                );
+                                let usage = call.output.usage.clone();
                                 let usd_cost =
                                     observed_usd_cost(&usage, step.model.estimated_cost_usd);
                                 self.record(
@@ -533,22 +602,33 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     serde_json::json!({
                                         "decision": if force_accept { "degrade_forced" } else { "cascade_accept" },
                                         "model": step.model.name,
-                                        "confidence": output.confidence,
+                                        "confidence": call.output.confidence,
                                         "minimum_confidence": step.confidence.minimum_score,
                                         "grounded": step.grounded,
+                                        "retry_attempts": attempts,
                                     }),
                                 )
                                 .await?;
                                 return Ok(ExecutionResponse {
-                                    response: output.response,
+                                    response: call.output.response,
                                     model: Some(step.model.name.clone()),
                                     cache_hit: false,
                                     usd_cost,
                                     usage,
                                 });
                             }
-                            Ok(output) => {
-                                let usage = output.usage.clone();
+                            Ok(call) => {
+                                let mut attempts = call.attempts;
+                                attempts.push(
+                                    self.record_final_retry_attempt(
+                                        request,
+                                        &step.model,
+                                        attempts.len() as u32 + 1,
+                                        "escalation",
+                                    )
+                                    .await?,
+                                );
+                                let usage = call.output.usage.clone();
                                 self.record(
                                     request,
                                     SpanKind::LlmCall,
@@ -559,14 +639,16 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     serde_json::json!({
                                         "decision": "cascade_escalation",
                                         "model": step.model.name,
-                                        "confidence": output.confidence,
+                                        "confidence": call.output.confidence,
                                         "minimum_confidence": step.confidence.minimum_score,
                                         "grounded": step.grounded,
+                                        "retry_attempts": attempts,
                                     }),
                                 )
                                 .await?;
                             }
-                            Err(error) => {
+                            Err(failure) => {
+                                let error = failure.error;
                                 last_cascade_error =
                                     Some(format!("{}: {}", step.model.name, error));
                                 self.record(
@@ -582,6 +664,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                         "error": error.to_string(),
                                         "error_class": error_class_name(&error.class),
                                         "grounded": step.grounded,
+                                        "retry_attempts": failure.attempts,
                                     }),
                                 )
                                 .await?;
@@ -596,6 +679,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                         }
                         match self
                             .call_model_with_retries(
+                                request,
                                 model,
                                 &request.prompt_name,
                                 &request.inputs,
@@ -604,8 +688,18 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                             )
                             .await
                         {
-                            Ok(output) => {
-                                let usage = output.usage.clone();
+                            Ok(call) => {
+                                let mut attempts = call.attempts;
+                                attempts.push(
+                                    self.record_final_retry_attempt(
+                                        request,
+                                        model,
+                                        attempts.len() as u32 + 1,
+                                        "success",
+                                    )
+                                    .await?,
+                                );
+                                let usage = call.output.usage.clone();
                                 let usd_cost = observed_usd_cost(&usage, model.estimated_cost_usd);
                                 self.record(
                                     request,
@@ -617,20 +711,22 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                     serde_json::json!({
                                         "decision": "fallback_accept",
                                         "model": model.name,
-                                        "confidence": output.confidence,
+                                        "confidence": call.output.confidence,
                                         "grounded": false,
+                                        "retry_attempts": attempts,
                                     }),
                                 )
                                 .await?;
                                 return Ok(ExecutionResponse {
-                                    response: output.response,
+                                    response: call.output.response,
                                     model: Some(model.name.clone()),
                                     cache_hit: false,
                                     usd_cost,
                                     usage,
                                 });
                             }
-                            Err(error) => {
+                            Err(failure) => {
+                                let error = failure.error;
                                 last_fallback_error = Some(format!("{}: {}", model.name, error));
                                 self.record(
                                     request,
@@ -645,6 +741,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                         "error": error.to_string(),
                                         "error_class": error_class_name(&error.class),
                                         "grounded": false,
+                                        "retry_attempts": failure.attempts,
                                     }),
                                 )
                                 .await?;
@@ -672,38 +769,83 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
 
     async fn call_model_with_retries(
         &self,
+        request: &ExecutionRequest,
         model: &RouteModel,
         prompt_name: &str,
         inputs: &Value,
         confidence_instruction: Option<&str>,
         grounded: bool,
-    ) -> Result<ModelOutput, ModelCallError> {
-        let mut failed_attempts = 0;
+    ) -> Result<ModelCallAttemptResult, ModelCallFailure> {
+        let mut attempts = Vec::new();
         loop {
+            let attempt = attempts.len() as u32 + 1;
             match self
                 .models
                 .call(model, prompt_name, inputs, confidence_instruction, grounded)
                 .await
             {
-                Ok(output) => return Ok(output),
+                Ok(output) => return Ok(ModelCallAttemptResult { output, attempts }),
                 Err(error) => {
-                    let attempts_so_far = failed_attempts + 1;
-                    if attempts_so_far >= self.retry_policy.max_attempts {
-                        return Err(error);
-                    }
-                    let retry_attempt = failed_attempts + 1;
-                    let Some(delay) = self.retry_policy.delay_for(
-                        retry_attempt,
-                        &error.class,
-                        deterministic_jitter(model, prompt_name, retry_attempt),
-                    ) else {
-                        return Err(error);
+                    let delay = if attempt >= self.retry_policy.max_attempts {
+                        None
+                    } else {
+                        self.retry_policy.delay_for(
+                            attempt,
+                            &error.class,
+                            deterministic_jitter(model, prompt_name, attempt),
+                        )
                     };
-                    failed_attempts += 1;
+                    let event = ModelRetryAttemptEvent {
+                        prompt_name: prompt_name.to_string(),
+                        model: model.name.clone(),
+                        attempt,
+                        error_class: Some(error_class_name(&error.class).to_string()),
+                        computed_delay_ms: delay.map(duration_ms),
+                        outcome: if delay.is_some() {
+                            "retrying".to_string()
+                        } else {
+                            "terminal_failure".to_string()
+                        },
+                    };
+                    if let Err(recorder_error) = self
+                        .retry_events
+                        .record_attempt(&request.session_id, &event)
+                        .await
+                    {
+                        return Err(ModelCallFailure {
+                            error: ModelCallError::permanent(recorder_error.to_string()),
+                            attempts,
+                        });
+                    }
+                    attempts.push(event);
+                    let Some(delay) = delay else {
+                        return Err(ModelCallFailure { error, attempts });
+                    };
                     self.sleeper.sleep(delay).await;
                 }
             }
         }
+    }
+
+    async fn record_final_retry_attempt(
+        &self,
+        request: &ExecutionRequest,
+        model: &RouteModel,
+        attempt: u32,
+        outcome: &str,
+    ) -> Result<ModelRetryAttemptEvent, RouteExecutorError> {
+        let event = ModelRetryAttemptEvent {
+            prompt_name: request.prompt_name.clone(),
+            model: model.name.clone(),
+            attempt,
+            error_class: None,
+            computed_delay_ms: None,
+            outcome: outcome.to_string(),
+        };
+        self.retry_events
+            .record_attempt(&request.session_id, &event)
+            .await?;
+        Ok(event)
     }
 
     async fn execute_cache(
@@ -888,6 +1030,11 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
         } else {
             (None, None, Vec::new())
         };
+        let retries = attributes
+            .get("retry_attempts")
+            .and_then(Value::as_array)
+            .map(|attempts| attempts.len().saturating_sub(1) as u32)
+            .unwrap_or(0);
         let usd_cost = usage.and_then(|usage| usage.usd_cost).unwrap_or(usd_cost);
         self.spans
             .insert(&Span {
@@ -908,7 +1055,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 tokens_completion,
                 usd_cost,
                 cache_status,
-                retries: 0,
+                retries,
                 evicted_sections,
                 status: SpanStatus::Ok,
                 attributes,
@@ -955,6 +1102,10 @@ fn duration_mul(duration: Duration, multiplier: u128) -> Duration {
 
 fn duration_mul_f64(duration: Duration, multiplier: f64) -> Duration {
     Duration::from_secs_f64(duration.as_secs_f64() * multiplier)
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn deterministic_jitter(model: &RouteModel, prompt_name: &str, attempt: u32) -> f64 {
@@ -1171,6 +1322,24 @@ mod tests {
     impl AsyncSleeper for RecordingSleeper {
         async fn sleep(&self, delay: Duration) {
             self.0.lock().unwrap().push(delay);
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingRetryEvents(Mutex<Vec<(String, ModelRetryAttemptEvent)>>);
+
+    #[async_trait]
+    impl RetryEventRecorder for RecordingRetryEvents {
+        async fn record_attempt(
+            &self,
+            session_id: &str,
+            event: &ModelRetryAttemptEvent,
+        ) -> Result<(), RouteExecutorError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((session_id.to_string(), event.clone()));
+            Ok(())
         }
     }
 
@@ -1850,6 +2019,136 @@ mod tests {
             vec!["cheap", "cheap", "cheap"]
         );
         assert_eq!(sleeper.0.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_attempts_are_recorded_in_events_and_the_logical_llm_span() {
+        let mut req = request();
+        req.bypass = true;
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let retry_events = Arc::new(RecordingRetryEvents::default());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let executor = RouteExecutor::new(
+            routing(),
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "v1".into(),
+                entries: vec![],
+            },
+            ScriptedCalls::new([
+                ScriptedOutcome::Transient("rate limited"),
+                ScriptedOutcome::TransientRetryAfter("timeout", Duration::from_millis(25)),
+                ScriptedOutcome::Answer { confidence: 0.95 },
+            ]),
+            AcceptJudge,
+            spans.clone(),
+        )
+        .with_retry_policy(RouteRetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+        })
+        .with_sleeper(sleeper)
+        .with_retry_event_recorder(retry_events.clone());
+
+        let response = executor.execute(&req).await.unwrap();
+
+        assert_eq!(response.model.as_deref(), Some("cheap"));
+        let events = retry_events.0.lock().unwrap().clone();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|(session, _)| session == "s1"));
+        let attempts: Vec<_> = events.iter().map(|(_, event)| event).collect();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|event| event.outcome.as_str())
+                .collect::<Vec<_>>(),
+            vec!["retrying", "retrying", "success"]
+        );
+        assert!(attempts.iter().all(|event| event.prompt_name == "answer"));
+        assert!(attempts.iter().all(|event| event.model == "cheap"));
+        assert_eq!(attempts[0].attempt, 1);
+        assert_eq!(attempts[0].error_class.as_deref(), Some("transient"));
+        assert!(attempts[0].computed_delay_ms.unwrap() <= 10);
+        assert_eq!(attempts[1].computed_delay_ms, Some(25));
+        assert_eq!(attempts[2].attempt, 3);
+        assert_eq!(attempts[2].error_class, None);
+        assert_eq!(attempts[2].computed_delay_ms, None);
+
+        let llm_spans = spans
+            .list(&SpanFilter {
+                session_id: Some("s1".into()),
+                agent_name: None,
+                kind: Some(SpanKind::LlmCall),
+                model: Some("cheap".into()),
+                since_unix_ms: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(llm_spans.len(), 1);
+        assert_eq!(llm_spans[0].retries, 2);
+        assert_eq!(
+            llm_spans[0].attributes["retry_attempts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            llm_spans[0].attributes["retry_attempts"][2]["outcome"],
+            "success"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_retry_budget_records_terminal_failure_attempt() {
+        let mut artifact = routing();
+        let route = artifact.prompts.get_mut("answer").unwrap();
+        let RouteDecision::Cascade(cascade) = &mut route.decisions[1] else {
+            panic!("expected cascade");
+        };
+        cascade.steps.truncate(1);
+
+        let mut req = request();
+        req.bypass = true;
+        let retry_events = Arc::new(RecordingRetryEvents::default());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let executor = RouteExecutor::new(
+            artifact,
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "v1".into(),
+                entries: vec![],
+            },
+            ScriptedCalls::new([
+                ScriptedOutcome::Transient("first"),
+                ScriptedOutcome::Transient("second"),
+            ]),
+            AcceptJudge,
+            spans,
+        )
+        .with_retry_policy(RouteRetryPolicy {
+            max_attempts: 2,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+        })
+        .with_sleeper(Arc::new(RecordingSleeper::default()))
+        .with_retry_event_recorder(retry_events.clone());
+
+        let error = executor.execute(&req).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            RouteExecutorError::ExhaustedWithLastErrors { .. }
+        ));
+        let events = retry_events.0.lock().unwrap().clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].1.outcome, "retrying");
+        assert_eq!(events[1].1.attempt, 2);
+        assert_eq!(events[1].1.error_class.as_deref(), Some("transient"));
+        assert_eq!(events[1].1.computed_delay_ms, None);
+        assert_eq!(events[1].1.outcome, "terminal_failure");
     }
 
     #[tokio::test]

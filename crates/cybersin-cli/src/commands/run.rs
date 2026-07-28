@@ -29,14 +29,18 @@ use cybersin_adapter::transport::stdio::in_memory_pair;
 use cybersin_adapter::transport::stdio::StdioDaemonChannel;
 use cybersin_router::{ModelKind, RouteDecision};
 use cybersin_runtime::{
-    stub_agent, ArtifactIngestOutcome, DaemonHandle, DistFixture, LocalConfigFile, ModelAllowlist,
-    OpenRouterModelCaller, RuntimeSessionSummary, Storage,
+    heartbeat_liveness_at, is_terminal_session_status, materialize_artifact_bundle, stub_agent,
+    ArtifactIngestOutcome, DaemonHandle, DistFixture, HeartbeatLiveness, LocalConfigFile,
+    ModelAllowlist, OpenRouterModelCaller, RuntimeSessionSummary, SessionSupervisor, Storage,
+    DEFAULT_HEARTBEAT_STALE_AFTER_MS,
 };
+use cybersin_sandbox::WorkspaceStore;
 use tokio::process::{Child, Command};
 
 use crate::commands::build::discover_agent_sources;
 use crate::harness_config::AgentMeta;
 use crate::readiness;
+use crate::session_liveness::now_unix_ms as session_now_unix_ms;
 use crate::tool_executor::{self, GatewayToolCaller};
 
 /// How long `cybersin run`'s `harness.adapter: grpc` path waits for the
@@ -50,6 +54,34 @@ const GRPC_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 enum RunTarget {
     Agent(PathBuf),
     BuiltInStarter { prompt_name: String },
+}
+
+#[derive(Debug, Clone)]
+struct LiveRunSpec {
+    dist_dir: PathBuf,
+    project_dir: PathBuf,
+    meta: AgentMeta,
+    agent_name: String,
+    inputs: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeLeaseOutcome {
+    Stale,
+    Forced,
+    Failed,
+    NotRunning,
+}
+
+impl ResumeLeaseOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stale => "stale",
+            Self::Forced => "forced",
+            Self::Failed => "failed",
+            Self::NotRunning => "not_running",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -67,8 +99,20 @@ pub struct RunArgs {
     /// Session id to record this run under. Defaults to a fresh
     /// timestamp-based id so repeated runs don't collide in the trace
     /// store.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "resume")]
     pub session_id: Option<String>,
+
+    /// Relaunch an existing session from its latest checkpoint.
+    #[arg(
+        long,
+        value_name = "SESSION_ID",
+        conflicts_with_all = ["agent_yaml", "stub", "session_id", "agent", "input"]
+    )]
+    pub resume: Option<String>,
+
+    /// Override a fresh heartbeat lease when used with `--resume`.
+    #[arg(long, requires = "resume")]
+    pub force: bool,
 
     /// Agent name spans/sessions are attributed to (the `agent` dimension
     /// of `cybersin cost --by agent`). Defaults to `agent.yaml`'s `name:`
@@ -80,6 +124,12 @@ pub struct RunArgs {
     /// only — `--stub` uses its own fixed inputs. Defaults to `{}`.
     #[arg(long)]
     pub input: Option<PathBuf>,
+}
+
+impl RunArgs {
+    pub(crate) fn is_resume(&self) -> bool {
+        self.resume.is_some()
+    }
 }
 
 pub async fn execute(
@@ -101,6 +151,16 @@ pub async fn run_session(
     sandbox_backend: crate::commands::sandbox::Backend,
     args: RunArgs,
 ) -> anyhow::Result<RuntimeSessionSummary> {
+    if let Some(session_id) = args.resume.clone() {
+        return run_resume(
+            db_path,
+            sandbox_root,
+            sandbox_backend,
+            session_id,
+            args.force,
+        )
+        .await;
+    }
     match (args.stub, args.agent_yaml.clone()) {
         (true, _) => run_stub(db_path, dist_dir, args).await,
         (false, explicit_agent_yaml) => {
@@ -298,22 +358,16 @@ async fn run_stub(
     .map_err(Into::into)
 }
 
-async fn run_live(
-    db_path: PathBuf,
-    dist_dir: PathBuf,
-    sandbox_root: PathBuf,
-    sandbox_backend: crate::commands::sandbox::Backend,
-    agent_yaml: PathBuf,
-    args: RunArgs,
-) -> anyhow::Result<RuntimeSessionSummary> {
-    let dist = Arc::new(DistFixture::load_dir(&dist_dir)?);
-
-    let yaml_source = std::fs::read_to_string(&agent_yaml)
+fn live_run_spec_from_agent(
+    dist_dir: &Path,
+    agent_yaml: &Path,
+    args: &RunArgs,
+) -> anyhow::Result<LiveRunSpec> {
+    let yaml_source = std::fs::read_to_string(agent_yaml)
         .with_context(|| format!("reading {}", agent_yaml.display()))?;
     let meta = AgentMeta::from_agent_yaml(&yaml_source)
         .with_context(|| format!("parsing {}", agent_yaml.display()))?;
     let agent_name = args.agent.clone().unwrap_or_else(|| meta.name.clone());
-
     let inputs = match &args.input {
         Some(path) => {
             let text = std::fs::read_to_string(path)
@@ -322,15 +376,136 @@ async fn run_live(
         }
         None => serde_json::json!({}),
     };
+    Ok(LiveRunSpec {
+        dist_dir: dist_dir.to_path_buf(),
+        project_dir: project_dir_from_dist(dist_dir).to_path_buf(),
+        meta,
+        agent_name,
+        inputs,
+    })
+}
 
-    println!("cybersind: auto-starting (state: {})", db_path.display());
-    let daemon = DaemonHandle::auto_start(&db_path).await?;
+async fn record_live_run_spec(
+    storage: &dyn Storage,
+    session_id: &str,
+    spec: &LiveRunSpec,
+) -> anyhow::Result<()> {
+    storage
+        .append_event(
+            session_id,
+            "run.harness",
+            serde_json::json!({
+                "agent_name": spec.agent_name,
+                "inputs": spec.inputs,
+                "harness": {
+                    "adapter": spec.meta.harness.adapter,
+                    "command": spec.meta.harness.command,
+                }
+            }),
+        )
+        .await?;
+    Ok(())
+}
 
-    let project_dir = project_dir_from_dist(&dist_dir);
-    let local_config = LocalConfigFile::load_optional(project_dir).with_context(|| {
+async fn load_live_run_spec(
+    storage: &dyn Storage,
+    session_id: &str,
+) -> anyhow::Result<Option<LiveRunSpec>> {
+    let Some(event) = storage
+        .load_events(session_id)
+        .await?
+        .into_iter()
+        .rev()
+        .find(|event| event.kind == "run.harness")
+    else {
+        return Ok(None);
+    };
+    let harness = &event.payload["harness"];
+    let adapter = harness["adapter"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("run.harness event is missing harness.adapter"))?
+        .to_string();
+    let command = harness["command"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("run.harness event is missing harness.command"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("run.harness command contains a non-string value"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let agent_name = event.payload["agent_name"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("run.harness event is missing agent_name"))?
+        .to_string();
+    Ok(Some(LiveRunSpec {
+        dist_dir: PathBuf::new(),
+        project_dir: PathBuf::new(),
+        meta: AgentMeta {
+            name: agent_name.clone(),
+            harness: crate::harness_config::HarnessConfig { adapter, command },
+        },
+        agent_name,
+        inputs: event
+            .payload
+            .get("inputs")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    }))
+}
+
+fn resume_gate(
+    session: &cybersin_runtime::SessionRecord,
+    force: bool,
+) -> anyhow::Result<(ResumeLeaseOutcome, Option<String>)> {
+    let holder = session.heartbeat_holder.clone();
+    match session.status.as_str() {
+        "failed" | "aborted" => Ok((ResumeLeaseOutcome::Failed, holder)),
+        "completed" => anyhow::bail!(
+            "session {:?} is completed; start a new run instead",
+            session.session_id
+        ),
+        "running" => {
+            let liveness = heartbeat_liveness_at(
+                session,
+                session_now_unix_ms(),
+                DEFAULT_HEARTBEAT_STALE_AFTER_MS,
+            );
+            match (force, liveness) {
+                (true, _) => Ok((ResumeLeaseOutcome::Forced, holder)),
+                (false, HeartbeatLiveness::Fresh) => anyhow::bail!(
+                    "session {:?} is still running under a fresh lease held by {}; pass --force to override",
+                    session.session_id,
+                    holder.as_deref().unwrap_or("unknown holder")
+                ),
+                (false, _) => Ok((ResumeLeaseOutcome::Stale, holder)),
+            }
+        }
+        status if is_terminal_session_status(status) => anyhow::bail!(
+            "session {:?} has terminal status {status:?}; start a new run instead",
+            session.session_id
+        ),
+        _ => Ok((ResumeLeaseOutcome::NotRunning, holder)),
+    }
+}
+
+async fn prepare_live_daemon(
+    daemon: DaemonHandle,
+    spec: LiveRunSpec,
+    sandbox_root: PathBuf,
+    sandbox_backend: crate::commands::sandbox::Backend,
+    session_id: String,
+) -> anyhow::Result<(
+    cybersin_runtime::RuntimeDaemon<Box<dyn DaemonChannel>>,
+    Child,
+)> {
+    let dist = Arc::new(DistFixture::load_dir(&spec.dist_dir)?);
+    let local_config = LocalConfigFile::load_optional(&spec.project_dir).with_context(|| {
         format!(
             "reading {}",
-            project_dir.join("cybersin.local.yaml").display()
+            spec.project_dir.join("cybersin.local.yaml").display()
         )
     })?;
     let model_caller = openrouter_from_local_config(dist.clone(), local_config.as_ref())
@@ -339,49 +514,178 @@ async fn run_live(
         .as_ref()
         .map(LocalConfigFile::model_allowlist)
         .unwrap_or_else(ModelAllowlist::allow_all);
+    let retry_policy = local_config
+        .as_ref()
+        .map(LocalConfigFile::retry_policy)
+        .unwrap_or_default();
 
     let executor = tool_executor::configured_executor_with_local_config(
-        &dist_dir,
+        &spec.dist_dir,
         &sandbox_root,
         sandbox_backend,
         local_config.as_ref(),
     )
     .context("configuring live tool execution")?;
+    let session_sandbox = WorkspaceStore::new(&sandbox_root)?;
     let tool_caller = GatewayToolCaller::new(executor, daemon.storage(), dist.clone());
-
-    let session_id = args
-        .session_id
-        .unwrap_or_else(|| format!("sess-{}", now_unix_ms()));
-    ensure_fresh_session_id(daemon.storage().as_ref(), &session_id).await?;
-    ingest_dist_for_session(daemon.storage().as_ref(), &dist_dir, &session_id).await?;
-
-    println!(
-        "spawning harness: session={session_id} agent={agent_name} command={:?} (adapter={})",
-        meta.harness.command, meta.harness.adapter
-    );
-
-    let (mut child, channel) = spawn_harness(&meta.harness, project_dir).await?;
-
-    let mut runtime_daemon = cybersin_runtime::RuntimeDaemon::new(
+    let (child, channel) = spawn_harness(&spec.meta.harness, &spec.project_dir).await?;
+    let runtime_daemon = cybersin_runtime::RuntimeDaemon::new(
         channel,
         daemon.storage(),
         daemon.spans(),
         dist,
-        session_id.clone(),
-        agent_name,
+        session_id,
+        spec.agent_name,
     )
     .with_models(model_caller, allowlist)
+    .with_retry_policy(retry_policy)
+    .with_session_sandbox(session_sandbox)
     .with_tool_caller(tool_caller);
+    Ok((runtime_daemon, child))
+}
+
+async fn run_resume(
+    db_path: PathBuf,
+    sandbox_root: PathBuf,
+    sandbox_backend: crate::commands::sandbox::Backend,
+    session_id: String,
+    force: bool,
+) -> anyhow::Result<RuntimeSessionSummary> {
+    println!("cybersind: auto-starting (state: {})", db_path.display());
+    let daemon = DaemonHandle::auto_start(&db_path).await?;
+    let storage = daemon.storage();
+    let session = storage
+        .get_session(&session_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session {session_id:?} not found"))?;
+    let (lease_outcome, holder) = resume_gate(&session, force)?;
+    if session.config_hash.is_empty() {
+        anyhow::bail!(
+            "session {session_id:?} has no pinned config_hash; run `cybersin sessions migrate` after re-ingesting the bundle"
+        );
+    }
+    if !storage.has_artifact_bundle(&session.config_hash).await? {
+        anyhow::bail!(
+            "artifact bundle for pinned config_hash {:?} is not stored; run `cybersin sessions migrate` or re-ingest the bundle",
+            session.config_hash
+        );
+    }
+    let checkpoint = storage
+        .latest_checkpoint(&session_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("session {session_id:?} has no checkpoint to resume from")
+        })?;
+    let stored_spec = load_live_run_spec(storage.as_ref(), &session_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "session {session_id:?} is missing run harness metadata; start a new run or re-ingest with a current cybersin"
+            )
+        })?;
+
+    let scratch = tempfile::Builder::new()
+        .prefix("cybersin-resume-")
+        .tempdir()?;
+    let scratch_dist = scratch.path().join("dist");
+    materialize_artifact_bundle(storage.as_ref(), &session.config_hash, &scratch_dist).await?;
+    let spec = LiveRunSpec {
+        dist_dir: scratch_dist,
+        project_dir: scratch.path().to_path_buf(),
+        meta: stored_spec.meta,
+        agent_name: stored_spec.agent_name,
+        inputs: stored_spec.inputs,
+    };
+
+    let workspaces = WorkspaceStore::new(&sandbox_root)?;
+    let resume_state = SessionSupervisor::with_session_sandbox(storage.clone(), workspaces)
+        .resume_with_payload(
+            &session_id,
+            &session.config_hash,
+            serde_json::json!({
+                "resume_kind": "run_relaunch",
+                "lease_outcome": lease_outcome.as_str(),
+                "heartbeat_holder": holder,
+                "restored_checkpoint_id": checkpoint.checkpoint_id,
+            }),
+        )
+        .await?;
+
+    println!(
+        "resuming harness: session={session_id} checkpoint={} lease={} holder={} command={:?} (adapter={})",
+        checkpoint.checkpoint_id,
+        lease_outcome.as_str(),
+        holder.as_deref().unwrap_or("-"),
+        spec.meta.harness.command,
+        spec.meta.harness.adapter
+    );
+
+    let (mut runtime_daemon, mut child) = prepare_live_daemon(
+        daemon,
+        spec.clone(),
+        sandbox_root,
+        sandbox_backend,
+        session_id,
+    )
+    .await?;
+    if let Err(err) = runtime_daemon
+        .start_resumed_session(spec.inputs.clone(), resume_state)
+        .await
+    {
+        return Err(harness_crash_or(&mut child, err.into()).await);
+    }
+    drive_live_daemon(runtime_daemon, &mut child).await
+}
+
+async fn run_live(
+    db_path: PathBuf,
+    dist_dir: PathBuf,
+    sandbox_root: PathBuf,
+    sandbox_backend: crate::commands::sandbox::Backend,
+    agent_yaml: PathBuf,
+    args: RunArgs,
+) -> anyhow::Result<RuntimeSessionSummary> {
+    println!("cybersind: auto-starting (state: {})", db_path.display());
+    let daemon = DaemonHandle::auto_start(&db_path).await?;
+    let session_id = args
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("sess-{}", now_unix_ms()));
+    ensure_fresh_session_id(daemon.storage().as_ref(), &session_id).await?;
+
+    let spec = live_run_spec_from_agent(&dist_dir, &agent_yaml, &args)?;
+    ingest_dist_for_session(daemon.storage().as_ref(), &dist_dir, &session_id).await?;
+    record_live_run_spec(daemon.storage().as_ref(), &session_id, &spec).await?;
+
+    println!(
+        "spawning harness: session={session_id} agent={} command={:?} (adapter={})",
+        spec.agent_name, spec.meta.harness.command, spec.meta.harness.adapter
+    );
+
+    let (mut runtime_daemon, mut child) = prepare_live_daemon(
+        daemon,
+        spec.clone(),
+        sandbox_root,
+        sandbox_backend,
+        session_id.clone(),
+    )
+    .await?;
     // A harness that crashes immediately closes its stdin/stdout out from
     // under the channel before we've necessarily observed its exit status,
     // so a send/recv here can fail with a raw transport error (e.g. a
     // broken pipe) instead of the more useful "the process died" signal.
     // Any time a channel operation on this session errors, prefer the
     // child's actual exit status over the raw transport error.
-    if let Err(err) = runtime_daemon.start_session(inputs).await {
+    if let Err(err) = runtime_daemon.start_session(spec.inputs.clone()).await {
         return Err(harness_crash_or(&mut child, err.into()).await);
     }
+    drive_live_daemon(runtime_daemon, &mut child).await
+}
 
+async fn drive_live_daemon(
+    runtime_daemon: cybersin_runtime::RuntimeDaemon<Box<dyn DaemonChannel>>,
+    child: &mut Child,
+) -> anyhow::Result<RuntimeSessionSummary> {
     // `runtime_daemon.run()` is driven inline via `select!`, not
     // `tokio::spawn`ed onto its own task: `GrpcDaemonChannel` (tonic's
     // `Streaming<T>` inside it) is `Send` but not `Sync`, and
@@ -410,7 +714,7 @@ async fn run_live(
                     let _ = child.wait().await;
                     summary
                 }
-                Err(err) => return Err(harness_crash_or(&mut child, err.into()).await),
+                Err(err) => return Err(harness_crash_or(child, err.into()).await),
             }
         }
         status = child.wait() => {
@@ -486,6 +790,10 @@ async fn run_builtin_starter(
         .as_ref()
         .map(LocalConfigFile::model_allowlist)
         .unwrap_or_else(ModelAllowlist::allow_all);
+    let retry_policy = local_config
+        .as_ref()
+        .map(LocalConfigFile::retry_policy)
+        .unwrap_or_default();
     let executor = tool_executor::configured_executor_with_local_config(
         &dist_dir,
         &sandbox_root,
@@ -515,6 +823,7 @@ async fn run_builtin_starter(
         agent_name,
     )
     .with_models(model_caller, allowlist)
+    .with_retry_policy(retry_policy)
     .with_tool_caller(tool_caller);
 
     runtime_daemon.start_session(inputs.clone()).await?;

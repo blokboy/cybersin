@@ -328,9 +328,13 @@ async fn main() -> ExitCode {
                     Ok(v) => v,
                     Err(e) => return from_async(Err(e)),
                 };
-            let dist = match resolve_dist(dist, &defaults) {
-                Ok(v) => v,
-                Err(e) => return from_async(Err(e)),
+            let dist = if args.is_resume() {
+                PathBuf::new()
+            } else {
+                match resolve_dist(dist, &defaults) {
+                    Ok(v) => v,
+                    Err(e) => return from_async(Err(e)),
+                }
             };
             from_async(commands::run::execute(db, dist, sandbox_root, sandbox_backend, args).await)
         }

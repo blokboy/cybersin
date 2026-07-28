@@ -8,6 +8,8 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use serde_json::json;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -62,6 +64,107 @@ tools: []
     .unwrap();
 }
 
+fn write_scripted_llm_agent(project: &std::path::Path, session_id: &str) {
+    std::fs::create_dir_all(project.join("agents")).unwrap();
+    std::fs::write(
+        project.join("scenario.script.yaml"),
+        r#"
+- llm_request:
+    prompt_name: researcher
+    inputs: { topic: retry schedule, depth: quick, documents: [] }
+"#,
+    )
+    .unwrap();
+    let harness_bin = env!("CARGO_BIN_EXE_scripted_harness");
+    std::fs::write(
+        project.join("agents/retry.agent.yaml"),
+        format!(
+            r#"
+name: retry-agent
+harness:
+  adapter: process
+  command: ["{harness_bin}", "scenario.script.yaml"]
+budget:
+  usd_per_session: 1.00
+  on_breach: degrade
+tools: []
+"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("input.json"),
+        format!(r#"{{"session_id":"{session_id}"}}"#),
+    )
+    .unwrap();
+}
+
+async fn run_flaky_retry_scenario(backoff_base_ms: u64, session_id: &str) -> Vec<Instant> {
+    let server = MockServer::start().await;
+    let attempts = Arc::new(Mutex::new(0_usize));
+    let request_times = Arc::new(Mutex::new(Vec::new()));
+    let responder_attempts = attempts.clone();
+    let responder_times = request_times.clone();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(move |_: &wiremock::Request| {
+            let mut attempts = responder_attempts.lock().unwrap();
+            *attempts += 1;
+            responder_times.lock().unwrap().push(Instant::now());
+            if *attempts == 1 {
+                ResponseTemplate::new(500)
+                    .set_body_string("temporary provider failure")
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{
+                        "message": {
+                            "content": "{\"summary\":\"retry recovered\", \"__cascade_confidence\": 0.99}"
+                        }
+                    }]
+                }))
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    copy_dir(fixture_dist(), &project.join("dist"));
+    write_scripted_llm_agent(&project, session_id);
+    std::fs::write(
+        project.join("cybersin.local.yaml"),
+        format!(
+            r#"
+providers:
+  openrouter:
+    api_key: ${{OPENROUTER_API_KEY}}
+    base_url: {}
+retry:
+  max_attempts: 2
+  backoff_base_ms: {backoff_base_ms}
+  backoff_cap_ms: 2000
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+
+    cybersin()
+        .current_dir(&project)
+        .env("OPENROUTER_API_KEY", "test-key")
+        .arg("run")
+        .arg("--session-id")
+        .arg(session_id)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("completed"));
+
+    let times = request_times.lock().unwrap().clone();
+    times
+}
+
 #[test]
 fn a_harness_process_that_exits_early_produces_a_clear_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -94,6 +197,22 @@ tools: []
         .failure()
         .stderr(predicate::str::contains("exited unexpectedly"))
         .stderr(predicate::str::contains("code 3"));
+}
+
+#[tokio::test]
+async fn local_retry_config_changes_a_flaky_run_attempt_schedule() {
+    let fast_times = run_flaky_retry_scenario(1, "sess-retry-fast").await;
+    let slow_times = run_flaky_retry_scenario(1000, "sess-retry-slow").await;
+
+    assert_eq!(fast_times.len(), 2);
+    assert_eq!(slow_times.len(), 2);
+    let fast_gap = fast_times[1].duration_since(fast_times[0]);
+    let slow_gap = slow_times[1].duration_since(slow_times[0]);
+
+    assert!(
+        slow_gap > fast_gap + Duration::from_millis(150),
+        "expected retry config to change attempt pacing; fast={fast_gap:?} slow={slow_gap:?}"
+    );
 }
 
 #[test]

@@ -8,9 +8,10 @@
 //! routed from a hand-written [`crate::dist::DistFixture`] (spec §14's M1:
 //! "stub agent runs on a hand-written dist/").
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use cybersin_adapter::channel::DaemonChannel;
 use cybersin_adapter::messages::{AbortReason, CallOutcome, DaemonMessage, HarnessMessage};
 use cybersin_ir::{BudgetArtifact, BudgetPlan, PromptIr, Section};
@@ -24,10 +25,32 @@ use crate::dist::DistFixture;
 use crate::error::RuntimeError;
 use crate::model_caller::{StubJudge, StubModelCaller};
 use crate::route_executor::{
-    cache_key, default_model, CacheEntry, ExecutionRequest, ModelCaller, RouteExecutor,
+    cache_key, default_model, CacheEntry, ExecutionRequest, ModelCaller, ModelRetryAttemptEvent,
+    RetryEventRecorder, RouteExecutor, RouteExecutorError, RouteRetryPolicy,
 };
-use crate::storage::{Storage, ToolCallRecord};
+use crate::storage::{EventRecord, Storage, ToolCallRecord};
 use crate::tool_caller::{StubToolCaller, ToolCaller, ToolOutput};
+
+struct StorageRetryEventRecorder {
+    storage: Arc<dyn Storage>,
+}
+
+#[async_trait]
+impl RetryEventRecorder for StorageRetryEventRecorder {
+    async fn record_attempt(
+        &self,
+        session_id: &str,
+        event: &ModelRetryAttemptEvent,
+    ) -> Result<(), RouteExecutorError> {
+        let payload = serde_json::to_value(event)
+            .map_err(|error| RouteExecutorError::RetryEvent(error.to_string()))?;
+        self.storage
+            .append_event(session_id, "model.retry_attempt", payload)
+            .await
+            .map_err(|error| RouteExecutorError::RetryEvent(error.to_string()))?;
+        Ok(())
+    }
+}
 
 /// Estimated token count for `text`: a whitespace-token heuristic, not a
 /// real tokenizer. This issue's stub agent needs *a* number to price
@@ -306,6 +329,7 @@ pub struct RuntimeDaemon<C> {
     session_id: String,
     agent_name: String,
     route_executor: RouteExecutor<Box<dyn ModelCaller>, StubJudge>,
+    retry_policy: RouteRetryPolicy,
     next_span_seq: u64,
     completed: bool,
     /// Session-level `usd_per_session` budget (spec §8.5). `None` means
@@ -333,6 +357,54 @@ pub struct RuntimeDaemon<C> {
     /// pre-issue-#35-Phase-3 behavior.
     tool_caller: Box<dyn ToolCaller>,
     heartbeat_holder: String,
+    replay_frontier: Option<ReplayFrontier>,
+}
+
+struct ReplayFrontier {
+    checkpoint_label: Option<String>,
+    events: VecDeque<EventRecord>,
+}
+
+fn skip_replay_noise(events: &mut VecDeque<EventRecord>) {
+    while events
+        .front()
+        .is_some_and(|event| !matches!(event.kind.as_str(), "llm.call" | "tool.call"))
+    {
+        events.pop_front();
+    }
+}
+
+fn outcome_to_json(outcome: &CallOutcome) -> Value {
+    match outcome {
+        CallOutcome::Ok { value } => serde_json::json!({ "status": "ok", "value": value }),
+        CallOutcome::Failed { reason, retriable } => {
+            serde_json::json!({ "status": "failed", "reason": reason, "retriable": retriable })
+        }
+    }
+}
+
+fn outcome_from_event(payload: &Value) -> CallOutcome {
+    match payload.get("outcome") {
+        Some(outcome) if outcome["status"].as_str() == Some("failed") => CallOutcome::Failed {
+            reason: outcome["reason"].as_str().unwrap_or_default().to_string(),
+            retriable: outcome["retriable"].as_bool().unwrap_or(false),
+        },
+        Some(outcome) if outcome["status"].as_str() == Some("ok") => CallOutcome::Ok {
+            value: outcome.get("value").cloned().unwrap_or(Value::Null),
+        },
+        _ if payload.get("approval_resolved").and_then(Value::as_str) == Some("succeeded") => {
+            CallOutcome::Ok {
+                value: payload.get("result").cloned().unwrap_or(Value::Null),
+            }
+        }
+        _ if payload.get("error").is_some() => CallOutcome::Failed {
+            reason: payload["error"].as_str().unwrap_or_default().to_string(),
+            retriable: false,
+        },
+        _ => CallOutcome::Ok {
+            value: payload.get("result").cloned().unwrap_or(Value::Null),
+        },
+    }
 }
 
 impl<C: DaemonChannel> RuntimeDaemon<C> {
@@ -350,7 +422,11 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             Box::new(StubModelCaller) as Box<dyn ModelCaller>,
             StubJudge,
             spans.clone(),
-        );
+        )
+        .with_retry_event_recorder(Arc::new(StorageRetryEventRecorder {
+            storage: storage.clone(),
+        }));
+        let retry_policy = RouteRetryPolicy::default();
         Self {
             channel,
             storage,
@@ -359,6 +435,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             session_id: session_id.into(),
             agent_name: agent_name.into(),
             route_executor,
+            retry_policy,
             next_span_seq: 0,
             completed: false,
             budget: None,
@@ -367,6 +444,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             session_sandbox: None,
             tool_caller: Box::new(StubToolCaller) as Box<dyn ToolCaller>,
             heartbeat_holder: crate::default_heartbeat_holder(),
+            replay_frontier: None,
         }
     }
 
@@ -412,7 +490,21 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             StubJudge,
             self.spans.clone(),
         )
-        .with_allowlist(allowlist);
+        .with_allowlist(allowlist)
+        .with_retry_policy(self.retry_policy)
+        .with_retry_event_recorder(Arc::new(StorageRetryEventRecorder {
+            storage: self.storage.clone(),
+        }));
+        self
+    }
+
+    /// Override the route executor's bounded transient retry policy. The
+    /// policy is kept on the daemon as well as the executor because
+    /// [`RuntimeDaemon::with_models`] rebuilds the executor when live model
+    /// calling is attached.
+    pub fn with_retry_policy(mut self, retry_policy: RouteRetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self.route_executor.set_retry_policy(retry_policy);
         self
     }
 
@@ -482,6 +574,27 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         Ok(())
     }
 
+    /// Push the opening protocol message for a durable session that has
+    /// already been restored by [`crate::SessionSupervisor`]. Unlike
+    /// [`RuntimeDaemon::start_session`], this does not create a new
+    /// session or append `session.started`; the existing event log remains
+    /// continuous and receives its `session.resumed` event from the
+    /// supervisor before this method is called.
+    pub async fn start_resumed_session(
+        &mut self,
+        inputs: Value,
+        resume_state: Value,
+    ) -> Result<(), RuntimeError> {
+        self.channel
+            .send(DaemonMessage::SessionStart {
+                session_id: self.session_id.clone(),
+                inputs,
+                resume_state: Some(resume_state),
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn write_heartbeat(&self) -> Result<(), RuntimeError> {
         self.storage
             .write_session_heartbeat(&self.session_id, now_unix_ms(), &self.heartbeat_holder)
@@ -538,8 +651,11 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 call_id,
                 tool,
                 args,
-                ..
-            } => self.handle_tool_request(call_id, tool, args).await,
+                idem_key,
+            } => {
+                self.handle_tool_request(call_id, tool, args, idem_key)
+                    .await
+            }
             HarnessMessage::SessionComplete { result, .. } => {
                 self.storage
                     .append_event(&self.session_id, "session.completed", result)
@@ -925,13 +1041,159 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         }
     }
 
+    async fn replay_frontier(&mut self) -> Result<&mut ReplayFrontier, RuntimeError> {
+        if self.replay_frontier.is_none() {
+            let checkpoint = self.storage.latest_checkpoint(&self.session_id).await?;
+            let (checkpoint_label, checkpoint_seq) = checkpoint
+                .map(|checkpoint| (checkpoint.label, checkpoint.event_seq))
+                .unwrap_or((None, 0));
+            let events = self
+                .storage
+                .load_events(&self.session_id)
+                .await?
+                .into_iter()
+                .filter(|event| event.seq > checkpoint_seq)
+                .collect();
+            self.replay_frontier = Some(ReplayFrontier {
+                checkpoint_label,
+                events,
+            });
+        }
+        Ok(self.replay_frontier.as_mut().expect("initialized above"))
+    }
+
+    async fn replay_checkpoint_covers(&mut self, label: &str) -> Result<bool, RuntimeError> {
+        let frontier = self.replay_frontier().await?;
+        Ok(frontier.checkpoint_label.take().as_deref() == Some(label))
+    }
+
+    async fn try_replay_llm_call(
+        &mut self,
+        call_id: &str,
+        prompt_name: &str,
+        inputs: &Value,
+    ) -> Result<bool, RuntimeError> {
+        let frontier = self.replay_frontier().await?;
+        skip_replay_noise(&mut frontier.events);
+        let Some(event) = frontier.events.front() else {
+            return Ok(false);
+        };
+        if event.kind != "llm.call"
+            || event.payload["prompt_name"].as_str() != Some(prompt_name)
+            || event
+                .payload
+                .get("inputs")
+                .is_some_and(|recorded| recorded != inputs)
+        {
+            return Ok(false);
+        }
+        let event = frontier.events.pop_front().expect("front checked above");
+        self.channel
+            .send(DaemonMessage::CallResult {
+                call_id: call_id.to_string(),
+                outcome: CallOutcome::Ok {
+                    value: event.payload["response"].clone(),
+                },
+            })
+            .await?;
+        Ok(true)
+    }
+
+    async fn try_replay_tool_call(
+        &mut self,
+        harness_call_id: &str,
+        tool: &str,
+        args: &Value,
+        idem_key: Option<&str>,
+    ) -> Result<bool, RuntimeError> {
+        let frontier = self.replay_frontier().await?;
+        skip_replay_noise(&mut frontier.events);
+        if let Some(event) = frontier.events.front() {
+            if event.kind == "tool.call"
+                && event.payload["tool"].as_str() == Some(tool)
+                && event
+                    .payload
+                    .get("args")
+                    .is_none_or(|recorded| recorded == args)
+                && event
+                    .payload
+                    .get("idem_key")
+                    .is_none_or(|recorded| recorded.as_str() == idem_key)
+            {
+                let event = frontier.events.pop_front().expect("front checked above");
+                self.channel
+                    .send(DaemonMessage::CallResult {
+                        call_id: harness_call_id.to_string(),
+                        outcome: outcome_from_event(&event.payload),
+                    })
+                    .await?;
+                return Ok(true);
+            }
+        }
+
+        let ledger_key = idem_key
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{}:{harness_call_id}", self.session_id));
+        let ledger_call_id = format!("{tool}:{ledger_key}");
+        let Some(row) = self.storage.get_tool_call(&ledger_call_id).await? else {
+            return Ok(false);
+        };
+        match row.status.as_str() {
+            "succeeded" => {
+                self.channel
+                    .send(DaemonMessage::CallResult {
+                        call_id: harness_call_id.to_string(),
+                        outcome: CallOutcome::Ok {
+                            value: row.result.unwrap_or(Value::Null),
+                        },
+                    })
+                    .await?;
+                Ok(true)
+            }
+            "failed" => {
+                self.channel
+                    .send(DaemonMessage::CallResult {
+                        call_id: harness_call_id.to_string(),
+                        outcome: CallOutcome::Failed {
+                            reason: row.failure_reason.unwrap_or_default(),
+                            retriable: row.retriable.unwrap_or(false),
+                        },
+                    })
+                    .await?;
+                Ok(true)
+            }
+            "pending" if row.retry_class == "critical" => {
+                self.storage
+                    .set_session_status(&self.session_id, "awaiting_dead_letter")
+                    .await?;
+                self.channel
+                    .send(DaemonMessage::CallParked {
+                        call_id: harness_call_id.to_string(),
+                        approval_id: row.call_id,
+                    })
+                    .await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     async fn handle_llm_request(
         &mut self,
         call_id: String,
         prompt_name: String,
         inputs: Value,
     ) -> Result<u32, RuntimeError> {
-        self.create_checkpoint(Some("pre-llm")).await?;
+        if self
+            .try_replay_llm_call(&call_id, &prompt_name, &inputs)
+            .await?
+        {
+            return Ok(0);
+        }
+
+        if !self.replay_checkpoint_covers("pre-llm").await? {
+            self.create_checkpoint(Some("pre-llm")).await?;
+        }
 
         match self.enforce_session_budget(&call_id, &prompt_name).await? {
             BudgetOutcome::Proceed => {}
@@ -1057,6 +1319,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                     "usage_source": event_usage_source,
                     "evicted_sections": assembled.evicted_sections,
                     "evicted_live_sections": assembled.evicted_live_sections,
+                    "inputs": inputs.clone(),
                     "response": response.response,
                 }),
             )
@@ -1094,8 +1357,18 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         call_id: String,
         tool: String,
         args: Value,
+        idem_key: Option<String>,
     ) -> Result<u32, RuntimeError> {
-        self.create_checkpoint(Some("pre-tool")).await?;
+        if self
+            .try_replay_tool_call(&call_id, &tool, &args, idem_key.as_deref())
+            .await?
+        {
+            return Ok(0);
+        }
+
+        if !self.replay_checkpoint_covers("pre-tool").await? {
+            self.create_checkpoint(Some("pre-tool")).await?;
+        }
 
         // A critical-class call with `approval: required` parks the
         // session (spec §8.2) instead of running immediately. Tools with
@@ -1130,7 +1403,13 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         // retry`/`approve`/`deny` already have.
         let call_result = self
             .tool_caller
-            .call(&self.session_id, &call_id, &tool, &args)
+            .call(
+                &self.session_id,
+                &call_id,
+                idem_key.as_deref(),
+                &tool,
+                &args,
+            )
             .await;
 
         let (retries, usd_cost, span_status, event_payload, outcome) = match call_result {
@@ -1138,22 +1417,47 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 value,
                 retries,
                 usd_cost,
-            }) => (
-                retries,
-                usd_cost,
-                SpanStatus::Ok,
-                serde_json::json!({ "tool": tool, "retries": retries, "usd_cost": usd_cost }),
-                CallOutcome::Ok { value },
-            ),
-            Err(crate::tool_caller::ToolCallFailure { reason, retriable }) => (
-                0,
-                0.0,
-                SpanStatus::Error {
-                    message: reason.clone(),
-                },
-                serde_json::json!({ "tool": tool, "error": reason }),
-                CallOutcome::Failed { reason, retriable },
-            ),
+            }) => {
+                let outcome = CallOutcome::Ok { value };
+                (
+                    retries,
+                    usd_cost,
+                    SpanStatus::Ok,
+                    serde_json::json!({
+                    "tool": tool.clone(),
+                    "args": args.clone(),
+                    "idem_key": idem_key.clone(),
+                        "retries": retries,
+                        "usd_cost": usd_cost,
+                        "outcome": outcome_to_json(&outcome),
+                    }),
+                    outcome,
+                )
+            }
+            Err(crate::tool_caller::ToolCallFailure { reason, retriable }) => {
+                let outcome = CallOutcome::Failed { reason, retriable };
+                (
+                    0,
+                    0.0,
+                    SpanStatus::Error {
+                        message: match &outcome {
+                            CallOutcome::Failed { reason, .. } => reason.clone(),
+                            _ => unreachable!(),
+                        },
+                    },
+                    serde_json::json!({
+                    "tool": tool.clone(),
+                    "args": args.clone(),
+                    "idem_key": idem_key.clone(),
+                        "error": match &outcome {
+                            CallOutcome::Failed { reason, .. } => reason,
+                            _ => unreachable!(),
+                        },
+                        "outcome": outcome_to_json(&outcome),
+                    }),
+                    outcome,
+                )
+            }
         };
 
         self.emit_span(
@@ -1223,6 +1527,20 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
                 "tool.call",
                 serde_json::json!({
                     "tool": tool, "usd_cost": usd_cost, "approval_resolved": row.status,
+                    "args": row.args.clone(),
+                    "result": row.result.clone(),
+                    "outcome": if succeeded {
+                        serde_json::json!({
+                            "status": "ok",
+                            "value": row.result.clone().unwrap_or(Value::Null),
+                        })
+                    } else {
+                        serde_json::json!({
+                            "status": "failed",
+                            "reason": row.failure_reason.clone().unwrap_or_default(),
+                            "retriable": row.retriable.unwrap_or(false),
+                        })
+                    },
                 }),
             )
             .await?;
@@ -1288,8 +1606,171 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use cybersin_adapter::stub_harness::{CallOutcomeOrPark, StubHarness};
+    use cybersin_adapter::transport::stdio::{in_memory_pair, StdioHarnessChannel};
     use cybersin_ir::EvictionStep;
+    use cybersin_router::RouteModel;
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use crate::allowlist::ModelAllowlist;
+    use crate::route_executor::{ModelCallError, ModelOutput};
+    use crate::{SqliteStorage, ToolCallFailure};
+
+    type TestHarness =
+        StubHarness<StdioHarnessChannel<tokio::io::DuplexStream, tokio::io::DuplexStream>>;
+
+    struct CountingModelCaller {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelCaller for CountingModelCaller {
+        async fn call(
+            &self,
+            model: &RouteModel,
+            prompt_name: &str,
+            _inputs: &Value,
+            _confidence_instruction: Option<&str>,
+            _grounded: bool,
+        ) -> Result<ModelOutput, ModelCallError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ModelOutput {
+                response: serde_json::json!({
+                    "text": format!("live {prompt_name}"),
+                    "model": model.name,
+                }),
+                confidence: 1.0,
+                usage: None,
+            })
+        }
+    }
+
+    struct FlakyModelCaller {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelCaller for FlakyModelCaller {
+        async fn call(
+            &self,
+            model: &RouteModel,
+            prompt_name: &str,
+            _inputs: &Value,
+            _confidence_instruction: Option<&str>,
+            _grounded: bool,
+        ) -> Result<ModelOutput, ModelCallError> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt < 3 {
+                return Err(ModelCallError::transient(format!(
+                    "transient attempt {attempt}"
+                )));
+            }
+            Ok(ModelOutput {
+                response: serde_json::json!({
+                    "text": format!("recovered {prompt_name}"),
+                    "model": model.name,
+                }),
+                confidence: 1.0,
+                usage: None,
+            })
+        }
+    }
+
+    struct CountingToolCaller {
+        calls: Arc<AtomicUsize>,
+        idem_keys: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl ToolCaller for CountingToolCaller {
+        async fn call(
+            &self,
+            _session_id: &str,
+            _call_id: &str,
+            idem_key: Option<&str>,
+            tool: &str,
+            _args: &Value,
+        ) -> Result<ToolOutput, ToolCallFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.idem_keys
+                .lock()
+                .unwrap()
+                .push(idem_key.map(str::to_owned));
+            Ok(ToolOutput {
+                value: serde_json::json!({ "tool": tool, "status": "live" }),
+                retries: 0,
+                usd_cost: 0.0008,
+            })
+        }
+    }
+
+    fn test_dist() -> Arc<DistFixture> {
+        Arc::new(DistFixture::load_dir(crate::bundled_stub_dist_dir()).unwrap())
+    }
+
+    async fn checkpointed_session(
+        storage: &dyn Storage,
+        session_id: &str,
+        dist: &DistFixture,
+        label: &str,
+    ) {
+        storage
+            .create_session_pinned(session_id, "agent", &dist.manifest.build_hash)
+            .await
+            .unwrap();
+        storage
+            .append_event(
+                session_id,
+                "session.started",
+                serde_json::json!({ "inputs": {} }),
+            )
+            .await
+            .unwrap();
+        storage
+            .create_checkpoint(session_id, Some(label))
+            .await
+            .unwrap();
+    }
+
+    async fn run_restarted_daemon(
+        storage: Arc<dyn Storage>,
+        spans: SpanStore,
+        dist: Arc<DistFixture>,
+        session_id: &str,
+        model_calls: Arc<AtomicUsize>,
+        tool_calls: Arc<AtomicUsize>,
+        tool_idem_keys: Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    ) -> (
+        TestHarness,
+        tokio::task::JoinHandle<Result<RuntimeSessionSummary, RuntimeError>>,
+    ) {
+        let (harness_io, daemon_io) = in_memory_pair();
+        let daemon = RuntimeDaemon::new(daemon_io, storage, spans, dist, session_id, "agent")
+            .with_models(
+                CountingModelCaller { calls: model_calls },
+                ModelAllowlist::allow_all(),
+            )
+            .with_tool_caller(CountingToolCaller {
+                calls: tool_calls,
+                idem_keys: tool_idem_keys,
+            });
+        (StubHarness::new(harness_io), tokio::spawn(daemon.run()))
+    }
+
+    async fn finish(
+        harness: &mut TestHarness,
+        task: tokio::task::JoinHandle<Result<RuntimeSessionSummary, RuntimeError>>,
+        session_id: &str,
+    ) {
+        harness
+            .session_complete(session_id, serde_json::json!({ "status": "ok" }))
+            .await;
+        harness.wait_for_close().await;
+        task.await.unwrap().unwrap();
+    }
 
     fn sample_prompt() -> PromptIr {
         PromptIr::new(
@@ -1495,5 +1976,374 @@ mod tests {
         // here, but the fallback is by name, not position).
         let unknown = assemble_context(&prompt, &[], Some(&budget), "anthropic");
         assert!(unknown.evicted_sections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replayed_model_response_after_checkpoint_is_not_reinferred() {
+        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let dist = test_dist();
+        checkpointed_session(storage.as_ref(), "sess-llm-replay", &dist, "pre-llm").await;
+        storage
+            .append_event(
+                "sess-llm-replay",
+                "llm.call",
+                serde_json::json!({
+                    "prompt_name": "researcher",
+                    "inputs": { "topic": "cybernetics" },
+                    "response": { "text": "recorded response" },
+                }),
+            )
+            .await
+            .unwrap();
+
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tool_idem_keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut harness, task) = run_restarted_daemon(
+            storage,
+            spans,
+            dist,
+            "sess-llm-replay",
+            model_calls.clone(),
+            tool_calls,
+            tool_idem_keys,
+        )
+        .await;
+
+        let (_call_id, outcome) = harness
+            .llm_request("researcher", serde_json::json!({ "topic": "cybernetics" }))
+            .await;
+        assert_eq!(
+            outcome,
+            CallOutcomeOrPark::Result(CallOutcome::Ok {
+                value: serde_json::json!({ "text": "recorded response" }),
+            })
+        );
+        assert_eq!(model_calls.load(Ordering::SeqCst), 0);
+        finish(&mut harness, task, "sess-llm-replay").await;
+    }
+
+    #[tokio::test]
+    async fn missing_model_response_after_checkpoint_goes_live() {
+        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let dist = test_dist();
+        checkpointed_session(storage.as_ref(), "sess-llm-live", &dist, "pre-llm").await;
+
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tool_idem_keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut harness, task) = run_restarted_daemon(
+            storage,
+            spans,
+            dist,
+            "sess-llm-live",
+            model_calls.clone(),
+            tool_calls,
+            tool_idem_keys,
+        )
+        .await;
+
+        let (_call_id, outcome) = harness
+            .llm_request("researcher", serde_json::json!({ "topic": "cybernetics" }))
+            .await;
+        assert!(matches!(
+            outcome,
+            CallOutcomeOrPark::Result(CallOutcome::Ok { .. })
+        ));
+        assert!(
+            model_calls.load(Ordering::SeqCst) > 0,
+            "a genuine post-checkpoint gap should issue the model route live"
+        );
+        finish(&mut harness, task, "sess-llm-live").await;
+    }
+
+    #[tokio::test]
+    async fn retry_attempt_schedule_can_be_read_back_from_session_event_log() {
+        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let dist = test_dist();
+        checkpointed_session(storage.as_ref(), "sess-llm-retry-log", &dist, "pre-llm").await;
+
+        let (harness_io, daemon_io) = in_memory_pair();
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let daemon = RuntimeDaemon::new(
+            daemon_io,
+            storage.clone(),
+            spans,
+            dist,
+            "sess-llm-retry-log",
+            "agent",
+        )
+        .with_models(
+            FlakyModelCaller {
+                calls: model_calls.clone(),
+            },
+            ModelAllowlist::allow_all(),
+        )
+        .with_retry_policy(RouteRetryPolicy {
+            max_attempts: 3,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(1),
+        });
+        let task = tokio::spawn(async move { daemon.run().await });
+        let mut harness = StubHarness::new(harness_io);
+
+        let (_call_id, outcome) = harness
+            .llm_request("researcher", serde_json::json!({ "topic": "cybernetics" }))
+            .await;
+
+        assert!(matches!(
+            outcome,
+            CallOutcomeOrPark::Result(CallOutcome::Ok { .. })
+        ));
+        assert!(model_calls.load(Ordering::SeqCst) >= 3);
+        let events = storage.load_events("sess-llm-retry-log").await.unwrap();
+        let retry_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == "model.retry_attempt")
+            .collect();
+        assert!(retry_events.len() >= 3);
+        assert_eq!(retry_events[0].payload["prompt_name"], "researcher");
+        assert_eq!(retry_events[0].payload["attempt"], 1);
+        assert_eq!(retry_events[0].payload["error_class"], "transient");
+        assert!(
+            retry_events[0].payload["computed_delay_ms"]
+                .as_u64()
+                .unwrap()
+                <= 1
+        );
+        assert_eq!(retry_events[0].payload["outcome"], "retrying");
+        assert_eq!(retry_events[2].payload["attempt"], 3);
+        assert_eq!(retry_events[2].payload["error_class"], Value::Null);
+        assert_eq!(retry_events[2].payload["computed_delay_ms"], Value::Null);
+        assert_eq!(retry_events[2].payload["outcome"], "escalation");
+        let success = retry_events
+            .iter()
+            .find(|event| event.payload["outcome"] == "success")
+            .expect("event log records the attempt that completed the logical call");
+        assert_eq!(success.payload["error_class"], Value::Null);
+        assert_eq!(success.payload["computed_delay_ms"], Value::Null);
+        finish(&mut harness, task, "sess-llm-retry-log").await;
+    }
+
+    #[tokio::test]
+    async fn completed_tool_event_after_checkpoint_is_not_reexecuted() {
+        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let dist = test_dist();
+        checkpointed_session(storage.as_ref(), "sess-tool-event", &dist, "pre-tool").await;
+        storage
+            .append_event(
+                "sess-tool-event",
+                "tool.call",
+                serde_json::json!({
+                    "tool": "web_search",
+                    "args": { "query": "cybernetics" },
+                    "idem_key": "search-1",
+                    "outcome": {
+                        "status": "ok",
+                        "value": { "result": "recorded tool" }
+                    },
+                }),
+            )
+            .await
+            .unwrap();
+
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tool_idem_keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut harness, task) = run_restarted_daemon(
+            storage,
+            spans,
+            dist,
+            "sess-tool-event",
+            model_calls,
+            tool_calls.clone(),
+            tool_idem_keys,
+        )
+        .await;
+
+        let (_call_id, outcome) = harness
+            .tool_request(
+                "web_search",
+                serde_json::json!({ "query": "cybernetics" }),
+                Some("search-1".to_string()),
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            CallOutcomeOrPark::Result(CallOutcome::Ok {
+                value: serde_json::json!({ "result": "recorded tool" }),
+            })
+        );
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        finish(&mut harness, task, "sess-tool-event").await;
+    }
+
+    #[tokio::test]
+    async fn completed_tool_ledger_row_after_checkpoint_is_not_reexecuted() {
+        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let dist = test_dist();
+        checkpointed_session(storage.as_ref(), "sess-tool-ledger", &dist, "pre-tool").await;
+        storage
+            .begin_tool_call(
+                "web_search:search-1",
+                "sess-tool-ledger",
+                "web_search",
+                "search-1",
+                "read",
+                &serde_json::json!({ "query": "cybernetics" }),
+            )
+            .await
+            .unwrap();
+        storage
+            .resolve_tool_call_succeeded(
+                "web_search:search-1",
+                serde_json::json!({ "result": "ledger tool" }),
+            )
+            .await
+            .unwrap();
+
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tool_idem_keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut harness, task) = run_restarted_daemon(
+            storage,
+            spans,
+            dist,
+            "sess-tool-ledger",
+            model_calls,
+            tool_calls.clone(),
+            tool_idem_keys,
+        )
+        .await;
+
+        let (_call_id, outcome) = harness
+            .tool_request(
+                "web_search",
+                serde_json::json!({ "query": "cybernetics" }),
+                Some("search-1".to_string()),
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            CallOutcomeOrPark::Result(CallOutcome::Ok {
+                value: serde_json::json!({ "result": "ledger tool" }),
+            })
+        );
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        finish(&mut harness, task, "sess-tool-ledger").await;
+    }
+
+    #[tokio::test]
+    async fn unfinished_read_and_write_tool_calls_resume_by_ledger_class() {
+        for (session_id, retry_class) in [("sess-read", "read"), ("sess-write", "write")] {
+            let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
+            let spans = SpanStore::in_memory().await.unwrap();
+            let dist = test_dist();
+            checkpointed_session(storage.as_ref(), session_id, &dist, "pre-tool").await;
+            storage
+                .begin_tool_call(
+                    "web_search:search-1",
+                    session_id,
+                    "web_search",
+                    "search-1",
+                    retry_class,
+                    &serde_json::json!({ "query": "cybernetics" }),
+                )
+                .await
+                .unwrap();
+
+            let model_calls = Arc::new(AtomicUsize::new(0));
+            let tool_calls = Arc::new(AtomicUsize::new(0));
+            let tool_idem_keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (mut harness, task) = run_restarted_daemon(
+                storage,
+                spans,
+                dist,
+                session_id,
+                model_calls,
+                tool_calls.clone(),
+                tool_idem_keys.clone(),
+            )
+            .await;
+
+            let (_call_id, outcome) = harness
+                .tool_request(
+                    "web_search",
+                    serde_json::json!({ "query": "cybernetics" }),
+                    Some("search-1".to_string()),
+                )
+                .await;
+            assert!(matches!(
+                outcome,
+                CallOutcomeOrPark::Result(CallOutcome::Ok { .. })
+            ));
+            assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                tool_idem_keys.lock().unwrap().as_slice(),
+                &[Some("search-1".to_string())]
+            );
+            finish(&mut harness, task, session_id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unfinished_critical_tool_call_is_parked_not_refired() {
+        let storage: Arc<dyn Storage> = Arc::new(SqliteStorage::in_memory().await.unwrap());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let dist = test_dist();
+        checkpointed_session(storage.as_ref(), "sess-critical", &dist, "pre-tool").await;
+        storage
+            .begin_tool_call(
+                "web_search:search-1",
+                "sess-critical",
+                "web_search",
+                "search-1",
+                "critical",
+                &serde_json::json!({ "query": "cybernetics" }),
+            )
+            .await
+            .unwrap();
+
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tool_idem_keys = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut harness, task) = run_restarted_daemon(
+            storage.clone(),
+            spans,
+            dist,
+            "sess-critical",
+            model_calls,
+            tool_calls.clone(),
+            tool_idem_keys,
+        )
+        .await;
+
+        let (_call_id, outcome) = harness
+            .tool_request(
+                "web_search",
+                serde_json::json!({ "query": "cybernetics" }),
+                Some("search-1".to_string()),
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            CallOutcomeOrPark::Parked("web_search:search-1".to_string())
+        );
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            storage
+                .get_session("sess-critical")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "awaiting_dead_letter"
+        );
+        finish(&mut harness, task, "sess-critical").await;
     }
 }

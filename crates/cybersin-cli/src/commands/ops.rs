@@ -565,6 +565,8 @@ async fn run_agents(
                 agent_yaml: Some(agent_yaml.clone()),
                 stub: false,
                 session_id: None,
+                resume: None,
+                force: false,
                 agent: None,
                 input: None,
             },
