@@ -52,34 +52,8 @@ sources and build output empty until you add them.
 Preview the scaffold first:
 
 ```sh
-cybersin init myagent --dry-run
+cybersin init myagent
 ```
-
-The dry run reports exactly what would be written:
-
-```sh
-would scaffold cybersin project spine at myagent
-created:
-  cybersin.yaml
-  cybersin.lock
-  cybersin.local.example.yaml
-  .gitignore
-  prompts
-  fragments
-  evals
-  agents
-  tools
-skipped: none
-```
-
-Create the files:
-
-```sh
-mkdir myagent
-cd myagent
-cybersin init .
-```
-
 The scaffold is intentionally minimal:
 
 ```text
@@ -98,6 +72,16 @@ myagent/
 Plain `init` is safe for an existing codebase: existing files are skipped and
 reported in the command output. Use `--force` only when you intentionally want
 to overwrite scaffold files.
+
+```sh
+cat > .env <<'EOF'
+OPENROUTER_API_KEY=...
+EOF
+```
+
+Create `.env` before running `cybersin setup` if you want the setup readiness
+report to pass on the first try. The golden path commands stay the same; the
+key is local machine input, not a portable project file.
 
 ### Run the Golden Path
 
@@ -137,16 +121,6 @@ permissions:
 ```
 
 Put the actual key in your shell or in the project `.env`:
-
-```sh
-cat > .env <<'EOF'
-OPENROUTER_API_KEY=...
-EOF
-```
-
-Create `.env` before running `cybersin setup` if you want the setup readiness
-report to pass on the first try. The golden path commands stay the same; the
-key is local machine input, not a portable project file.
 
 `cybersin.local.yaml` and `.env` are gitignored by the scaffold. Raw secrets in
 local YAML are a deliberate opt-in in the local-config model; the current
