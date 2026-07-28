@@ -14,6 +14,7 @@ use std::fmt::Write as _;
 use crate::commands::build::{self, BuildProfile, BuildProgress};
 
 pub const BUILD_CAPABILITY_ID: &str = "compile.build";
+pub const BUILD_WATCH_CAPABILITY_ID: &str = "compile.build.watch";
 pub const CHECK_CAPABILITY_ID: &str = "compile.check";
 pub const SCAFFOLD_PROMPT_AGENT_CAPABILITY_ID: &str = "compile.scaffold-prompt-agent";
 pub const SCAFFOLD_BUILD_WORKFLOW_ID: &str = "workflow.scaffold-build";
@@ -171,6 +172,9 @@ pub enum CapabilityEvent {
     Failed {
         message: String,
     },
+    Interrupted {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,6 +208,30 @@ impl BuildInput {
 
     pub fn with_selected_prompt_source(mut self, source: impl Into<PathBuf>) -> Self {
         self.selected_prompt_source = Some(source.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildWatchInput {
+    pub project_path: PathBuf,
+    pub profile: BuildProfile,
+    pub frozen: bool,
+    pub max_builds: Option<u32>,
+}
+
+impl BuildWatchInput {
+    pub fn new(project_path: impl Into<PathBuf>, profile: BuildProfile, frozen: bool) -> Self {
+        Self {
+            project_path: project_path.into(),
+            profile,
+            frozen,
+            max_builds: None,
+        }
+    }
+
+    pub fn with_max_builds(mut self, max_builds: u32) -> Self {
+        self.max_builds = Some(max_builds);
         self
     }
 }
@@ -361,6 +389,167 @@ pub fn execute_build_with_progress(
     }
 
     CapabilityExecution::new(events)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapabilityEventFlow {
+    Continue,
+    Interrupt { message: String },
+}
+
+pub fn execute_build_watch(input: BuildWatchInput) -> CapabilityExecution {
+    execute_build_watch_with_events(input, |_| CapabilityEventFlow::Continue)
+}
+
+pub fn execute_build_watch_with_events(
+    input: BuildWatchInput,
+    mut on_event: impl FnMut(&CapabilityEvent) -> CapabilityEventFlow,
+) -> CapabilityExecution {
+    let mut execution = StreamingCapabilityExecution::new(&mut on_event);
+
+    if !execution.emit(CapabilityEvent::Started {
+        capability_id: CapabilityId::new(BUILD_WATCH_CAPABILITY_ID),
+    }) {
+        return execution.finish();
+    }
+
+    let mut last = match build::watched_snapshot(&input.project_path) {
+        Ok(snapshot) => snapshot,
+        Err(message) => {
+            execution.emit(CapabilityEvent::Failed { message });
+            return execution.finish();
+        }
+    };
+
+    if !execution.emit(CapabilityEvent::Progress {
+        message: format!("watching {}", input.project_path.display()),
+        current: Some(0),
+        total: input.max_builds.map(u64::from),
+    }) {
+        return execution.finish();
+    }
+
+    let mut builds = 0u32;
+    loop {
+        if !run_build_watch_iteration(&input, &mut execution, builds + 1) {
+            return execution.finish();
+        }
+        builds += 1;
+
+        if let Some(max) = input.max_builds {
+            if builds >= max {
+                execution.emit(CapabilityEvent::Completed {
+                    value: Some(json!({
+                        "project_path": input.project_path.display().to_string(),
+                        "profile": build_profile_name(input.profile),
+                        "frozen": input.frozen,
+                        "builds": builds,
+                        "message": format!("build watch stopped after {builds} build(s)"),
+                    })),
+                });
+                return execution.finish();
+            }
+        }
+
+        loop {
+            std::thread::sleep(build::WATCH_POLL_INTERVAL);
+            let snapshot = match build::watched_snapshot(&input.project_path) {
+                Ok(snapshot) => snapshot,
+                Err(message) => {
+                    execution.emit(CapabilityEvent::Failed { message });
+                    return execution.finish();
+                }
+            };
+            if snapshot != last {
+                last = snapshot;
+                if !execution.emit(CapabilityEvent::Progress {
+                    message: "source change detected; rebuilding".to_string(),
+                    current: Some(builds as u64),
+                    total: input.max_builds.map(u64::from),
+                }) {
+                    return execution.finish();
+                }
+                break;
+            }
+        }
+    }
+}
+
+fn run_build_watch_iteration<F>(
+    input: &BuildWatchInput,
+    execution: &mut StreamingCapabilityExecution<'_, F>,
+    build_number: u32,
+) -> bool
+where
+    F: FnMut(&CapabilityEvent) -> CapabilityEventFlow,
+{
+    if !execution.emit(CapabilityEvent::Progress {
+        message: format!("starting build {build_number}"),
+        current: Some((build_number - 1) as u64),
+        total: input.max_builds.map(u64::from),
+    }) {
+        return false;
+    }
+
+    let build = execute_build_with_progress(
+        BuildInput::new(&input.project_path, input.profile, input.frozen),
+        |progress| {
+            let _ = execution.emit(build_progress_event(progress));
+        },
+    );
+
+    for event in build.events {
+        if matches!(event, CapabilityEvent::Progress { .. }) {
+            continue;
+        }
+        if !execution.emit(event) {
+            return false;
+        }
+    }
+
+    true
+}
+
+struct StreamingCapabilityExecution<'a, F>
+where
+    F: FnMut(&CapabilityEvent) -> CapabilityEventFlow,
+{
+    events: Vec<CapabilityEvent>,
+    on_event: &'a mut F,
+    interrupted: bool,
+}
+
+impl<'a, F> StreamingCapabilityExecution<'a, F>
+where
+    F: FnMut(&CapabilityEvent) -> CapabilityEventFlow,
+{
+    fn new(on_event: &'a mut F) -> Self {
+        Self {
+            events: Vec::new(),
+            on_event,
+            interrupted: false,
+        }
+    }
+
+    fn emit(&mut self, event: CapabilityEvent) -> bool {
+        if self.interrupted {
+            return false;
+        }
+        self.events.push(event);
+        let last = self.events.last().expect("just pushed event");
+        match (self.on_event)(last) {
+            CapabilityEventFlow::Continue => true,
+            CapabilityEventFlow::Interrupt { message } => {
+                self.interrupted = true;
+                self.events.push(CapabilityEvent::Interrupted { message });
+                false
+            }
+        }
+    }
+
+    fn finish(self) -> CapabilityExecution {
+        CapabilityExecution::new(self.events)
+    }
 }
 
 pub fn execute_scaffold_prompt_agent(input: ScaffoldPromptAgentInput) -> CapabilityExecution {
@@ -612,6 +801,7 @@ pub fn build_summary(events: &[CapabilityEvent]) -> Option<Result<String, String
                 return Some(Ok(message.as_str()?.to_string()));
             }
             CapabilityEvent::Failed { message } => return Some(Err(message.clone())),
+            CapabilityEvent::Interrupted { message } => return Some(Err(message.clone())),
             _ => {}
         }
     }
@@ -743,6 +933,7 @@ pub fn trace_ls_result(events: &[CapabilityEvent]) -> Option<Result<(), String>>
         match event {
             CapabilityEvent::Completed { .. } => return Some(Ok(())),
             CapabilityEvent::Failed { message } => return Some(Err(message.clone())),
+            CapabilityEvent::Interrupted { message } => return Some(Err(message.clone())),
             _ => {}
         }
     }
@@ -883,6 +1074,7 @@ pub fn check_summary(events: &[CapabilityEvent]) -> Option<Result<String, String
                 return Some(Ok(format!("cybersin check: {sources} source(s) ok")));
             }
             CapabilityEvent::Failed { message } => return Some(Err(message.clone())),
+            CapabilityEvent::Interrupted { message } => return Some(Err(message.clone())),
             _ => {}
         }
     }
@@ -943,7 +1135,7 @@ pub fn registry() -> CapabilityRegistry {
     CapabilityRegistry::new(vec![
         build_spec(),
         spec(
-            "compile.build.watch",
+            BUILD_WATCH_CAPABILITY_ID,
             "Watch build",
             "Compile once, then rebuild when project sources change.",
             CapabilityCategory::Compile,
@@ -1672,6 +1864,9 @@ mod tests {
             CapabilityEvent::Failed {
                 message: "storage unavailable".to_string(),
             },
+            CapabilityEvent::Interrupted {
+                message: "user interrupted".to_string(),
+            },
         ];
 
         assert!(matches!(
@@ -1704,6 +1899,7 @@ mod tests {
         ));
         assert!(matches!(events[4], CapabilityEvent::Completed { .. }));
         assert!(matches!(events[5], CapabilityEvent::Failed { .. }));
+        assert!(matches!(events[6], CapabilityEvent::Interrupted { .. }));
     }
 
     #[test]
