@@ -2,13 +2,11 @@
 //! operations control room. The interactive and plain renderers share one
 //! view model so redirected output remains useful and testable.
 
-use std::collections::BTreeMap;
-use std::fs;
 use std::io::{self, IsTerminal};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Args;
 use crossterm::cursor::Show;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -16,11 +14,6 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use cybersin_backends::{backend_for, RenderedPrompt};
-use cybersin_ir::PromptIr;
-use cybersin_router::{RouteDecision, RouteModel, RoutingArtifact};
-use cybersin_runtime::{DaemonHandle, ModelAllowlist, SessionRecord, ToolPolicy};
-use cybersin_trace::{CostDimension, CostRollupRow, Span, SpanFilter, SpanKind};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -28,6 +21,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
 use ratatui::Terminal;
 
+use crate::capabilities::{execute_explain_snapshot, ExplainInput, ExplainSnapshot};
 use crate::session_liveness::{display_liveness, heartbeat_display, holder_display, now_unix_ms};
 
 #[derive(Debug, Args)]
@@ -42,36 +36,10 @@ pub struct ExplainArgs {
     pub plain: bool,
 }
 
-#[derive(Debug)]
-struct TargetTokens {
-    target: String,
-    sections: Vec<(String, usize)>,
-}
-
-#[derive(Debug)]
-struct ExplainModel {
-    prompt: String,
-    targets: Vec<TargetTokens>,
-    tools: Vec<(String, ToolPolicy)>,
-    routing: Vec<String>,
-    estimated_cost: f64,
-    /// The first candidate this environment's `cybersin.local.yaml`
-    /// allowlist would actually let a real run reach, computed at
-    /// `explain`-invocation time rather than baked into `dist/` — issue
-    /// #35 Phase 1: `dist/routing.json` stays portable across
-    /// environments, but cost visibility before a run should reflect what
-    /// *this* environment can actually call. `None` means every candidate
-    /// in this project's routing is disallowed here.
-    effective: Option<(String, f64)>,
-    observed_cost: f64,
-    observed_calls: usize,
-    sessions: Vec<SessionRecord>,
-    spans: Vec<Span>,
-    costs: Vec<CostRollupRow>,
-}
+type ExplainModel = ExplainSnapshot;
 
 pub async fn execute(db: PathBuf, args: ExplainArgs) -> Result<()> {
-    let daemon = DaemonHandle::auto_start(db).await?;
+    let daemon = cybersin_runtime::DaemonHandle::auto_start(db).await?;
     let model = ExplainModel::load(&args.path, &args.prompt, &daemon).await?;
     if args.plain || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         print!("{}", model.plain_report());
@@ -81,123 +49,12 @@ pub async fn execute(db: PathBuf, args: ExplainArgs) -> Result<()> {
 }
 
 impl ExplainModel {
-    async fn load(project: &Path, prompt_name: &str, daemon: &DaemonHandle) -> Result<Self> {
-        let prompt_path = project
-            .join("dist")
-            .join("prompts")
-            .join(format!("{prompt_name}.json"));
-        let prompt: PromptIr = read_json(&prompt_path).with_context(|| {
-            format!(
-                "compiled prompt {:?} not found; run `cybersin build {}` first",
-                prompt_name,
-                project.display()
-            )
-        })?;
-        let tools_path = project.join("dist").join("tools.json");
-        let policies: BTreeMap<String, ToolPolicy> = if tools_path.is_file() {
-            read_json(&tools_path)?
-        } else {
-            BTreeMap::new()
-        };
-        let tools = prompt
-            .tools
-            .iter()
-            .filter_map(|name| {
-                policies
-                    .get(name)
-                    .cloned()
-                    .map(|policy| (name.clone(), policy))
-            })
-            .collect();
-
-        let target_dir = project.join("dist").join("prompts").join(prompt_name);
-        let mut rendered_targets = Vec::new();
-        let entries = fs::read_dir(&target_dir).with_context(|| {
-            format!(
-                "rendered targets for {:?} not found; run `cybersin build {}` first",
-                prompt_name,
-                project.display()
-            )
-        })?;
-        for entry in entries {
-            let path = entry?.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let rendered: RenderedPrompt = read_json(&path)
-                .with_context(|| format!("reading backend output {}", path.display()))?;
-            rendered_targets.push(rendered.target);
-        }
-        rendered_targets.sort();
-        rendered_targets.dedup();
-        if rendered_targets.is_empty() {
-            anyhow::bail!("compiled prompt {prompt_name:?} has no rendered backend targets");
-        }
-
-        let mut targets = Vec::new();
-        for target in rendered_targets {
-            let backend = backend_for(&target).map_err(anyhow::Error::msg)?;
-            let mut sections = Vec::new();
-            for section in &prompt.sections {
-                let tokens = if section.dedup_ref.is_some() {
-                    0
-                } else {
-                    let mut section_prompt = prompt.clone();
-                    section_prompt.sections = vec![section.clone()];
-                    backend
-                        .render(&section_prompt)
-                        .map_err(anyhow::Error::msg)?
-                        .messages
-                        .iter()
-                        .map(|message| message.content.split_whitespace().count())
-                        .sum()
-                };
-                sections.push((section.id.clone(), tokens));
-            }
-            targets.push(TargetTokens { target, sections });
-        }
-
-        let routing_artifact: RoutingArtifact =
-            read_json(&project.join("dist").join("routing.json"))
-                .context("reading real dist/routing.json")?;
-        let route = routing_artifact
-            .prompts
-            .get(prompt_name)
-            .with_context(|| format!("routing.json has no route for prompt {prompt_name:?}"))?;
-        let (routing, estimated_cost) = render_route(&route.decisions);
-        let allowlist = ModelAllowlist::load(project).with_context(|| {
-            format!("reading {}", project.join("cybersin.local.yaml").display())
-        })?;
-        let effective = effective_first_candidate(&route.decisions, &allowlist)
-            .map(|model| (describe_model(&model), model.estimated_cost_usd));
-
-        let all_spans = daemon
-            .spans()
-            .list(&SpanFilter {
-                limit: Some(1_000),
-                ..SpanFilter::default()
-            })
-            .await?;
-        let observed = all_spans
-            .iter()
-            .filter(|span| span.kind == SpanKind::LlmCall && span.name == prompt_name)
-            .collect::<Vec<_>>();
-        let observed_cost = observed.iter().map(|span| span.usd_cost).sum();
-        let observed_calls = observed.len();
-
-        Ok(Self {
-            prompt: prompt.name,
-            targets,
-            tools,
-            routing,
-            estimated_cost,
-            effective,
-            observed_cost,
-            observed_calls,
-            sessions: daemon.storage().list_sessions().await?,
-            spans: all_spans.into_iter().take(25).collect(),
-            costs: daemon.spans().cost_rollup(CostDimension::Model).await?,
-        })
+    async fn load(
+        project: &std::path::Path,
+        prompt_name: &str,
+        daemon: &cybersin_runtime::DaemonHandle,
+    ) -> Result<Self> {
+        execute_explain_snapshot(daemon, ExplainInput::new(project, prompt_name)).await
     }
 
     fn explain_text(&self) -> String {
@@ -334,97 +191,6 @@ limits=cpu:{},mem_mb:{},wall_s:{}\n",
     }
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
-}
-
-fn describe_model(model: &RouteModel) -> String {
-    format!(
-        "{} ({}, {:?}) — estimated ${:.6}",
-        model.name, model.provider, model.quality, model.estimated_cost_usd
-    )
-}
-
-fn render_route(decisions: &[RouteDecision]) -> (Vec<String>, f64) {
-    let mut lines = Vec::new();
-    let mut estimated = 0.0_f64;
-    for decision in decisions {
-        match decision {
-            RouteDecision::Cache(cache) => {
-                lines.push(format!(
-                    "├─ cache ≥ {:.2}; judge {:.2}..{:.2}: {}",
-                    cache.similarity_threshold,
-                    cache.judge_trigger_band[0],
-                    cache.judge_trigger_band[1],
-                    describe_model(&cache.judge)
-                ));
-            }
-            RouteDecision::Cascade(cascade) => {
-                lines.push("├─ cascade".into());
-                for (index, step) in cascade.steps.iter().enumerate() {
-                    let branch = if index + 1 == cascade.steps.len() {
-                        "└─"
-                    } else {
-                        "├─"
-                    };
-                    lines.push(format!(
-                        "│  {branch} {} (accept ≥ {:.2})",
-                        describe_model(&step.model),
-                        step.confidence.minimum_score
-                    ));
-                    estimated += step.model.estimated_cost_usd;
-                }
-            }
-            RouteDecision::Fallbacks(fallbacks) => {
-                lines.push("└─ provider fallbacks".into());
-                for provider in &fallbacks.providers {
-                    lines.push(format!("   └─ {}", describe_model(provider)));
-                }
-            }
-        }
-    }
-    (lines, estimated)
-}
-
-/// The first candidate a real run would actually reach in this
-/// environment: walk cascade steps then provider fallbacks in order,
-/// skipping anything `allowlist` disallows — the same skip
-/// `RouteExecutor::execute` applies at call time (issue #35 Phase 1), just
-/// simulated here instead of executed. Cache decisions are a zero-cost
-/// early exit that don't call a model at all, so they're not part of
-/// "effective candidate" — same reasoning `RouteExecutor` uses (they're
-/// not gated by the allowlist either).
-fn effective_first_candidate(
-    decisions: &[RouteDecision],
-    allowlist: &ModelAllowlist,
-) -> Option<RouteModel> {
-    for decision in decisions {
-        match decision {
-            RouteDecision::Cache(_) => {}
-            RouteDecision::Cascade(cascade) => {
-                if let Some(step) = cascade
-                    .steps
-                    .iter()
-                    .find(|step| allowlist.allows(&step.model))
-                {
-                    return Some(step.model.clone());
-                }
-            }
-            RouteDecision::Fallbacks(fallbacks) => {
-                if let Some(model) = fallbacks
-                    .providers
-                    .iter()
-                    .find(|model| allowlist.allows(model))
-                {
-                    return Some(model.clone());
-                }
-            }
-        }
-    }
-    None
-}
-
 fn run_tui(model: &ExplainModel) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -449,12 +215,7 @@ fn tui_loop(
     model: &ExplainModel,
 ) -> Result<()> {
     let titles = ["Explain", "Sessions", "Traces", "Cost"];
-    let pages = [
-        model.explain_text(),
-        model.sessions_text(),
-        model.traces_text(),
-        model.costs_text(),
-    ];
+    let pages = explain_tui_pages(model);
     let mut selected = 0;
     loop {
         terminal.draw(|frame| {
@@ -500,5 +261,50 @@ fn tui_loop(
                 }
             }
         }
+    }
+}
+
+fn explain_tui_pages(model: &ExplainModel) -> [String; 4] {
+    [
+        model.explain_text(),
+        model.sessions_text(),
+        model.traces_text(),
+        model.costs_text(),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capabilities::execute_explain_snapshot;
+
+    fn fixture_project() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/ic1-research-team")
+            .canonicalize()
+            .expect("fixture project should exist")
+    }
+
+    #[tokio::test]
+    async fn plain_and_tui_pages_consume_the_explain_capability_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("explain-capability.db");
+        let daemon = cybersin_runtime::DaemonHandle::auto_start(&db)
+            .await
+            .unwrap();
+        let project = fixture_project();
+
+        let direct = execute_explain_snapshot(&daemon, ExplainInput::new(&project, "researcher"))
+            .await
+            .unwrap();
+        let command_model = ExplainModel::load(&project, "researcher", &daemon)
+            .await
+            .unwrap();
+
+        assert_eq!(command_model.plain_report(), direct.plain_report());
+        assert_eq!(
+            explain_tui_pages(&command_model),
+            explain_tui_pages(&direct)
+        );
     }
 }

@@ -4,20 +4,29 @@
 //! modules are CLI adapters, while these types describe the shared product
 //! surface that CLI and TUI adapters will eventually invoke.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cybersin_trace::{Span, SpanFilter, SpanStore};
+use anyhow::{Context, Result};
+use cybersin_backends::{backend_for, RenderedPrompt};
+use cybersin_ir::PromptIr;
+use cybersin_router::{RouteDecision, RouteModel, RoutingArtifact};
+use cybersin_runtime::{DaemonHandle, ModelAllowlist, SessionRecord, ToolCallRecord, ToolPolicy};
+use cybersin_trace::{CostDimension, CostRollupRow, Span, SpanFilter, SpanKind, SpanStore};
 use serde_json::{json, Value};
 use std::fmt::Write as _;
 
 use crate::commands::build::{self, BuildProfile, BuildProgress};
+use crate::harness_config::AgentMeta;
 
 pub const BUILD_CAPABILITY_ID: &str = "compile.build";
 pub const CHECK_CAPABILITY_ID: &str = "compile.check";
 pub const SCAFFOLD_PROMPT_AGENT_CAPABILITY_ID: &str = "compile.scaffold-prompt-agent";
 pub const SCAFFOLD_BUILD_WORKFLOW_ID: &str = "workflow.scaffold-build";
 pub const TRACE_LS_CAPABILITY_ID: &str = "inspection.trace.ls";
+pub const EXPLAIN_CAPABILITY_ID: &str = "inspection.explain";
+pub const OPS_CAPABILITY_ID: &str = "control.ops";
 
 /// A user-facing operation that can be invoked through one or more adapters.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,6 +279,200 @@ impl CapabilityExecution {
             .iter()
             .any(|event| matches!(event, CapabilityEvent::Completed { .. }))
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplainInput {
+    pub project_path: PathBuf,
+    pub prompt_name: String,
+}
+
+impl ExplainInput {
+    pub fn new(project_path: impl Into<PathBuf>, prompt_name: impl Into<String>) -> Self {
+        Self {
+            project_path: project_path.into(),
+            prompt_name: prompt_name.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ExplainTargetTokens {
+    pub target: String,
+    pub sections: Vec<(String, usize)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExplainSnapshot {
+    pub prompt: String,
+    pub targets: Vec<ExplainTargetTokens>,
+    pub tools: Vec<(String, ToolPolicy)>,
+    pub routing: Vec<String>,
+    pub estimated_cost: f64,
+    pub effective: Option<(String, f64)>,
+    pub observed_cost: f64,
+    pub observed_calls: usize,
+    pub sessions: Vec<SessionRecord>,
+    pub spans: Vec<Span>,
+    pub costs: Vec<CostRollupRow>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OpsSnapshot {
+    pub builds: Vec<OpsBuild>,
+    pub sessions: Vec<SessionRecord>,
+    pub spans: Vec<Span>,
+    pub costs: Vec<CostRollupRow>,
+    pub approvals: Vec<ToolCallRecord>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OpsBuild {
+    pub name: String,
+    pub path: PathBuf,
+    pub build_hash_short: Option<String>,
+}
+
+pub async fn execute_explain_snapshot(
+    daemon: &DaemonHandle,
+    input: ExplainInput,
+) -> Result<ExplainSnapshot> {
+    let project = input.project_path;
+    let prompt_name = input.prompt_name;
+    let prompt_path = project
+        .join("dist")
+        .join("prompts")
+        .join(format!("{prompt_name}.json"));
+    let prompt: PromptIr = read_json(&prompt_path).with_context(|| {
+        format!(
+            "compiled prompt {:?} not found; run `cybersin build {}` first",
+            prompt_name,
+            project.display()
+        )
+    })?;
+    let tools_path = project.join("dist").join("tools.json");
+    let policies: BTreeMap<String, ToolPolicy> = if tools_path.is_file() {
+        read_json(&tools_path)?
+    } else {
+        BTreeMap::new()
+    };
+    let tools = prompt
+        .tools
+        .iter()
+        .filter_map(|name| {
+            policies
+                .get(name)
+                .cloned()
+                .map(|policy| (name.clone(), policy))
+        })
+        .collect();
+
+    let target_dir = project.join("dist").join("prompts").join(&prompt_name);
+    let mut rendered_targets = Vec::new();
+    let entries = fs::read_dir(&target_dir).with_context(|| {
+        format!(
+            "rendered targets for {:?} not found; run `cybersin build {}` first",
+            prompt_name,
+            project.display()
+        )
+    })?;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let rendered: RenderedPrompt = read_json(&path)
+            .with_context(|| format!("reading backend output {}", path.display()))?;
+        rendered_targets.push(rendered.target);
+    }
+    rendered_targets.sort();
+    rendered_targets.dedup();
+    if rendered_targets.is_empty() {
+        anyhow::bail!("compiled prompt {prompt_name:?} has no rendered backend targets");
+    }
+
+    let mut targets = Vec::new();
+    for target in rendered_targets {
+        let backend = backend_for(&target).map_err(anyhow::Error::msg)?;
+        let mut sections = Vec::new();
+        for section in &prompt.sections {
+            let tokens = if section.dedup_ref.is_some() {
+                0
+            } else {
+                let mut section_prompt = prompt.clone();
+                section_prompt.sections = vec![section.clone()];
+                backend
+                    .render(&section_prompt)
+                    .map_err(anyhow::Error::msg)?
+                    .messages
+                    .iter()
+                    .map(|message| message.content.split_whitespace().count())
+                    .sum()
+            };
+            sections.push((section.id.clone(), tokens));
+        }
+        targets.push(ExplainTargetTokens { target, sections });
+    }
+
+    let routing_artifact: RoutingArtifact = read_json(&project.join("dist").join("routing.json"))
+        .context("reading real dist/routing.json")?;
+    let route = routing_artifact
+        .prompts
+        .get(&prompt_name)
+        .with_context(|| format!("routing.json has no route for prompt {prompt_name:?}"))?;
+    let (routing, estimated_cost) = render_route(&route.decisions);
+    let allowlist = ModelAllowlist::load(&project)
+        .with_context(|| format!("reading {}", project.join("cybersin.local.yaml").display()))?;
+    let effective = effective_first_candidate(&route.decisions, &allowlist)
+        .map(|model| (describe_model(&model), model.estimated_cost_usd));
+
+    let all_spans = daemon
+        .spans()
+        .list(&SpanFilter {
+            limit: Some(1_000),
+            ..SpanFilter::default()
+        })
+        .await?;
+    let observed = all_spans
+        .iter()
+        .filter(|span| span.kind == SpanKind::LlmCall && span.name == prompt_name)
+        .collect::<Vec<_>>();
+    let observed_cost = observed.iter().map(|span| span.usd_cost).sum();
+    let observed_calls = observed.len();
+
+    Ok(ExplainSnapshot {
+        prompt: prompt.name,
+        targets,
+        tools,
+        routing,
+        estimated_cost,
+        effective,
+        observed_cost,
+        observed_calls,
+        sessions: daemon.storage().list_sessions().await?,
+        spans: all_spans.into_iter().take(25).collect(),
+        costs: daemon.spans().cost_rollup(CostDimension::Model).await?,
+    })
+}
+
+pub async fn execute_ops_snapshot(
+    daemon: &DaemonHandle,
+    project_root: &Path,
+) -> Result<OpsSnapshot> {
+    let spans = daemon
+        .spans()
+        .list(&SpanFilter {
+            limit: Some(1_000),
+            ..SpanFilter::default()
+        })
+        .await?;
+    Ok(OpsSnapshot {
+        builds: discover_ops_builds(project_root)?,
+        sessions: daemon.storage().list_sessions().await?,
+        costs: daemon.spans().cost_rollup(CostDimension::Model).await?,
+        spans: spans.into_iter().take(25).collect(),
+        approvals: daemon.storage().list_awaiting_approval().await?,
+    })
 }
 
 pub fn execute_build(input: BuildInput) -> CapabilityExecution {
@@ -597,6 +800,127 @@ fn display_project_path(project_root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn describe_model(model: &RouteModel) -> String {
+    format!(
+        "{} ({}, {:?}) — estimated ${:.6}",
+        model.name, model.provider, model.quality, model.estimated_cost_usd
+    )
+}
+
+fn render_route(decisions: &[RouteDecision]) -> (Vec<String>, f64) {
+    let mut lines = Vec::new();
+    let mut estimated = 0.0_f64;
+    for decision in decisions {
+        match decision {
+            RouteDecision::Cache(cache) => {
+                lines.push(format!(
+                    "├─ cache ≥ {:.2}; judge {:.2}..{:.2}: {}",
+                    cache.similarity_threshold,
+                    cache.judge_trigger_band[0],
+                    cache.judge_trigger_band[1],
+                    describe_model(&cache.judge)
+                ));
+            }
+            RouteDecision::Cascade(cascade) => {
+                lines.push("├─ cascade".into());
+                for (index, step) in cascade.steps.iter().enumerate() {
+                    let branch = if index + 1 == cascade.steps.len() {
+                        "└─"
+                    } else {
+                        "├─"
+                    };
+                    lines.push(format!(
+                        "│  {branch} {} (accept ≥ {:.2})",
+                        describe_model(&step.model),
+                        step.confidence.minimum_score
+                    ));
+                    estimated += step.model.estimated_cost_usd;
+                }
+            }
+            RouteDecision::Fallbacks(fallbacks) => {
+                lines.push("└─ provider fallbacks".into());
+                for provider in &fallbacks.providers {
+                    lines.push(format!("   └─ {}", describe_model(provider)));
+                }
+            }
+        }
+    }
+    (lines, estimated)
+}
+
+/// The first candidate a real run would actually reach in this
+/// environment: walk cascade steps then provider fallbacks in order,
+/// skipping anything `allowlist` disallows.
+fn effective_first_candidate(
+    decisions: &[RouteDecision],
+    allowlist: &ModelAllowlist,
+) -> Option<RouteModel> {
+    for decision in decisions {
+        match decision {
+            RouteDecision::Cache(_) => {}
+            RouteDecision::Cascade(cascade) => {
+                if let Some(step) = cascade
+                    .steps
+                    .iter()
+                    .find(|step| allowlist.allows(&step.model))
+                {
+                    return Some(step.model.clone());
+                }
+            }
+            RouteDecision::Fallbacks(fallbacks) => {
+                if let Some(model) = fallbacks
+                    .providers
+                    .iter()
+                    .find(|model| allowlist.allows(model))
+                {
+                    return Some(model.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn discover_ops_builds(project_root: &Path) -> Result<Vec<OpsBuild>> {
+    let build_hash_short = read_dist_build_hash(project_root).ok().map(short_hash);
+    let mut builds = Vec::new();
+    for path in build::discover_agent_sources(project_root).map_err(anyhow::Error::msg)? {
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let meta = AgentMeta::from_agent_yaml(&text)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        builds.push(OpsBuild {
+            name: meta.name,
+            path,
+            build_hash_short: build_hash_short.clone(),
+        });
+    }
+    builds.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+    Ok(builds)
+}
+
+fn read_dist_build_hash(project_root: &Path) -> Result<String> {
+    let manifest_path = project_root.join("dist/manifest.json");
+    let text = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    let manifest: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    Ok(manifest
+        .get("build_hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unbuilt")
+        .to_string())
+}
+
+fn short_hash(hash: String) -> String {
+    hash.get(..12).unwrap_or(&hash).to_string()
 }
 
 pub fn build_summary(events: &[CapabilityEvent]) -> Option<Result<String, String>> {
@@ -1094,7 +1418,7 @@ pub fn registry() -> CapabilityRegistry {
             cli(),
         ),
         spec(
-            "inspection.explain",
+            EXPLAIN_CAPABILITY_ID,
             "Explain prompt",
             "Explain compiled prompt tokens, routing, costs, sessions, traces, and tools.",
             CapabilityCategory::Inspection,
@@ -1124,7 +1448,7 @@ pub fn registry() -> CapabilityRegistry {
             cli(),
         ),
         spec(
-            "control.ops",
+            OPS_CAPABILITY_ID,
             "Open ops",
             "Inspect and interact with project sessions, traces, costs, approvals, and builds.",
             CapabilityCategory::Control,
