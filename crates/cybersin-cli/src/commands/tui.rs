@@ -1202,6 +1202,9 @@ fn render_capability_events(events: &[CapabilityEvent]) -> String {
             CapabilityEvent::Failed { message } => {
                 lines.push(format!("failed: {message}"));
             }
+            CapabilityEvent::Interrupted { message } => {
+                lines.push(format!("interrupted: {message}"));
+            }
         }
     }
     lines.join("\n")

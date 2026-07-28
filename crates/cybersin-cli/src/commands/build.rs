@@ -41,7 +41,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::capabilities::{build_summary, execute_build, BuildInput};
+use crate::capabilities::{
+    build_summary, execute_build, execute_build_watch_with_events, BuildInput, BuildWatchInput,
+    CapabilityEvent, CapabilityEventFlow, OutputMode,
+};
 use crate::git;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -810,7 +813,7 @@ fn walk_hash(
 /// polling every 300ms is simple, portable, and fast enough for a local
 /// dev loop, without adding a dependency for one feature (CLAUDE.md: no
 /// speculative generality).
-const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(300);
+pub(crate) const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Rebuild `project` once, then again every time a watched source
 /// changes, until `max_builds` rebuilds have run (`None` means forever
@@ -819,6 +822,7 @@ const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// through `on_result` as it happens rather than collected and
 /// returned, since a `--watch` invocation may run arbitrarily many
 /// builds.
+#[cfg(test)]
 pub fn watch(
     project: &Path,
     profile: BuildProfile,
@@ -853,17 +857,20 @@ pub fn watch_cli(
     profile: BuildProfile,
     frozen: bool,
 ) -> Result<Option<String>, String> {
-    watch(project, profile, frozen, None, |result| match result {
-        Ok(Some(message)) => println!("{message}"),
-        Ok(None) => {}
-        Err(message) => eprintln!("{message}"),
-    })?;
+    let execution =
+        execute_build_watch_with_events(BuildWatchInput::new(project, profile, frozen), |event| {
+            render_watch_cli_event(event);
+            CapabilityEventFlow::Continue
+        });
+    if let Some(Err(message)) = build_summary(&execution.events) {
+        return Err(message);
+    }
     Ok(None)
 }
 
 /// mtimes of everything `--watch` rebuilds on: project config, lockfile,
 /// prompts, agent declarations, and packaged tool assets.
-fn watched_snapshot(project: &Path) -> Result<BTreeMap<PathBuf, SystemTime>, String> {
+pub(crate) fn watched_snapshot(project: &Path) -> Result<BTreeMap<PathBuf, SystemTime>, String> {
     let mut snapshot = BTreeMap::new();
     for name in ["cybersin.yaml", "cybersin.lock"] {
         let path = project.join(name);
@@ -898,12 +905,37 @@ fn watched_snapshot(project: &Path) -> Result<BTreeMap<PathBuf, SystemTime>, Str
     Ok(snapshot)
 }
 
+fn render_watch_cli_event(event: &CapabilityEvent) {
+    match event {
+        CapabilityEvent::Output {
+            mode: OutputMode::Text,
+            value,
+        } => {
+            let stream = value.get("stream").and_then(serde_json::Value::as_str);
+            let text = value.get("text").and_then(serde_json::Value::as_str);
+            match (stream, text) {
+                (Some("stdout"), Some(text)) => println!("{text}"),
+                (Some("stderr"), Some(text)) => eprintln!("{text}"),
+                _ => {}
+            }
+        }
+        CapabilityEvent::Failed { message } | CapabilityEvent::Interrupted { message } => {
+            eprintln!("{message}");
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    use crate::capabilities::{build_summary, execute_build, BuildInput, CapabilityEvent};
+    use crate::capabilities::{
+        build_summary, execute_build, execute_build_watch, execute_build_watch_with_events,
+        BuildInput, BuildWatchInput, CapabilityEvent, CapabilityEventFlow, BUILD_CAPABILITY_ID,
+        BUILD_WATCH_CAPABILITY_ID,
+    };
 
     fn init_project(dir: &Path) {
         crate::commands::init::run(dir).expect("init");
@@ -1219,6 +1251,104 @@ tools:
 
         let rendered = fs::read_to_string(project.join("dist/prompts/hello/generic.json")).unwrap();
         assert!(rendered.contains("enthusiastically"));
+    }
+
+    #[test]
+    fn build_watch_capability_emits_lifecycle_output_and_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        init_project(&project);
+
+        let execution = execute_build_watch(
+            BuildWatchInput::new(&project, BuildProfile::Dev, true).with_max_builds(1),
+        );
+
+        assert!(matches!(
+            execution.events.first(),
+            Some(CapabilityEvent::Started { capability_id })
+                if capability_id.as_str() == BUILD_WATCH_CAPABILITY_ID
+        ));
+        assert!(execution.events.iter().any(|event| matches!(
+            event,
+            CapabilityEvent::Started { capability_id }
+                if capability_id.as_str() == BUILD_CAPABILITY_ID
+        )));
+        assert!(execution.events.iter().any(|event| matches!(
+            event,
+            CapabilityEvent::Progress { message, .. } if message.starts_with("watching ")
+        )));
+        assert!(execution.events.iter().any(|event| matches!(
+            event,
+            CapabilityEvent::Output { value, .. }
+                if value.get("text").and_then(serde_json::Value::as_str)
+                    == Some(format!("built {}", project.display()).as_str())
+        )));
+        assert!(matches!(
+            execution.events.last(),
+            Some(CapabilityEvent::Completed { value: Some(value) })
+                if value.get("builds").and_then(serde_json::Value::as_u64) == Some(1)
+        ));
+    }
+
+    #[test]
+    fn build_watch_capability_streams_build_failure_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_project = tmp.path().join("missing");
+
+        let execution = execute_build_watch(
+            BuildWatchInput::new(&missing_project, BuildProfile::Dev, true).with_max_builds(1),
+        );
+
+        assert!(execution.events.iter().any(|event| matches!(
+            event,
+            CapabilityEvent::Failed { message } if message.contains("failed to read")
+        )));
+        assert!(matches!(
+            execution.events.last(),
+            Some(CapabilityEvent::Completed { value: Some(value) })
+                if value.get("builds").and_then(serde_json::Value::as_u64) == Some(1)
+        ));
+    }
+
+    #[test]
+    fn build_watch_capability_can_be_interrupted_at_event_seam() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        init_project(&project);
+        let mut seen = Vec::new();
+
+        let execution = execute_build_watch_with_events(
+            BuildWatchInput::new(&project, BuildProfile::Dev, true).with_max_builds(1),
+            |event| {
+                seen.push(event.clone());
+                match event {
+                    CapabilityEvent::Progress { message, .. }
+                        if message.starts_with("watching ") =>
+                    {
+                        CapabilityEventFlow::Interrupt {
+                            message: "user interrupted build watch".to_string(),
+                        }
+                    }
+                    _ => CapabilityEventFlow::Continue,
+                }
+            },
+        );
+
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            CapabilityEvent::Started { capability_id }
+                if capability_id.as_str() == BUILD_WATCH_CAPABILITY_ID
+        )));
+        assert!(matches!(
+            execution.events.last(),
+            Some(CapabilityEvent::Interrupted { message })
+                if message == "user interrupted build watch"
+        ));
+        assert!(!execution.events.iter().any(|event| matches!(
+            event,
+            CapabilityEvent::Started { capability_id }
+                if capability_id.as_str() == BUILD_CAPABILITY_ID
+        )));
     }
 
     #[test]
