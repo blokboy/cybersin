@@ -558,6 +558,9 @@ fn from_blocked_capability(execution: capabilities::CapabilityExecution) -> Exit
             CapabilityEvent::Progress { message, .. } => {
                 eprintln!("capability progress: {message}")
             }
+            CapabilityEvent::Interrupted { message } => {
+                eprintln!("capability interrupted: {message}");
+            }
             CapabilityEvent::Output { .. } | CapabilityEvent::Completed { .. } => {}
         }
     }
