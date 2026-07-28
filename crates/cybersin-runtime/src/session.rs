@@ -332,6 +332,7 @@ pub struct RuntimeDaemon<C> {
     /// replaces, so `new` alone (no builder call) reproduces the exact
     /// pre-issue-#35-Phase-3 behavior.
     tool_caller: Box<dyn ToolCaller>,
+    heartbeat_holder: String,
 }
 
 impl<C: DaemonChannel> RuntimeDaemon<C> {
@@ -365,6 +366,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             halted: false,
             session_sandbox: None,
             tool_caller: Box::new(StubToolCaller) as Box<dyn ToolCaller>,
+            heartbeat_holder: crate::default_heartbeat_holder(),
         }
     }
 
@@ -480,6 +482,13 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
         Ok(())
     }
 
+    async fn write_heartbeat(&self) -> Result<(), RuntimeError> {
+        self.storage
+            .write_session_heartbeat(&self.session_id, now_unix_ms(), &self.heartbeat_holder)
+            .await?;
+        Ok(())
+    }
+
     /// Drive this session until the harness disconnects or sends
     /// `session.complete`.
     pub async fn run(mut self) -> Result<RuntimeSessionSummary, RuntimeError> {
@@ -488,6 +497,7 @@ impl<C: DaemonChannel> RuntimeDaemon<C> {
             if self.completed || self.halted {
                 break;
             }
+            self.write_heartbeat().await?;
             match self.channel.recv().await {
                 Some(msg) => spans_recorded += self.handle_message(msg).await?,
                 None => break,

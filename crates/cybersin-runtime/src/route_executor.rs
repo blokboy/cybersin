@@ -3,6 +3,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -134,6 +135,7 @@ pub struct ModelOutput {
 pub enum ModelErrorClass {
     Transient { retry_after: Option<Duration> },
     Permanent,
+    Ambiguous,
 }
 
 impl ModelErrorClass {
@@ -173,6 +175,13 @@ impl ModelCallError {
     pub fn permanent(message: impl Into<String>) -> Self {
         Self {
             class: ModelErrorClass::Permanent,
+            message: message.into(),
+        }
+    }
+
+    pub fn ambiguous(message: impl Into<String>) -> Self {
+        Self {
+            class: ModelErrorClass::Ambiguous,
             message: message.into(),
         }
     }
@@ -260,6 +269,60 @@ pub enum KnnBackend {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteRetryPolicy {
+    pub max_attempts: u32,
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+}
+
+impl Default for RouteRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(500),
+            max_delay: Duration::from_secs(60),
+        }
+    }
+}
+
+impl RouteRetryPolicy {
+    /// Pure full-jitter delay function. `attempt` is one-based for the
+    /// retry about to be slept before, and `jitter` must be in `[0.0, 1.0]`.
+    pub fn delay_for(
+        &self,
+        attempt: u32,
+        class: &ModelErrorClass,
+        jitter: f64,
+    ) -> Option<Duration> {
+        let ModelErrorClass::Transient { retry_after } = class else {
+            return None;
+        };
+        if let Some(retry_after) = retry_after {
+            return Some((*retry_after).min(self.max_delay));
+        }
+        let multiplier = 1_u128 << attempt.saturating_sub(1).min(31);
+        let uncapped = duration_mul(self.base_delay, multiplier);
+        let capped = uncapped.min(self.max_delay);
+        let jitter = jitter.clamp(0.0, 1.0);
+        Some(duration_mul_f64(capped, jitter))
+    }
+}
+
+#[async_trait]
+pub trait AsyncSleeper: Send + Sync {
+    async fn sleep(&self, delay: Duration);
+}
+
+pub struct TokioSleeper;
+
+#[async_trait]
+impl AsyncSleeper for TokioSleeper {
+    async fn sleep(&self, delay: Duration) {
+        tokio::time::sleep(delay).await;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SqliteVecEvaluation {
     pub static_linkable: bool,
     pub cross_platform: bool,
@@ -294,6 +357,8 @@ pub struct RouteExecutor<M, J> {
     /// build time — see `crate::allowlist` — so `dist/` stays portable
     /// across environments.
     allowlist: ModelAllowlist,
+    retry_policy: RouteRetryPolicy,
+    sleeper: Arc<dyn AsyncSleeper>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -314,6 +379,10 @@ pub enum RouteExecutorError {
     MissingPrompt(String),
     #[error("all route decisions were exhausted for prompt {0:?}")]
     Exhausted(String),
+    #[error(
+        "all route decisions were exhausted for prompt {prompt:?}; last errors: {last_errors}"
+    )]
+    ExhaustedWithLastErrors { prompt: String, last_errors: String },
     #[error("trace store error: {0}")]
     Trace(#[from] cybersin_trace::TraceError),
 }
@@ -333,6 +402,8 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
             judge,
             spans,
             allowlist: ModelAllowlist::allow_all(),
+            retry_policy: RouteRetryPolicy::default(),
+            sleeper: Arc::new(TokioSleeper),
         }
     }
 
@@ -340,6 +411,16 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
     /// `crate::allowlist::ModelAllowlist`.
     pub fn with_allowlist(mut self, allowlist: ModelAllowlist) -> Self {
         self.allowlist = allowlist;
+        self
+    }
+
+    pub fn with_retry_policy(mut self, retry_policy: RouteRetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
+    }
+
+    pub fn with_sleeper(mut self, sleeper: Arc<dyn AsyncSleeper>) -> Self {
+        self.sleeper = sleeper;
         self
     }
 
@@ -372,6 +453,8 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
             .prompts
             .get(&request.prompt_name)
             .ok_or_else(|| RouteExecutorError::MissingPrompt(request.prompt_name.clone()))?;
+        let mut last_cascade_error: Option<String> = None;
+        let mut last_fallback_error: Option<String> = None;
 
         for decision in &route.decisions {
             match decision {
@@ -423,8 +506,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                             continue;
                         }
                         let result = self
-                            .models
-                            .call(
+                            .call_model_with_retries(
                                 &step.model,
                                 &request.prompt_name,
                                 &request.inputs,
@@ -485,6 +567,8 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                 .await?;
                             }
                             Err(error) => {
+                                last_cascade_error =
+                                    Some(format!("{}: {}", step.model.name, error));
                                 self.record(
                                     request,
                                     SpanKind::LlmCall,
@@ -496,6 +580,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                         "decision": "cascade_error",
                                         "model": step.model.name,
                                         "error": error.to_string(),
+                                        "error_class": error_class_name(&error.class),
                                         "grounded": step.grounded,
                                     }),
                                 )
@@ -510,8 +595,13 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                             continue;
                         }
                         match self
-                            .models
-                            .call(model, &request.prompt_name, &request.inputs, None, false)
+                            .call_model_with_retries(
+                                model,
+                                &request.prompt_name,
+                                &request.inputs,
+                                None,
+                                false,
+                            )
                             .await
                         {
                             Ok(output) => {
@@ -541,6 +631,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                 });
                             }
                             Err(error) => {
+                                last_fallback_error = Some(format!("{}: {}", model.name, error));
                                 self.record(
                                     request,
                                     SpanKind::LlmCall,
@@ -552,6 +643,7 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                                         "decision": "fallback_error",
                                         "model": model.name,
                                         "error": error.to_string(),
+                                        "error_class": error_class_name(&error.class),
                                         "grounded": false,
                                     }),
                                 )
@@ -562,7 +654,56 @@ impl<M: ModelCaller, J: Judge> RouteExecutor<M, J> {
                 }
             }
         }
+        let last_errors = [
+            last_cascade_error.map(|error| format!("cascade={error}")),
+            last_fallback_error.map(|error| format!("fallback={error}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if !last_errors.is_empty() {
+            return Err(RouteExecutorError::ExhaustedWithLastErrors {
+                prompt: request.prompt_name.clone(),
+                last_errors: last_errors.join("; "),
+            });
+        }
         Err(RouteExecutorError::Exhausted(request.prompt_name.clone()))
+    }
+
+    async fn call_model_with_retries(
+        &self,
+        model: &RouteModel,
+        prompt_name: &str,
+        inputs: &Value,
+        confidence_instruction: Option<&str>,
+        grounded: bool,
+    ) -> Result<ModelOutput, ModelCallError> {
+        let mut failed_attempts = 0;
+        loop {
+            match self
+                .models
+                .call(model, prompt_name, inputs, confidence_instruction, grounded)
+                .await
+            {
+                Ok(output) => return Ok(output),
+                Err(error) => {
+                    let attempts_so_far = failed_attempts + 1;
+                    if attempts_so_far >= self.retry_policy.max_attempts {
+                        return Err(error);
+                    }
+                    let retry_attempt = failed_attempts + 1;
+                    let Some(delay) = self.retry_policy.delay_for(
+                        retry_attempt,
+                        &error.class,
+                        deterministic_jitter(model, prompt_name, retry_attempt),
+                    ) else {
+                        return Err(error);
+                    };
+                    failed_attempts += 1;
+                    self.sleeper.sleep(delay).await;
+                }
+            }
+        }
     }
 
     async fn execute_cache(
@@ -807,6 +948,39 @@ fn observed_usd_cost(usage: &Option<ModelUsage>, estimate: f64) -> f64 {
         .unwrap_or(estimate)
 }
 
+fn duration_mul(duration: Duration, multiplier: u128) -> Duration {
+    let millis = duration.as_millis().saturating_mul(multiplier);
+    Duration::from_millis(millis.min(u128::from(u64::MAX)) as u64)
+}
+
+fn duration_mul_f64(duration: Duration, multiplier: f64) -> Duration {
+    Duration::from_secs_f64(duration.as_secs_f64() * multiplier)
+}
+
+fn deterministic_jitter(model: &RouteModel, prompt_name: &str, attempt: u32) -> f64 {
+    let mut hasher = Sha256::new();
+    hasher.update(model.provider.as_bytes());
+    hasher.update([0]);
+    hasher.update(model.name.as_bytes());
+    hasher.update([0]);
+    hasher.update(prompt_name.as_bytes());
+    hasher.update([0]);
+    hasher.update(attempt.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    let value = u64::from_le_bytes(bytes);
+    value as f64 / u64::MAX as f64
+}
+
+fn error_class_name(class: &ModelErrorClass) -> &'static str {
+    match class {
+        ModelErrorClass::Transient { .. } => "transient",
+        ModelErrorClass::Permanent => "permanent",
+        ModelErrorClass::Ambiguous => "ambiguous",
+    }
+}
+
 fn cosine_similarity(left: &[f32], right: &[f32]) -> Option<f64> {
     if left.is_empty() || left.len() != right.len() {
         return None;
@@ -875,7 +1049,9 @@ fn canonicalize(value: &Value) -> Value {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
     use std::sync::Mutex;
 
     use cybersin_ir::QualityTier;
@@ -928,6 +1104,73 @@ mod tests {
                     usd_cost: Some(0.00042),
                 }),
             })
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum ScriptedOutcome {
+        Answer { confidence: f64 },
+        Transient(&'static str),
+        TransientRetryAfter(&'static str, Duration),
+        Permanent(&'static str),
+        Ambiguous(&'static str),
+    }
+
+    #[derive(Default)]
+    struct ScriptedCalls {
+        outcomes: Mutex<VecDeque<ScriptedOutcome>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedCalls {
+        fn new(outcomes: impl IntoIterator<Item = ScriptedOutcome>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelCaller for ScriptedCalls {
+        async fn call(
+            &self,
+            model: &RouteModel,
+            _prompt_name: &str,
+            _inputs: &Value,
+            _confidence_instruction: Option<&str>,
+            _grounded: bool,
+        ) -> Result<ModelOutput, ModelCallError> {
+            self.calls.lock().unwrap().push(model.name.clone());
+            let outcome = self
+                .outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted outcome");
+            match outcome {
+                ScriptedOutcome::Answer { confidence } => Ok(ModelOutput {
+                    response: serde_json::json!({"from": model.name}),
+                    confidence,
+                    usage: None,
+                }),
+                ScriptedOutcome::Transient(message) => Err(ModelCallError::transient(message)),
+                ScriptedOutcome::TransientRetryAfter(message, delay) => {
+                    Err(ModelCallError::transient_with_retry_after(message, delay))
+                }
+                ScriptedOutcome::Permanent(message) => Err(ModelCallError::permanent(message)),
+                ScriptedOutcome::Ambiguous(message) => Err(ModelCallError::ambiguous(message)),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSleeper(Mutex<Vec<Duration>>);
+
+    #[async_trait]
+    impl AsyncSleeper for RecordingSleeper {
+        async fn sleep(&self, delay: Duration) {
+            self.0.lock().unwrap().push(delay);
         }
     }
 
@@ -1504,6 +1747,308 @@ mod tests {
 
         assert!(matches!(error, RouteExecutorError::Exhausted(prompt) if prompt == "answer"));
         assert!(executor.models.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retry_policy_grows_with_full_jitter_bounds_and_cap() {
+        let policy = RouteRetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::from_millis(250),
+        };
+        let class = ModelErrorClass::transient();
+
+        assert_eq!(
+            policy.delay_for(1, &class, 0.0),
+            Some(Duration::from_millis(0))
+        );
+        assert_eq!(
+            policy.delay_for(1, &class, 1.0),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            policy.delay_for(2, &class, 1.0),
+            Some(Duration::from_millis(200))
+        );
+        assert_eq!(
+            policy.delay_for(3, &class, 1.0),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            policy.delay_for(3, &class, 0.5),
+            Some(Duration::from_millis(125))
+        );
+    }
+
+    #[test]
+    fn retry_policy_uses_retry_after_exactly_but_still_caps() {
+        let policy = RouteRetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(2),
+        };
+
+        assert_eq!(
+            policy.delay_for(
+                1,
+                &ModelErrorClass::transient_with_retry_after(Duration::from_millis(750)),
+                0.0
+            ),
+            Some(Duration::from_millis(750))
+        );
+        assert_eq!(
+            policy.delay_for(
+                1,
+                &ModelErrorClass::transient_with_retry_after(Duration::from_secs(10)),
+                0.0
+            ),
+            Some(Duration::from_secs(2))
+        );
+    }
+
+    #[test]
+    fn retry_policy_never_retries_non_transient_errors() {
+        let policy = RouteRetryPolicy::default();
+
+        assert_eq!(policy.delay_for(1, &ModelErrorClass::Permanent, 1.0), None);
+        assert_eq!(policy.delay_for(1, &ModelErrorClass::Ambiguous, 1.0), None);
+    }
+
+    #[tokio::test]
+    async fn transient_cascade_failure_retries_same_model_before_escalating() {
+        let mut req = request();
+        req.bypass = true;
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let executor = RouteExecutor::new(
+            routing(),
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "v1".into(),
+                entries: vec![],
+            },
+            ScriptedCalls::new([
+                ScriptedOutcome::Transient("rate limited"),
+                ScriptedOutcome::Transient("timeout"),
+                ScriptedOutcome::Answer { confidence: 0.95 },
+            ]),
+            AcceptJudge,
+            spans,
+        )
+        .with_retry_policy(RouteRetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(100),
+        })
+        .with_sleeper(sleeper.clone());
+
+        let response = executor.execute(&req).await.unwrap();
+
+        assert_eq!(response.model.as_deref(), Some("cheap"));
+        assert_eq!(
+            *executor.models.calls.lock().unwrap(),
+            vec!["cheap", "cheap", "cheap"]
+        );
+        assert_eq!(sleeper.0.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn permanent_errors_do_not_retry() {
+        let mut req = request();
+        req.bypass = true;
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let executor = RouteExecutor::new(
+            routing(),
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "v1".into(),
+                entries: vec![],
+            },
+            ScriptedCalls::new([
+                ScriptedOutcome::Permanent("bad request"),
+                ScriptedOutcome::Answer { confidence: 0.95 },
+            ]),
+            AcceptJudge,
+            spans,
+        )
+        .with_sleeper(sleeper.clone());
+
+        let response = executor.execute(&req).await.unwrap();
+
+        assert_eq!(response.model.as_deref(), Some("strong"));
+        assert_eq!(
+            *executor.models.calls.lock().unwrap(),
+            vec!["cheap", "strong"]
+        );
+        assert!(sleeper.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn low_confidence_cascade_outcome_does_not_retry() {
+        let mut req = request();
+        req.bypass = true;
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let executor = RouteExecutor::new(
+            routing(),
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "v1".into(),
+                entries: vec![],
+            },
+            ScriptedCalls::new([
+                ScriptedOutcome::Answer { confidence: 0.4 },
+                ScriptedOutcome::Answer { confidence: 0.95 },
+            ]),
+            AcceptJudge,
+            spans,
+        )
+        .with_sleeper(sleeper.clone());
+
+        let response = executor.execute(&req).await.unwrap();
+
+        assert_eq!(response.model.as_deref(), Some("strong"));
+        assert_eq!(
+            *executor.models.calls.lock().unwrap(),
+            vec!["cheap", "strong"]
+        );
+        assert!(sleeper.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fallback_waits_until_cascade_retry_budget_is_exhausted() {
+        let mut artifact = routing();
+        let route = artifact.prompts.get_mut("answer").unwrap();
+        let RouteDecision::Cascade(cascade) = &mut route.decisions[1] else {
+            panic!("expected cascade");
+        };
+        cascade.steps.truncate(1);
+        route.decisions[2] = RouteDecision::Fallbacks(FallbackDecision {
+            providers: vec![model("backup", ModelKind::Provider)],
+        });
+
+        let mut req = request();
+        req.bypass = true;
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let executor = RouteExecutor::new(
+            artifact,
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "v1".into(),
+                entries: vec![],
+            },
+            ScriptedCalls::new([
+                ScriptedOutcome::Transient("first"),
+                ScriptedOutcome::TransientRetryAfter("second", Duration::from_millis(25)),
+                ScriptedOutcome::Transient("third"),
+                ScriptedOutcome::Answer { confidence: 0.1 },
+            ]),
+            AcceptJudge,
+            spans,
+        )
+        .with_retry_policy(RouteRetryPolicy {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(10),
+            max_delay: Duration::from_millis(50),
+        })
+        .with_sleeper(sleeper.clone());
+
+        let response = executor.execute(&req).await.unwrap();
+
+        assert_eq!(response.model.as_deref(), Some("backup"));
+        assert_eq!(
+            *executor.models.calls.lock().unwrap(),
+            vec!["cheap", "cheap", "cheap", "backup"]
+        );
+        assert_eq!(sleeper.0.lock().unwrap()[1], Duration::from_millis(25));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_model_outcome_is_not_retried_and_surfaces_for_recovery() {
+        let mut artifact = routing();
+        let route = artifact.prompts.get_mut("answer").unwrap();
+        let RouteDecision::Cascade(cascade) = &mut route.decisions[1] else {
+            panic!("expected cascade");
+        };
+        cascade.steps.truncate(1);
+        route.decisions[2] = RouteDecision::Fallbacks(FallbackDecision { providers: vec![] });
+
+        let mut req = request();
+        req.bypass = true;
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let spans = SpanStore::in_memory().await.unwrap();
+        let executor = RouteExecutor::new(
+            artifact,
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "v1".into(),
+                entries: vec![],
+            },
+            ScriptedCalls::new([ScriptedOutcome::Ambiguous(
+                "response may have been persisted",
+            )]),
+            AcceptJudge,
+            spans,
+        )
+        .with_sleeper(sleeper.clone());
+
+        let error = executor.execute(&req).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            RouteExecutorError::ExhaustedWithLastErrors {
+                prompt,
+                last_errors
+            } if prompt == "answer"
+                && last_errors.contains("cheap: response may have been persisted")
+        ));
+        assert_eq!(*executor.models.calls.lock().unwrap(), vec!["cheap"]);
+        assert!(sleeper.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_errors_name_the_last_failure_per_tier() {
+        let mut artifact = routing();
+        let route = artifact.prompts.get_mut("answer").unwrap();
+        let RouteDecision::Cascade(cascade) = &mut route.decisions[1] else {
+            panic!("expected cascade");
+        };
+        cascade.steps.truncate(1);
+        route.decisions[2] = RouteDecision::Fallbacks(FallbackDecision {
+            providers: vec![model("backup", ModelKind::Provider)],
+        });
+
+        let mut req = request();
+        req.bypass = true;
+        let spans = SpanStore::in_memory().await.unwrap();
+        let executor = RouteExecutor::new(
+            artifact,
+            CacheArtifact {
+                schema_version: 1,
+                namespace_version: "v1".into(),
+                entries: vec![],
+            },
+            ScriptedCalls::new([
+                ScriptedOutcome::Permanent("cascade stopped"),
+                ScriptedOutcome::Permanent("fallback stopped"),
+            ]),
+            AcceptJudge,
+            spans,
+        );
+
+        let error = executor.execute(&req).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            RouteExecutorError::ExhaustedWithLastErrors {
+                prompt,
+                last_errors
+            } if prompt == "answer"
+                && last_errors.contains("cascade=cheap: cascade stopped")
+                && last_errors.contains("fallback=backup: fallback stopped")
+        ));
     }
 
     #[test]

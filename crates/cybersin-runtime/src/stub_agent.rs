@@ -113,6 +113,12 @@ mod tests {
         let session = storage.get_session("sess-stub-1").await.unwrap().unwrap();
         assert_eq!(session.status, "completed");
         assert_eq!(session.agent_name, "research-agent");
+        assert!(session.last_heartbeat_unix_ms.is_some());
+        assert!(session
+            .heartbeat_holder
+            .as_deref()
+            .unwrap_or_default()
+            .contains("pid="));
 
         let recorded = spans
             .list(&SpanFilter {

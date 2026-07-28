@@ -23,6 +23,7 @@ mod git;
 mod harness_config;
 mod project;
 mod readiness;
+mod session_liveness;
 mod tool_executor;
 
 use std::path::PathBuf;

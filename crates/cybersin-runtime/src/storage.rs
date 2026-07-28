@@ -97,20 +97,25 @@ pub async fn materialize_artifact_bundle(
             ));
         }
     }
-    std::fs::create_dir_all(target_dir).map_err(|source| StorageError::Io {
-        path: target_dir.display().to_string(),
-        source,
-    })?;
+    let mut verified = Vec::with_capacity(files.len());
     for file in &files {
-        if hex_sha256(&file.bytes) != file.sha256 {
+        let actual = hex_sha256(&file.bytes);
+        if actual != file.sha256 {
             return Err(StorageError::ArtifactHashMismatch {
                 config_hash: config_hash.to_string(),
                 path: file.path.clone(),
                 expected: file.sha256.clone(),
-                actual: hex_sha256(&file.bytes),
+                actual,
             });
         }
-        let relative = safe_artifact_path(&file.path)?;
+        verified.push((safe_artifact_path(&file.path)?.to_path_buf(), file));
+    }
+
+    std::fs::create_dir_all(target_dir).map_err(|source| StorageError::Io {
+        path: target_dir.display().to_string(),
+        source,
+    })?;
+    for (relative, file) in verified {
         let destination = target_dir.join(relative);
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(|source| StorageError::Io {
@@ -159,6 +164,50 @@ pub struct SessionRecord {
     pub status: String,
     pub config_hash: String,
     pub created_unix_ms: i64,
+    pub last_heartbeat_unix_ms: Option<i64>,
+    pub heartbeat_holder: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeartbeatLiveness {
+    Fresh,
+    Stale,
+    None,
+}
+
+/// Fixed default resume/listing freshness threshold for harness leases.
+/// Kept as data rather than sleep timing so tests can compare against a
+/// controlled `now_unix_ms`.
+pub const DEFAULT_HEARTBEAT_STALE_AFTER_MS: i64 = 30_000;
+
+pub fn heartbeat_liveness_at(
+    session: &SessionRecord,
+    now_unix_ms: i64,
+    stale_after_ms: i64,
+) -> HeartbeatLiveness {
+    match session.last_heartbeat_unix_ms {
+        Some(last) if now_unix_ms.saturating_sub(last) <= stale_after_ms => {
+            HeartbeatLiveness::Fresh
+        }
+        Some(_) => HeartbeatLiveness::Stale,
+        None => HeartbeatLiveness::None,
+    }
+}
+
+pub fn is_terminal_session_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "aborted" | "failed" | "halted" | "killed"
+    )
+}
+
+pub fn default_heartbeat_holder() -> String {
+    let pid = std::process::id();
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    format!("pid={pid} host={host}")
 }
 
 /// One row of the append-only `events` log for a session (spec §8.1).
@@ -279,6 +328,12 @@ pub trait Storage: Send + Sync {
         config_hash: &str,
     ) -> Result<()>;
     async fn set_session_status(&self, session_id: &str, status: &str) -> Result<()>;
+    async fn write_session_heartbeat(
+        &self,
+        session_id: &str,
+        unix_ms: i64,
+        holder: &str,
+    ) -> Result<()>;
     async fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>>;
     async fn list_sessions(&self) -> Result<Vec<SessionRecord>>;
     /// Append one event to a session's append-only log; returns the
@@ -468,6 +523,22 @@ impl SqliteStorage {
                 .execute(&self.pool)
                 .await?;
         }
+        if !columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "last_heartbeat_unix_ms")
+        {
+            sqlx::query("ALTER TABLE sessions ADD COLUMN last_heartbeat_unix_ms INTEGER")
+                .execute(&self.pool)
+                .await?;
+        }
+        if !columns
+            .iter()
+            .any(|row| row.get::<String, _>("name") == "heartbeat_holder")
+        {
+            sqlx::query("ALTER TABLE sessions ADD COLUMN heartbeat_holder TEXT")
+                .execute(&self.pool)
+                .await?;
+        }
 
         sqlx::query(
             r#"
@@ -619,9 +690,28 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
+    async fn write_session_heartbeat(
+        &self,
+        session_id: &str,
+        unix_ms: i64,
+        holder: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE sessions SET last_heartbeat_unix_ms = ?, heartbeat_holder = ? \
+             WHERE session_id = ?",
+        )
+        .bind(unix_ms)
+        .bind(holder)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let row = sqlx::query(
-            "SELECT session_id, agent_name, status, created_unix_ms, config_hash FROM sessions WHERE session_id = ?",
+            "SELECT session_id, agent_name, status, created_unix_ms, config_hash, \
+             last_heartbeat_unix_ms, heartbeat_holder FROM sessions WHERE session_id = ?",
         )
         .bind(session_id)
         .fetch_optional(&self.pool)
@@ -632,12 +722,15 @@ impl Storage for SqliteStorage {
             status: r.get("status"),
             config_hash: r.get("config_hash"),
             created_unix_ms: r.get("created_unix_ms"),
+            last_heartbeat_unix_ms: r.get("last_heartbeat_unix_ms"),
+            heartbeat_holder: r.get("heartbeat_holder"),
         }))
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let rows = sqlx::query(
-            "SELECT session_id, agent_name, status, created_unix_ms, config_hash FROM sessions \
+            "SELECT session_id, agent_name, status, created_unix_ms, config_hash, \
+             last_heartbeat_unix_ms, heartbeat_holder FROM sessions \
              ORDER BY created_unix_ms DESC",
         )
         .fetch_all(&self.pool)
@@ -650,6 +743,8 @@ impl Storage for SqliteStorage {
                 status: r.get("status"),
                 config_hash: r.get("config_hash"),
                 created_unix_ms: r.get("created_unix_ms"),
+                last_heartbeat_unix_ms: r.get("last_heartbeat_unix_ms"),
+                heartbeat_holder: r.get("heartbeat_holder"),
             })
             .collect())
     }
@@ -1217,6 +1312,8 @@ mod tests {
         assert_eq!(record.session_id, "sess-1");
         assert_eq!(record.agent_name, "research-agent");
         assert_eq!(record.status, "running");
+        assert_eq!(record.last_heartbeat_unix_ms, None);
+        assert_eq!(record.heartbeat_holder, None);
     }
 
     #[tokio::test]
@@ -1232,6 +1329,39 @@ mod tests {
             .unwrap();
         let record = storage.get_session("sess-1").await.unwrap().unwrap();
         assert_eq!(record.status, "completed");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_write_read_round_trips_and_reports_liveness() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        storage
+            .create_session("sess-1", "research-agent")
+            .await
+            .unwrap();
+        let session = storage.get_session("sess-1").await.unwrap().unwrap();
+        assert_eq!(
+            heartbeat_liveness_at(&session, 10_000, DEFAULT_HEARTBEAT_STALE_AFTER_MS),
+            HeartbeatLiveness::None
+        );
+
+        storage
+            .write_session_heartbeat("sess-1", 10_000, "pid=123 host=test")
+            .await
+            .unwrap();
+        let session = storage.get_session("sess-1").await.unwrap().unwrap();
+        assert_eq!(session.last_heartbeat_unix_ms, Some(10_000));
+        assert_eq!(
+            session.heartbeat_holder.as_deref(),
+            Some("pid=123 host=test")
+        );
+        assert_eq!(
+            heartbeat_liveness_at(&session, 39_999, DEFAULT_HEARTBEAT_STALE_AFTER_MS),
+            HeartbeatLiveness::Fresh
+        );
+        assert_eq!(
+            heartbeat_liveness_at(&session, 40_001, DEFAULT_HEARTBEAT_STALE_AFTER_MS),
+            HeartbeatLiveness::Stale
+        );
     }
 
     #[tokio::test]
@@ -1336,6 +1466,48 @@ mod tests {
             std::fs::read(out.path().join("manifest.json")).unwrap(),
             bytes
         );
+    }
+
+    #[tokio::test]
+    async fn materialize_reverifies_stored_hashes_before_writing_tree() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let good = b"good".to_vec();
+        let poisoned = b"original".to_vec();
+        storage
+            .ingest_artifact_bundle(&DistArtifactBundle {
+                config_hash: "hash-1".to_string(),
+                files: vec![
+                    DistArtifactFile {
+                        path: "a.txt".to_string(),
+                        sha256: hex_sha256(&good),
+                        bytes: good,
+                    },
+                    DistArtifactFile {
+                        path: "nested/poisoned.bin".to_string(),
+                        sha256: hex_sha256(&poisoned),
+                        bytes: poisoned,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE artifact_files SET bytes = ? WHERE config_hash = ? AND path = ?")
+            .bind(b"tampered".to_vec())
+            .bind("hash-1")
+            .bind("nested/poisoned.bin")
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        let err = materialize_artifact_bundle(&storage, "hash-1", out.path())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageError::ArtifactHashMismatch { path, .. } if path == "nested/poisoned.bin"
+        ));
+        assert!(!out.path().join("a.txt").exists());
     }
 
     #[tokio::test]

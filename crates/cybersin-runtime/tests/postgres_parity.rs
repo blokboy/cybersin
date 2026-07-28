@@ -3,6 +3,7 @@ use std::sync::Arc;
 use cybersin_runtime::stub_agent::run_stub_session;
 use cybersin_runtime::{
     DistArtifactBundle, DistArtifactFile, DistFixture, PgStorage, SqliteStorage, Storage,
+    StorageError,
 };
 use cybersin_trace::SpanStore;
 use serde_json::json;
@@ -25,6 +26,8 @@ struct ParityResult {
     state_value: serde_json::Value,
     checkpoint_state: serde_json::Value,
     signal: Option<serde_json::Value>,
+    last_heartbeat_unix_ms: Option<i64>,
+    heartbeat_holder: Option<String>,
     attempts: i64,
     tool_succeeded: bool,
 }
@@ -49,6 +52,10 @@ async fn exercise(storage: &dyn Storage, suffix: &str) -> ParityResult {
         .await
         .unwrap();
     storage
+        .write_session_heartbeat(&session, 12_345, "pid=123 host=parity")
+        .await
+        .unwrap();
+    storage
         .set_state(&session, "agent", "progress", &json!({"step": 2}))
         .await
         .unwrap();
@@ -66,6 +73,25 @@ async fn exercise(storage: &dyn Storage, suffix: &str) -> ParityResult {
         .await
         .unwrap()
         .is_none());
+    assert!(matches!(
+        storage.migrate_session(&session, "config-v2").await,
+        Err(StorageError::ArtifactBundleMissing(hash)) if hash == "config-v2"
+    ));
+    assert_eq!(
+        storage
+            .get_session(&session)
+            .await
+            .unwrap()
+            .unwrap()
+            .config_hash,
+        "config-v1"
+    );
+    assert!(storage
+        .load_events(&session)
+        .await
+        .unwrap()
+        .iter()
+        .all(|event| event.kind != "session.migrated"));
     storage
         .ingest_artifact_bundle(&DistArtifactBundle {
             config_hash: "config-v2".to_string(),
@@ -113,6 +139,8 @@ async fn exercise(storage: &dyn Storage, suffix: &str) -> ParityResult {
         state_value: state.value,
         checkpoint_state: checkpoint.state,
         signal,
+        last_heartbeat_unix_ms: session_record.last_heartbeat_unix_ms,
+        heartbeat_holder: session_record.heartbeat_holder,
         attempts: tool.attempts,
         tool_succeeded: won
             && tool.status == "succeeded"

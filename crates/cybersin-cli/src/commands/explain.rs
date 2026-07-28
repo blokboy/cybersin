@@ -28,6 +28,8 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs, Wrap};
 use ratatui::Terminal;
 
+use crate::session_liveness::{display_liveness, heartbeat_display, holder_display, now_unix_ms};
+
 #[derive(Debug, Args)]
 pub struct ExplainArgs {
     /// Compiled prompt name, matching `dist/prompts/<name>.json`.
@@ -273,10 +275,17 @@ limits=cpu:{},mem_mb:{},wall_s:{}\n",
         if self.sessions.is_empty() {
             out.push_str("  no sessions recorded\n");
         }
+        let now = now_unix_ms();
         for session in &self.sessions {
             out.push_str(&format!(
-                "  {}  {}  {}  {}\n",
-                session.session_id, session.status, session.agent_name, session.config_hash
+                "  {}  {}  {}  {}  {}  {}  {}\n",
+                session.session_id,
+                session.status,
+                session.agent_name,
+                session.config_hash,
+                display_liveness(session, now),
+                heartbeat_display(session),
+                holder_display(session)
             ));
         }
         out

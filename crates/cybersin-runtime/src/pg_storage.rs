@@ -85,6 +85,12 @@ impl PgStorage {
         )
         .execute(&mut *conn)
         .await?;
+        sqlx::query("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS last_heartbeat_unix_ms BIGINT")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS heartbeat_holder TEXT")
+            .execute(&mut *conn)
+            .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS events (
                 session_id TEXT NOT NULL,
@@ -238,9 +244,28 @@ impl Storage for PgStorage {
         Ok(())
     }
 
+    async fn write_session_heartbeat(
+        &self,
+        session_id: &str,
+        unix_ms: i64,
+        holder: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE sessions SET last_heartbeat_unix_ms = $1, heartbeat_holder = $2 \
+             WHERE session_id = $3",
+        )
+        .bind(unix_ms)
+        .bind(holder)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let row = sqlx::query(
-            "SELECT session_id, agent_name, status, created_unix_ms, config_hash
+            "SELECT session_id, agent_name, status, created_unix_ms, config_hash,
+             last_heartbeat_unix_ms, heartbeat_holder
              FROM sessions WHERE session_id = $1",
         )
         .bind(session_id)
@@ -252,12 +277,15 @@ impl Storage for PgStorage {
             status: r.get("status"),
             config_hash: r.get("config_hash"),
             created_unix_ms: r.get("created_unix_ms"),
+            last_heartbeat_unix_ms: r.get("last_heartbeat_unix_ms"),
+            heartbeat_holder: r.get("heartbeat_holder"),
         }))
     }
 
     async fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
         let rows = sqlx::query(
-            "SELECT session_id, agent_name, status, created_unix_ms, config_hash
+            "SELECT session_id, agent_name, status, created_unix_ms, config_hash,
+             last_heartbeat_unix_ms, heartbeat_holder
              FROM sessions ORDER BY created_unix_ms DESC",
         )
         .fetch_all(&self.pool)
@@ -270,6 +298,8 @@ impl Storage for PgStorage {
                 status: r.get("status"),
                 config_hash: r.get("config_hash"),
                 created_unix_ms: r.get("created_unix_ms"),
+                last_heartbeat_unix_ms: r.get("last_heartbeat_unix_ms"),
+                heartbeat_holder: r.get("heartbeat_holder"),
             })
             .collect())
     }

@@ -2,7 +2,7 @@
 //! (spec §11), exercised by shelling out to the built binary via
 //! `assert_cmd`, matching this issue's acceptance criteria end-to-end.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -49,6 +49,23 @@ fn show_session(db: &Path, session_id: &str) -> serde_json::Value {
     serde_json::from_slice(&output).unwrap()
 }
 
+fn migration_events(session: &serde_json::Value) -> Vec<&serde_json::Value> {
+    session["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["kind"] == "session.migrated")
+        .collect()
+}
+
+fn now_unix_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 fn relative_paths(root: &Path) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     let mut stack = vec![root.to_path_buf()];
@@ -68,6 +85,41 @@ fn relative_paths(root: &Path) -> BTreeSet<String> {
         }
     }
     paths
+}
+
+fn copy_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn collect_file_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                files.insert(rel, fs::read(path).unwrap());
+            }
+        }
+    }
+    files
 }
 
 #[test]
@@ -900,7 +952,13 @@ fn durable_session_cli_lists_shows_notifies_migrates_and_resumes() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("missing-hash"));
+        .stderr(predicate::str::contains("missing-hash"))
+        .stderr(predicate::str::contains(
+            "run a build/run that ingests it first",
+        ));
+    let after_failed_migrate = show_session(&db, "durable-1");
+    assert_eq!(after_failed_migrate["config_hash"], "stub-manual-0001");
+    assert!(migration_events(&after_failed_migrate).is_empty());
     cybersin()
         .args([
             "--db",
@@ -912,7 +970,15 @@ fn durable_session_cli_lists_shows_notifies_migrates_and_resumes() {
             "stub-manual-0001",
         ])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains(
+            "migrated durable-1 to stub-manual-0001",
+        ));
+    let after_stored_migrate = show_session(&db, "durable-1");
+    assert_eq!(after_stored_migrate["config_hash"], "stub-manual-0001");
+    let migrations = migration_events(&after_stored_migrate);
+    assert_eq!(migrations.len(), 1);
+    assert_eq!(migrations[0]["payload"]["config_hash"], "stub-manual-0001");
     let materialized = tmp.path().join("materialized-dist");
     cybersin()
         .args([
@@ -945,6 +1011,185 @@ fn durable_session_cli_lists_shows_notifies_migrates_and_resumes() {
         .assert()
         .success()
         .stdout(predicate::str::contains("resumed durable-1"));
+}
+
+#[test]
+fn sessions_materialize_restores_full_ingested_bundle_from_unrelated_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("state.db");
+    let project = tmp.path().join("project");
+    let source_dist = project.join("dist");
+    let expected_dist = tmp.path().join("relocated-source-dist");
+    let unrelated = tmp.path().join("unrelated");
+    let materialized_by_session = tmp.path().join("materialized-by-session");
+    let materialized_by_hash = tmp.path().join("materialized-by-hash");
+    let config_hash = "stub-manual-0001";
+
+    copy_tree(&cybersin_runtime::bundled_stub_dist_dir(), &source_dist);
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "--dist",
+            source_dist.to_str().unwrap(),
+            "run",
+            "--stub",
+            "--session-id",
+            "materialize-1",
+        ])
+        .current_dir(&project)
+        .assert()
+        .success();
+
+    copy_tree(&source_dist, &expected_dist);
+    fs::remove_dir_all(&source_dist).unwrap();
+    fs::create_dir_all(&unrelated).unwrap();
+
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "sessions",
+            "materialize",
+            "--session",
+            "materialize-1",
+            "--out",
+            materialized_by_session.to_str().unwrap(),
+        ])
+        .current_dir(&unrelated)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(config_hash));
+    assert_eq!(
+        collect_file_bytes(&materialized_by_session),
+        collect_file_bytes(&expected_dist)
+    );
+
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "sessions",
+            "materialize",
+            "--config-hash",
+            config_hash,
+            "--out",
+            materialized_by_hash.to_str().unwrap(),
+        ])
+        .current_dir(&unrelated)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(config_hash));
+    assert_eq!(
+        collect_file_bytes(&materialized_by_hash),
+        collect_file_bytes(&expected_dist)
+    );
+}
+
+#[test]
+fn sessions_materialize_missing_pinned_hash_reports_hash_without_creating_target() {
+    use cybersin_runtime::Storage as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("state.db");
+    let target = tmp.path().join("out");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        cybersin_runtime::SqliteStorage::connect(&format!("sqlite://{}?mode=rwc", db.display()))
+            .await
+            .unwrap()
+            .create_session_pinned("missing-bundle", "agent", "absent-hash-92")
+            .await
+            .unwrap();
+    });
+
+    cybersin()
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "sessions",
+            "materialize",
+            "--session",
+            "missing-bundle",
+            "--out",
+            target.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("absent-hash-92"));
+    assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn sessions_ls_surfaces_heartbeat_liveness_and_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("state.db");
+    let daemon = cybersin_runtime::DaemonHandle::auto_start(&db)
+        .await
+        .unwrap();
+    let storage = daemon.storage();
+    storage
+        .create_session("live-session", "agent-a")
+        .await
+        .unwrap();
+    storage
+        .write_session_heartbeat("live-session", now_unix_ms(), "pid=1 host=test")
+        .await
+        .unwrap();
+    storage
+        .create_session("stale-session", "agent-b")
+        .await
+        .unwrap();
+    storage
+        .write_session_heartbeat("stale-session", 1, "pid=2 host=test")
+        .await
+        .unwrap();
+    storage
+        .create_session("done-session", "agent-c")
+        .await
+        .unwrap();
+    storage
+        .write_session_heartbeat("done-session", 1, "pid=3 host=test")
+        .await
+        .unwrap();
+    storage
+        .set_session_status("done-session", "completed")
+        .await
+        .unwrap();
+    drop(daemon);
+
+    cybersin()
+        .args(["--db", db.to_str().unwrap(), "sessions", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("live-session"))
+        .stdout(predicate::str::contains("live"))
+        .stdout(predicate::str::contains("pid=1 host=test"))
+        .stdout(predicate::str::contains("stale-session"))
+        .stdout(predicate::str::contains("stale"))
+        .stdout(predicate::str::contains("done-session"))
+        .stdout(predicate::str::contains("terminal"));
+
+    let output = cybersin()
+        .args(["--db", db.to_str().unwrap(), "sessions", "ls", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let rows: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let row = |id: &str| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == id)
+            .unwrap()
+    };
+    assert_eq!(row("live-session")["liveness"], "live");
+    assert_eq!(row("live-session")["heartbeat_holder"], "pid=1 host=test");
+    assert!(row("live-session")["last_heartbeat_unix_ms"].is_number());
+    assert_eq!(row("stale-session")["liveness"], "stale");
+    assert_eq!(row("done-session")["liveness"], "terminal");
 }
 
 #[test]

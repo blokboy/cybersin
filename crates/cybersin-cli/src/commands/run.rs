@@ -279,6 +279,7 @@ async fn run_stub(
         .session_id
         .unwrap_or_else(|| format!("sess-{}", now_unix_ms()));
     let agent_name = args.agent.unwrap_or_else(|| "research-agent".to_string());
+    ensure_fresh_session_id(daemon.storage().as_ref(), &session_id).await?;
 
     println!(
         "running stub agent: session={session_id} agent={agent_name} dist={}",
@@ -351,6 +352,7 @@ async fn run_live(
     let session_id = args
         .session_id
         .unwrap_or_else(|| format!("sess-{}", now_unix_ms()));
+    ensure_fresh_session_id(daemon.storage().as_ref(), &session_id).await?;
     ingest_dist_for_session(daemon.storage().as_ref(), &dist_dir, &session_id).await?;
 
     println!(
@@ -496,6 +498,7 @@ async fn run_builtin_starter(
     let session_id = args
         .session_id
         .unwrap_or_else(|| format!("sess-{}", now_unix_ms()));
+    ensure_fresh_session_id(daemon.storage().as_ref(), &session_id).await?;
     ingest_dist_for_session(daemon.storage().as_ref(), &dist_dir, &session_id).await?;
 
     println!(
@@ -520,6 +523,16 @@ async fn run_builtin_starter(
     let starter_fut = run_starter_harness(harness_io, session_id, prompt_name, inputs);
     let (summary, ()) = tokio::try_join!(daemon_fut, starter_fut)?;
     Ok(summary)
+}
+
+async fn ensure_fresh_session_id(storage: &dyn Storage, session_id: &str) -> anyhow::Result<()> {
+    if let Some(existing) = storage.get_session(session_id).await? {
+        anyhow::bail!(
+            "session id {session_id:?} already exists with status {:?}; use `cybersin run --resume {session_id}` or pass a fresh --session-id",
+            existing.status
+        );
+    }
+    Ok(())
 }
 
 async fn ingest_dist_for_session(

@@ -4,10 +4,34 @@
 //! through the actual compiled `cybersin` binary, not library calls.
 
 use assert_cmd::Command;
+use cybersin_runtime::{SqliteStorage, Storage};
 use predicates::prelude::*;
 
 fn cybersin() -> Command {
     Command::cargo_bin("cybersin").expect("find cybersin binary")
+}
+
+async fn seed_session(db: &std::path::Path, session_id: &str, status: &str) {
+    let storage = SqliteStorage::connect(&format!("sqlite://{}?mode=rwc", db.display()))
+        .await
+        .unwrap();
+    storage
+        .create_session(session_id, "seed-agent")
+        .await
+        .unwrap();
+    if status != "running" {
+        storage
+            .set_session_status(session_id, status)
+            .await
+            .unwrap();
+    }
+}
+
+async fn session_event_count(db: &std::path::Path, session_id: &str) -> usize {
+    let storage = SqliteStorage::connect(&format!("sqlite://{}?mode=rwc", db.display()))
+        .await
+        .unwrap();
+    storage.load_events(session_id).await.unwrap().len()
 }
 
 #[test]
@@ -130,6 +154,59 @@ fn stub_run_then_trace_and_cost_show_real_data() {
         .assert()
         .success()
         .stdout(predicate::str::contains("web_search"));
+}
+
+#[tokio::test]
+async fn run_with_existing_session_id_errors_before_writing_session_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("cybersin.db");
+
+    for status in ["running", "failed", "completed"] {
+        let session_id = format!("existing-{status}");
+        seed_session(&db, &session_id, status).await;
+
+        cybersin()
+            .arg("--db")
+            .arg(&db)
+            .arg("--dist")
+            .arg(cybersin_runtime::bundled_stub_dist_dir())
+            .arg("run")
+            .arg("--stub")
+            .arg("--session-id")
+            .arg(&session_id)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(format!(
+                "session id \"{session_id}\" already exists with status \"{status}\""
+            )))
+            .stderr(predicate::str::contains("run --resume"))
+            .stderr(predicate::str::contains("--session-id"));
+
+        assert_eq!(
+            session_event_count(&db, &session_id).await,
+            0,
+            "collision must fail before writing session events for {status}"
+        );
+    }
+}
+
+#[test]
+fn run_with_fresh_session_id_still_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("cybersin.db");
+
+    cybersin()
+        .arg("--db")
+        .arg(&db)
+        .arg("--dist")
+        .arg(cybersin_runtime::bundled_stub_dist_dir())
+        .arg("run")
+        .arg("--stub")
+        .arg("--session-id")
+        .arg("fresh-session-id")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fresh-session-id completed"));
 }
 
 #[test]

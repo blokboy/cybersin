@@ -61,6 +61,7 @@ use crate::commands::run::{self, RunArgs};
 use crate::commands::sandbox::Backend;
 use crate::harness_config::AgentMeta;
 use crate::project::{self, ProjectDefaults};
+use crate::session_liveness::{display_liveness, heartbeat_display, holder_display, now_unix_ms};
 use crate::tool_executor::configured_executor;
 
 /// How often the TUI's Sessions/Traces/Cost/Approvals tabs re-query the
@@ -190,10 +191,17 @@ impl OpsModel {
         if self.sessions.is_empty() {
             out.push_str("  no sessions recorded\n");
         }
+        let now = now_unix_ms();
         for session in &self.sessions {
             out.push_str(&format!(
-                "  {}  {}  {}  {}\n",
-                session.session_id, session.status, session.agent_name, session.config_hash
+                "  {}  {}  {}  {}  {}  {}  {}\n",
+                session.session_id,
+                session.status,
+                session.agent_name,
+                session.config_hash,
+                display_liveness(session, now),
+                heartbeat_display(session),
+                holder_display(session)
             ));
         }
         out
