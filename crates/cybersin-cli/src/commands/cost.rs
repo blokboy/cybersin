@@ -6,6 +6,8 @@ use clap::{Args, ValueEnum};
 use cybersin_runtime::DaemonHandle;
 use cybersin_trace::CostDimension;
 
+use crate::capabilities::{execute_cost, rendered_text, simple_result, CostInput};
+
 /// CLI-facing mirror of `cybersin_trace::CostDimension`, so `clap`'s
 /// `ValueEnum` derive (and its dependencies) stay out of `cybersin-trace`
 /// — that crate's dependency list stops at serde/sqlx/thiserror (spec
@@ -41,29 +43,9 @@ pub struct CostArgs {
 pub async fn execute(db_path: PathBuf, args: CostArgs) -> anyhow::Result<()> {
     let daemon = DaemonHandle::auto_start(&db_path).await?;
     let dimension: CostDimension = args.by.into();
-    let rows = daemon.spans().cost_rollup(dimension).await?;
-
-    if rows.is_empty() {
-        println!("no cost data yet — try `cybersin run --stub` first");
-        return Ok(());
-    }
-
-    println!(
-        "{:<24} {:>10} {:>8} {:>10} {:>10}",
-        dimension.to_string().to_uppercase(),
-        "USD",
-        "SPANS",
-        "PTOK",
-        "CTOK"
-    );
-    let mut total_usd = 0.0;
-    for row in &rows {
-        println!(
-            "{:<24} {:>10.6} {:>8} {:>10} {:>10}",
-            row.key, row.usd_cost, row.span_count, row.tokens_prompt, row.tokens_completion
-        );
-        total_usd += row.usd_cost;
-    }
-    println!("{:<24} {:>10.6}", "TOTAL", total_usd);
-    Ok(())
+    let execution = execute_cost(&daemon.spans(), CostInput { by: dimension }).await;
+    print!("{}", rendered_text(&execution.events));
+    simple_result(&execution.events)
+        .unwrap_or_else(|| Err("cost failed: capability did not emit a terminal event".to_string()))
+        .map_err(anyhow::Error::msg)
 }

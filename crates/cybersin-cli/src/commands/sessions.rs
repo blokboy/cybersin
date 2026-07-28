@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use clap::Subcommand;
 use cybersin_runtime::{materialize_artifact_bundle, DaemonHandle, SessionSupervisor};
 
-use crate::session_liveness::{display_liveness, heartbeat_display, holder_display, now_unix_ms};
+use crate::capabilities::{
+    execute_sessions_ls, execute_sessions_show, rendered_text, simple_result, SessionsLsInput,
+    SessionsShowInput,
+};
 
 #[derive(Debug, Subcommand)]
 pub enum SessionsCommand {
@@ -42,58 +45,26 @@ pub async fn execute(db: PathBuf, command: SessionsCommand) -> anyhow::Result<()
     let storage = daemon.storage();
     match command {
         SessionsCommand::Ls { json } => {
-            let sessions = storage.list_sessions().await?;
-            let now = now_unix_ms();
-            if json {
-                let rows: Vec<_> = sessions
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "session_id": s.session_id,
-                            "status": s.status,
-                            "agent_name": s.agent_name,
-                            "config_hash": s.config_hash,
-                            "created_unix_ms": s.created_unix_ms,
-                            "last_heartbeat_unix_ms": s.last_heartbeat_unix_ms,
-                            "heartbeat_holder": s.heartbeat_holder,
-                            "liveness": display_liveness(s, now),
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&rows)?);
-                return Ok(());
-            }
-            for s in sessions {
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    s.session_id,
-                    s.status,
-                    s.agent_name,
-                    s.config_hash,
-                    display_liveness(&s, now),
-                    heartbeat_display(&s),
-                    holder_display(&s)
-                );
-            }
+            let execution = execute_sessions_ls(storage.as_ref(), SessionsLsInput { json }).await;
+            print!("{}", rendered_text(&execution.events));
+            simple_result(&execution.events)
+                .unwrap_or_else(|| {
+                    Err("sessions ls failed: capability did not emit a terminal event".to_string())
+                })
+                .map_err(anyhow::Error::msg)?;
         }
         SessionsCommand::Show { session } => {
-            let s = storage
-                .get_session(&session)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("session {session:?} not found"))?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "session_id": s.session_id, "agent_name": s.agent_name, "status": s.status,
-                    "config_hash": s.config_hash, "created_unix_ms": s.created_unix_ms,
-                    "last_heartbeat_unix_ms": s.last_heartbeat_unix_ms,
-                    "heartbeat_holder": s.heartbeat_holder,
-                    "liveness": display_liveness(&s, now_unix_ms()),
-                    "events": storage.load_events(&session).await?,
-                    "state": storage.list_state(&session).await?,
-                    "checkpoint": storage.latest_checkpoint(&session).await?,
-                }))?
-            );
+            let execution =
+                execute_sessions_show(storage.as_ref(), SessionsShowInput { session }).await;
+            print!("{}", rendered_text(&execution.events));
+            simple_result(&execution.events)
+                .unwrap_or_else(|| {
+                    Err(
+                        "sessions show failed: capability did not emit a terminal event"
+                            .to_string(),
+                    )
+                })
+                .map_err(anyhow::Error::msg)?;
         }
         SessionsCommand::Resume {
             session,

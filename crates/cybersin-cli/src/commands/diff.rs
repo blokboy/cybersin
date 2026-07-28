@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+use crate::capabilities::{execute_diff, rendered_text, DiffInput};
 use crate::commands::build::{run_into, BuildProfile};
 use crate::git;
 
@@ -31,6 +32,28 @@ pub fn run(
     reference: &str,
     profile: BuildProfile,
 ) -> Result<Option<String>, String> {
+    let execution = execute_diff(DiffInput {
+        project_path: project.to_path_buf(),
+        reference: reference.to_string(),
+        profile,
+    });
+    print!("{}", rendered_text(&execution.events));
+    diff_summary(&execution.events).unwrap_or_else(|| {
+        Err("cybersin diff failed: capability did not emit a terminal event".to_string())
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffOutput {
+    pub text: String,
+    pub summary: String,
+}
+
+pub fn run_with_output(
+    project: &Path,
+    reference: &str,
+    profile: BuildProfile,
+) -> Result<DiffOutput, String> {
     let repo_root = git::show_toplevel(project)?;
     let project_abs = fs::canonicalize(project)
         .map_err(|e| format!("error: failed to resolve {}: {e}", project.display()))?;
@@ -70,6 +93,7 @@ pub fn run(
     paths.extend(before.keys());
     paths.extend(after.keys());
 
+    let mut text = String::new();
     let mut added = 0usize;
     let mut removed = 0usize;
     let mut changed = 0usize;
@@ -77,27 +101,53 @@ pub fn run(
         match (before.get(path), after.get(path)) {
             (None, Some(_)) => {
                 added += 1;
-                println!("A  {path}");
+                use std::fmt::Write as _;
+                writeln!(&mut text, "A  {path}").expect("writing to String should not fail");
             }
             (Some(_), None) => {
                 removed += 1;
-                println!("D  {path}");
+                use std::fmt::Write as _;
+                writeln!(&mut text, "D  {path}").expect("writing to String should not fail");
             }
             (Some(old), Some(new)) if old != new => {
                 changed += 1;
-                println!("M  {path}");
-                print!(
-                    "{}",
-                    line_diff(&String::from_utf8_lossy(old), &String::from_utf8_lossy(new))
-                );
+                use std::fmt::Write as _;
+                writeln!(&mut text, "M  {path}").expect("writing to String should not fail");
+                text.push_str(&line_diff(
+                    &String::from_utf8_lossy(old),
+                    &String::from_utf8_lossy(new),
+                ));
             }
             _ => {}
         }
     }
 
-    Ok(Some(format!(
-        "cybersin diff {reference}: {added} added, {removed} removed, {changed} changed"
-    )))
+    Ok(DiffOutput {
+        text,
+        summary: format!(
+            "cybersin diff {reference}: {added} added, {removed} removed, {changed} changed"
+        ),
+    })
+}
+
+pub fn diff_summary(
+    events: &[crate::capabilities::CapabilityEvent],
+) -> Option<Result<Option<String>, String>> {
+    for event in events.iter().rev() {
+        match event {
+            crate::capabilities::CapabilityEvent::Completed {
+                value: Some(value), ..
+            } => {
+                let message = value.get("message")?.as_str()?.to_string();
+                return Some(Ok(Some(message)));
+            }
+            crate::capabilities::CapabilityEvent::Failed { message } => {
+                return Some(Err(message.clone()));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn collect_files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
