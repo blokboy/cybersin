@@ -32,7 +32,11 @@ use std::{env, io};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
+
+use crate::capabilities::{
+    apply_safety_gate, registry, CapabilityEvent, ConfirmationAnswer, SafetyGateResult,
+};
 
 /// Cybersin: a prompt compiler and agent runtime in one binary (spec §1).
 #[derive(Parser)]
@@ -76,6 +80,10 @@ struct Cli {
     /// when the shell's current directory is somewhere else.
     #[arg(long, global = true)]
     project: Option<PathBuf>,
+
+    /// Confirm safety-gated capabilities without an interactive prompt.
+    #[arg(long, global = true)]
+    yes: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -249,6 +257,7 @@ async fn main() -> ExitCode {
         sandbox_root,
         sandbox_backend,
         project,
+        yes,
         command,
     } = Cli::parse_from(args);
     let project_start = match resolve_project_start(project) {
@@ -378,8 +387,23 @@ async fn main() -> ExitCode {
         Command::Ops(args) => {
             from_async(commands::ops::execute(db, dist, sandbox_root, sandbox_backend, args).await)
         }
-        Command::Daemon(args) => from_async(commands::daemon::execute(args).await),
+        Command::Daemon(args) => {
+            if let Err(execution) = ensure_cli_safety("control.daemon.server", yes) {
+                return from_blocked_capability(execution);
+            }
+            from_async(commands::daemon::execute(args).await)
+        }
         Command::Dlq { command } => {
+            let capability_id = match &command {
+                commands::dlq::DlqCommand::Retry { .. } => Some("control.dlq.retry"),
+                commands::dlq::DlqCommand::Drop { .. } => Some("control.dlq.drop"),
+                commands::dlq::DlqCommand::Ls | commands::dlq::DlqCommand::Show { .. } => None,
+            };
+            if let Some(capability_id) = capability_id {
+                if let Err(execution) = ensure_cli_safety(capability_id, yes) {
+                    return from_blocked_capability(execution);
+                }
+            }
             let (db, sandbox_root, sandbox_backend, defaults) =
                 match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
                     Ok(v) => v,
@@ -394,6 +418,9 @@ async fn main() -> ExitCode {
             )
         }
         Command::Approve { call_id } => {
+            if let Err(execution) = ensure_cli_safety("control.approve", yes) {
+                return from_blocked_capability(execution);
+            }
             let (db, sandbox_root, sandbox_backend, defaults) =
                 match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
                     Ok(v) => v,
@@ -408,6 +435,9 @@ async fn main() -> ExitCode {
             )
         }
         Command::Deny { call_id } => {
+            if let Err(execution) = ensure_cli_safety("control.deny", yes) {
+                return from_blocked_capability(execution);
+            }
             let (db, sandbox_root, sandbox_backend, defaults) =
                 match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
                     Ok(v) => v,
@@ -422,6 +452,23 @@ async fn main() -> ExitCode {
             )
         }
         Command::Sessions { command } => {
+            let capability_id = match &command {
+                commands::sessions::SessionsCommand::Resume { .. } => {
+                    Some("control.sessions.resume")
+                }
+                commands::sessions::SessionsCommand::Kill { .. } => Some("control.sessions.kill"),
+                commands::sessions::SessionsCommand::Migrate { .. } => {
+                    Some("control.sessions.migrate")
+                }
+                commands::sessions::SessionsCommand::Ls { .. }
+                | commands::sessions::SessionsCommand::Show { .. }
+                | commands::sessions::SessionsCommand::Materialize { .. } => None,
+            };
+            if let Some(capability_id) = capability_id {
+                if let Err(execution) = ensure_cli_safety(capability_id, yes) {
+                    return from_blocked_capability(execution);
+                }
+            }
             let (db, ..) =
                 match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
                     Ok(v) => v,
@@ -430,6 +477,9 @@ async fn main() -> ExitCode {
             from_async(commands::sessions::execute(db, command).await)
         }
         Command::Notify { session, payload } => {
+            if let Err(execution) = ensure_cli_safety("control.notify", yes) {
+                return from_blocked_capability(execution);
+            }
             let (db, ..) =
                 match resolve_runtime_globals(&project_start, db, sandbox_root, sandbox_backend) {
                     Ok(v) => v,
@@ -438,10 +488,20 @@ async fn main() -> ExitCode {
             from_async(commands::notify::execute(db, session, payload).await)
         }
         Command::Sandbox { command } => match command {
-            SandboxCommand::Exec(args) => from_sync(commands::sandbox::exec(args)),
+            SandboxCommand::Exec(args) => {
+                if let Err(execution) = ensure_cli_safety("sandbox.exec", yes) {
+                    return from_blocked_capability(execution);
+                }
+                from_sync(commands::sandbox::exec(args))
+            }
             SandboxCommand::Snapshot(args) => from_sync(commands::sandbox::snapshot(args)),
             SandboxCommand::Diff(args) => from_sync(commands::sandbox::diff(args)),
-            SandboxCommand::Restore(args) => from_sync(commands::sandbox::restore(args)),
+            SandboxCommand::Restore(args) => {
+                if let Err(execution) = ensure_cli_safety("sandbox.restore", yes) {
+                    return from_blocked_capability(execution);
+                }
+                from_sync(commands::sandbox::restore(args))
+            }
         },
         Command::Optimize(args) => {
             let (db, ..) =
@@ -452,6 +512,56 @@ async fn main() -> ExitCode {
             from_async(commands::optimize::execute(db, args).await)
         }
     }
+}
+
+fn ensure_cli_safety(
+    capability_id: &str,
+    auto_confirm: bool,
+) -> Result<(), capabilities::CapabilityExecution> {
+    let registry = registry();
+    let Some(spec) = registry.get(capability_id) else {
+        return Ok(());
+    };
+    let interactive = auto_confirm || (io::stdin().is_terminal() && io::stderr().is_terminal());
+    match apply_safety_gate(spec, interactive, |_decision, message| {
+        if auto_confirm || confirm_on_stderr(message).unwrap_or(false) {
+            ConfirmationAnswer::Accepted
+        } else {
+            ConfirmationAnswer::Denied
+        }
+    }) {
+        SafetyGateResult::Accepted { .. } => Ok(()),
+        SafetyGateResult::Blocked { execution } => Err(execution),
+    }
+}
+
+fn confirm_on_stderr(message: &str) -> io::Result<bool> {
+    eprint!("{message} [y/N] ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
+}
+
+fn from_blocked_capability(execution: capabilities::CapabilityExecution) -> ExitCode {
+    for event in &execution.events {
+        match event {
+            CapabilityEvent::Started { capability_id } => {
+                eprintln!("capability started: {}", capability_id.as_str());
+            }
+            CapabilityEvent::Prompt { message, .. } => {
+                eprintln!("capability prompt: {message}");
+            }
+            CapabilityEvent::Failed { message } => {
+                eprintln!("capability failed: {message}");
+            }
+            CapabilityEvent::Progress { message, .. } => {
+                eprintln!("capability progress: {message}")
+            }
+            CapabilityEvent::Output { .. } | CapabilityEvent::Completed { .. } => {}
+        }
+    }
+    ExitCode::FAILURE
 }
 
 fn normalize_help_alias<I>(args: I) -> Vec<std::ffi::OsString>
