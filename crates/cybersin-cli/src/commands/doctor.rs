@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use cybersin_runtime::{allowlist::LOCAL_CONFIG_FILENAME, Availability, LocalConfigFile};
 
+use crate::capabilities::{execute_doctor, rendered_text, simple_result, DoctorInput};
 use crate::project::{discover_project_root, ProjectDefaults};
 use crate::readiness::{self, DotenvReadiness};
 
@@ -21,13 +22,13 @@ impl DoctorReport {
 }
 
 pub fn execute(project_start: &Path) -> anyhow::Result<()> {
-    let report = diagnose(project_start)?;
-    println!("{}", report.render());
-    if report.ok {
-        Ok(())
-    } else {
-        anyhow::bail!("project is not ready; see next actions above")
-    }
+    let execution = execute_doctor(DoctorInput::new(project_start));
+    print!("{}", rendered_text(&execution.events));
+    simple_result(&execution.events)
+        .unwrap_or_else(|| {
+            Err("doctor failed: capability did not emit a terminal event".to_string())
+        })
+        .map_err(anyhow::Error::msg)
 }
 
 pub fn diagnose(project_start: &Path) -> anyhow::Result<DoctorReport> {

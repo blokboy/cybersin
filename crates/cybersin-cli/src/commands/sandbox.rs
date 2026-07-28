@@ -7,6 +7,8 @@ use cybersin_sandbox::{
     SandboxBackend, SandboxScope, Termination, WorkspaceStore,
 };
 
+use crate::capabilities::{execute_sandbox_diff, rendered_text, simple_result, SandboxDiffInput};
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum Backend {
     Docker,
@@ -62,11 +64,11 @@ pub struct ExecArgs {
 #[derive(Debug, Args)]
 pub struct LifecycleArgs {
     #[arg(long, default_value = ".cybersin/sandbox")]
-    root: PathBuf,
+    pub(crate) root: PathBuf,
     #[arg(long)]
-    session: String,
+    pub(crate) session: String,
     #[arg(long)]
-    checkpoint: String,
+    pub(crate) checkpoint: String,
 }
 
 pub fn exec(args: ExecArgs) -> Result<Option<String>, String> {
@@ -126,20 +128,35 @@ pub fn snapshot(args: LifecycleArgs) -> Result<Option<String>, String> {
 }
 
 pub fn diff(args: LifecycleArgs) -> Result<Option<String>, String> {
-    let changes = session_workspace(&args)?
+    let execution = execute_sandbox_diff(SandboxDiffInput {
+        root: args.root,
+        session: args.session,
+        checkpoint: args.checkpoint,
+    });
+    print!("{}", rendered_text(&execution.events));
+    simple_result(&execution.events)
+        .unwrap_or_else(|| {
+            Err("sandbox diff failed: capability did not emit a terminal event".to_string())
+        })
+        .map(|_| None)
+}
+
+pub fn diff_text(args: &LifecycleArgs) -> Result<String, String> {
+    let changes = session_workspace(args)?
         .diff(&args.checkpoint)
         .map_err(|err| err.to_string())?;
-    let mut stdout = io::stdout().lock();
+    let mut text = String::new();
     for (path, kind) in changes {
         let marker = match kind {
             DiffKind::Added => 'A',
             DiffKind::Modified => 'M',
             DiffKind::Deleted => 'D',
         };
-        writeln!(stdout, "{marker} {}", path.display()).map_err(|err| err.to_string())?;
+        use std::fmt::Write as _;
+        writeln!(&mut text, "{marker} {}", path.display())
+            .expect("writing to String should not fail");
     }
-    stdout.flush().map_err(|err| err.to_string())?;
-    Ok(None)
+    Ok(text)
 }
 
 pub fn restore(args: LifecycleArgs) -> Result<Option<String>, String> {

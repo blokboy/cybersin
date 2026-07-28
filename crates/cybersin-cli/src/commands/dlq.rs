@@ -12,6 +12,9 @@ use clap::Subcommand;
 use cybersin_gateway::{GatewayOutcome, ToolGateway};
 use cybersin_runtime::DaemonHandle;
 
+use crate::capabilities::{
+    execute_dlq_ls, execute_dlq_show, rendered_text, simple_result, DlqShowInput,
+};
 use crate::commands::sandbox::Backend;
 use crate::tool_executor::configured_executor;
 
@@ -45,29 +48,22 @@ pub async fn execute(
 
     match cmd {
         DlqCommand::Ls => {
-            let rows = gateway.dlq_list().await?;
-            if rows.is_empty() {
-                println!("no dead letters");
-                return Ok(());
-            }
-            println!(
-                "{:<28} {:<12} {:<10} {:>8} {:<20}",
-                "CALL_ID", "SESSION", "CLASS", "ATTEMPTS", "REASON"
-            );
-            for row in rows {
-                println!(
-                    "{:<28} {:<12} {:<10} {:>8} {:<20}",
-                    row.call_id,
-                    row.session_id,
-                    row.retry_class,
-                    row.attempts,
-                    row.failure_reason.as_deref().unwrap_or("-"),
-                );
-            }
+            let execution = execute_dlq_ls(&gateway).await;
+            print!("{}", rendered_text(&execution.events));
+            simple_result(&execution.events)
+                .unwrap_or_else(|| {
+                    Err("dlq ls failed: capability did not emit a terminal event".to_string())
+                })
+                .map_err(anyhow::Error::msg)?;
         }
         DlqCommand::Show { call_id } => {
-            let row = gateway.dlq_show(&call_id).await?;
-            println!("{}", serde_json::to_string_pretty(&row)?);
+            let execution = execute_dlq_show(&gateway, DlqShowInput { call_id }).await;
+            print!("{}", rendered_text(&execution.events));
+            simple_result(&execution.events)
+                .unwrap_or_else(|| {
+                    Err("dlq show failed: capability did not emit a terminal event".to_string())
+                })
+                .map_err(anyhow::Error::msg)?;
         }
         DlqCommand::Retry { call_id } => {
             let outcome = gateway.dlq_retry(&call_id).await?;

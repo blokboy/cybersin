@@ -6,8 +6,8 @@ use clap::Subcommand;
 use cybersin_runtime::DaemonHandle;
 
 use crate::capabilities::{
-    execute_trace_ls, trace_ls_output_stream, trace_ls_result, CapabilityEvent, OutputMode,
-    TraceLsInput,
+    execute_trace_ls, execute_trace_show, rendered_text, simple_result, trace_ls_result,
+    TraceLsInput, TraceShowInput,
 };
 
 #[derive(Debug, Subcommand)]
@@ -62,17 +62,22 @@ pub async fn execute(db_path: PathBuf, cmd: TraceCommand) -> anyhow::Result<()> 
                 },
             )
             .await;
-            render_trace_ls_events(&execution.events);
+            print!("{}", rendered_text(&execution.events));
             trace_ls_result(&execution.events)
                 .unwrap_or_else(|| {
                     Err("trace ls failed: capability did not emit a terminal event".to_string())
                 })
                 .map_err(anyhow::Error::msg)?;
         }
-        TraceCommand::Show { id } => match daemon.spans().get(&id).await? {
-            Some(span) => println!("{}", serde_json::to_string_pretty(&span)?),
-            None => anyhow::bail!("no span with id {id:?}"),
-        },
+        TraceCommand::Show { id } => {
+            let execution = execute_trace_show(&daemon.spans(), TraceShowInput { id }).await;
+            print!("{}", rendered_text(&execution.events));
+            simple_result(&execution.events)
+                .unwrap_or_else(|| {
+                    Err("trace show failed: capability did not emit a terminal event".to_string())
+                })
+                .map_err(anyhow::Error::msg)?;
+        }
         TraceCommand::Sample { id, to_eval } => {
             let span = daemon
                 .spans()
@@ -115,30 +120,14 @@ pub async fn execute(db_path: PathBuf, cmd: TraceCommand) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn render_trace_ls_events(events: &[CapabilityEvent]) {
-    print!("{}", trace_ls_rendered_text(events));
-}
-
-fn trace_ls_rendered_text(events: &[CapabilityEvent]) -> String {
-    let mut rendered = String::new();
-    for event in events {
-        if let CapabilityEvent::Output {
-            mode: OutputMode::Text,
-            value,
-        } = event
-        {
-            if let Some((stream, text)) = trace_ls_output_stream(value) {
-                if stream == "stdout" {
-                    rendered.push_str(text);
-                }
-            }
-        }
-    }
-    rendered
+#[cfg(test)]
+fn trace_ls_rendered_text(events: &[crate::capabilities::CapabilityEvent]) -> String {
+    rendered_text(events)
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::capabilities::{trace_ls_output_stream, CapabilityEvent, OutputMode};
     use cybersin_trace::{CacheStatus, Span, SpanKind, SpanStatus, SpanStore};
 
     use super::*;
