@@ -46,8 +46,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use cybersin_gateway::{GatewayOutcome, ToolGateway};
-use cybersin_runtime::{DaemonHandle, SessionRecord, ToolCallRecord};
-use cybersin_trace::{CostDimension, CostRollupRow, Span, SpanFilter};
+use cybersin_runtime::DaemonHandle;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -56,10 +55,10 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tab
 use ratatui::Terminal;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::commands::build::discover_agent_sources;
+pub(crate) use crate::capabilities::{discover_ops_builds, OpsBuild};
+use crate::capabilities::{execute_ops_snapshot, OpsSnapshot};
 use crate::commands::run::{self, RunArgs};
 use crate::commands::sandbox::Backend;
-use crate::harness_config::AgentMeta;
 use crate::project::{self, ProjectDefaults};
 use crate::session_liveness::{display_liveness, heartbeat_display, holder_display, now_unix_ms};
 use crate::tool_executor::configured_executor;
@@ -143,31 +142,11 @@ impl GatewayContext {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct OpsModel {
-    builds: Vec<OpsBuild>,
-    sessions: Vec<SessionRecord>,
-    spans: Vec<Span>,
-    costs: Vec<CostRollupRow>,
-    approvals: Vec<ToolCallRecord>,
-}
+type OpsModel = OpsSnapshot;
 
 impl OpsModel {
     async fn load(daemon: &DaemonHandle, project_root: &Path) -> Result<Self> {
-        let spans = daemon
-            .spans()
-            .list(&SpanFilter {
-                limit: Some(1_000),
-                ..SpanFilter::default()
-            })
-            .await?;
-        Ok(Self {
-            builds: discover_ops_builds(project_root)?,
-            sessions: daemon.storage().list_sessions().await?,
-            costs: daemon.spans().cost_rollup(CostDimension::Model).await?,
-            spans: spans.into_iter().take(25).collect(),
-            approvals: daemon.storage().list_awaiting_approval().await?,
-        })
+        execute_ops_snapshot(daemon, project_root).await
     }
 
     fn builds_text(&self) -> String {
@@ -277,48 +256,6 @@ impl OpsModel {
             self.approvals_text()
         )
     }
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct OpsBuild {
-    pub(crate) name: String,
-    pub(crate) path: PathBuf,
-    pub(crate) build_hash_short: Option<String>,
-}
-
-pub(crate) fn discover_ops_builds(project_root: &Path) -> Result<Vec<OpsBuild>> {
-    let build_hash_short = read_dist_build_hash(project_root).ok().map(short_hash);
-    let mut builds = Vec::new();
-    for path in discover_agent_sources(project_root).map_err(anyhow::Error::msg)? {
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let meta = AgentMeta::from_agent_yaml(&text)
-            .with_context(|| format!("parsing {}", path.display()))?;
-        builds.push(OpsBuild {
-            name: meta.name,
-            path,
-            build_hash_short: build_hash_short.clone(),
-        });
-    }
-    builds.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
-    Ok(builds)
-}
-
-fn read_dist_build_hash(project_root: &Path) -> Result<String> {
-    let manifest_path = project_root.join("dist/manifest.json");
-    let text = std::fs::read_to_string(&manifest_path)
-        .with_context(|| format!("reading {}", manifest_path.display()))?;
-    let manifest: serde_json::Value = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}", manifest_path.display()))?;
-    Ok(manifest
-        .get("build_hash")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unbuilt")
-        .to_string())
-}
-
-fn short_hash(hash: String) -> String {
-    hash.get(..12).unwrap_or(&hash).to_string()
 }
 
 /// How long ago (relative to now) `updated_unix_ms` was — the Approvals
@@ -640,12 +577,7 @@ fn tui_loop(
     loop {
         let (pages, builds, approval_lines, status_text) = {
             let model = shared.lock().unwrap();
-            let pages = [
-                model.builds_text(),
-                model.sessions_text(),
-                model.traces_text(),
-                model.costs_text(),
-            ];
+            let pages = ops_tui_pages(&model);
             let builds = model.builds.clone();
             build_cursor = build_cursor.min(builds.len().saturating_sub(1));
             let approval_lines = model.approval_lines();
@@ -842,4 +774,41 @@ fn approval_call_id(shared: &Arc<Mutex<OpsModel>>, index: usize) -> Option<Strin
         .approvals
         .get(index)
         .map(|row| row.call_id.clone())
+}
+
+fn ops_tui_pages(model: &OpsModel) -> [String; 4] {
+    [
+        model.builds_text(),
+        model.sessions_text(),
+        model.traces_text(),
+        model.costs_text(),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capabilities::execute_ops_snapshot;
+
+    fn fixture_project() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/ic1-research-team")
+            .canonicalize()
+            .expect("fixture project should exist")
+    }
+
+    #[tokio::test]
+    async fn plain_and_tui_pages_consume_the_ops_capability_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = temp.path().join("ops-capability.db");
+        let daemon = DaemonHandle::auto_start(&db).await.unwrap();
+        let project = fixture_project();
+
+        let direct = execute_ops_snapshot(&daemon, &project).await.unwrap();
+        let command_model = OpsModel::load(&daemon, &project).await.unwrap();
+
+        assert_eq!(command_model.plain_report(), direct.plain_report());
+        assert_eq!(ops_tui_pages(&command_model), ops_tui_pages(&direct));
+        assert_eq!(command_model.approval_lines(), direct.approval_lines());
+    }
 }
