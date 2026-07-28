@@ -20,9 +20,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::capabilities::{
-    build_summary, check_output_stream, execute_check, execute_scaffold_build_with_progress,
-    execute_trace_ls, registry, AdapterSupport, CapabilityEvent, CapabilitySpec,
-    ScaffoldBuildInput, TraceLsInput, CHECK_CAPABILITY_ID, TRACE_LS_CAPABILITY_ID,
+    apply_safety_gate, build_summary, check_output_stream, execute_check,
+    execute_scaffold_build_with_progress, execute_trace_ls, registry, AdapterSupport,
+    CapabilityEvent, CapabilitySpec, SafetyGateResult, ScaffoldBuildInput, TraceLsInput,
+    CHECK_CAPABILITY_ID, SCAFFOLD_BUILD_WORKFLOW_ID, TRACE_LS_CAPABILITY_ID,
 };
 #[cfg(test)]
 use crate::commands::build;
@@ -690,10 +691,11 @@ async fn run_generic_capability(
         }
     }
 
-    let events = match spec.id.as_str() {
+    let mut events = tui_safety_events(spec)?;
+    match spec.id.as_str() {
         CHECK_CAPABILITY_ID => {
             let project_root = resolve_project_root(project_start)?;
-            execute_check(crate::capabilities::CheckInput::new(project_root)).events
+            events.extend(execute_check(crate::capabilities::CheckInput::new(project_root)).events);
         }
         TRACE_LS_CAPABILITY_ID => {
             let project_root = resolve_project_root(project_start)?;
@@ -702,24 +704,35 @@ async fn run_generic_capability(
             let daemon = DaemonHandle::auto_start(&defaults.db_default())
                 .await
                 .map_err(|error| error.to_string())?;
-            execute_trace_ls(
-                &daemon.spans(),
-                TraceLsInput {
-                    limit: Some(25),
-                    ..Default::default()
-                },
-            )
-            .await
-            .events
+            events.extend(
+                execute_trace_ls(
+                    &daemon.spans(),
+                    TraceLsInput {
+                        limit: Some(25),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .events,
+            );
         }
         _ => {
             return Err(
                 "this capability is listed but not wired into the generic browser yet".to_string(),
             )
         }
-    };
+    }
 
     Ok(render_capability_events(&events))
+}
+
+fn tui_safety_events(spec: &CapabilitySpec) -> Result<Vec<CapabilityEvent>, String> {
+    match apply_safety_gate(spec, false, |_decision, _message| {
+        unreachable!("the bare TUI has no confirmation prompt yet")
+    }) {
+        SafetyGateResult::Accepted { events } => Ok(events),
+        SafetyGateResult::Blocked { execution } => Err(render_capability_events(&execution.events)),
+    }
 }
 
 fn render_capability_events(events: &[CapabilityEvent]) -> String {
@@ -1030,11 +1043,17 @@ fn run_selected_build_from(
     on_progress: impl FnMut(BuildProgress),
 ) -> Result<String, String> {
     let project_root = resolve_project_root(&project_start)?;
+    let registry = registry();
+    let spec = registry
+        .get(SCAFFOLD_BUILD_WORKFLOW_ID)
+        .ok_or_else(|| "scaffold/build workflow capability is not registered".to_string())?;
+    let mut events = tui_safety_events(spec)?;
     let execution = execute_scaffold_build_with_progress(
         ScaffoldBuildInput::new(&project_root, &source, BuildProfile::Dev, false),
         on_progress,
     );
-    build_summary(&execution.events).unwrap_or_else(|| {
+    events.extend(execution.events);
+    build_summary(&events).unwrap_or_else(|| {
         Err("cybersin build failed: workflow did not emit a terminal event".to_string())
     })
 }

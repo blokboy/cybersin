@@ -145,6 +145,22 @@ esac
             "checkpoint-1",
         ])
         .assert()
+        .failure()
+        .stderr(predicate::str::contains("not confirmed"));
+
+    cybersin()
+        .args([
+            "--yes",
+            "sandbox",
+            "restore",
+            "--root",
+            root_arg,
+            "--session",
+            "session-1",
+            "--checkpoint",
+            "checkpoint-1",
+        ])
+        .assert()
         .success();
     cybersin()
         .args([

@@ -130,6 +130,154 @@ pub enum ConfirmationPolicy {
     Required { reason: String },
 }
 
+/// Normalized safety decision shared by CLI and TUI adapters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SafetyDecision {
+    Unnecessary,
+    Recommended { reason: String },
+    Required { reason: String },
+}
+
+impl SafetyDecision {
+    pub fn requires_confirmation(&self) -> bool {
+        !matches!(self, SafetyDecision::Unnecessary)
+    }
+
+    pub fn prompt_message(&self, spec: &CapabilitySpec) -> Option<String> {
+        match self {
+            SafetyDecision::Unnecessary => None,
+            SafetyDecision::Recommended { reason } => Some(format!(
+                "{} is safety-sensitive ({reason}). Continue?",
+                spec.title
+            )),
+            SafetyDecision::Required { reason } => Some(format!(
+                "{} requires confirmation: {reason}. Continue?",
+                spec.title
+            )),
+        }
+    }
+
+    pub fn confirmation_policy(&self) -> ConfirmationPolicy {
+        match self {
+            SafetyDecision::Unnecessary => ConfirmationPolicy::None,
+            SafetyDecision::Recommended { .. } => ConfirmationPolicy::Recommended,
+            SafetyDecision::Required { reason } => ConfirmationPolicy::Required {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmationAnswer {
+    Accepted,
+    Denied,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SafetyGateResult {
+    Accepted { events: Vec<CapabilityEvent> },
+    Blocked { execution: CapabilityExecution },
+}
+
+impl SafetyGateResult {
+    pub fn into_events_or_blocked(self) -> Result<Vec<CapabilityEvent>, CapabilityExecution> {
+        match self {
+            SafetyGateResult::Accepted { events } => Ok(events),
+            SafetyGateResult::Blocked { execution } => Err(execution),
+        }
+    }
+}
+
+/// Reads the capability safety profile and decides whether a gate is needed.
+pub fn safety_decision(profile: &SafetyProfile) -> SafetyDecision {
+    match &profile.confirmation {
+        ConfirmationPolicy::None => SafetyDecision::Unnecessary,
+        ConfirmationPolicy::Recommended => SafetyDecision::Recommended {
+            reason: inferred_safety_reason(profile).to_string(),
+        },
+        ConfirmationPolicy::Required { reason } => SafetyDecision::Required {
+            reason: reason.clone(),
+        },
+    }
+}
+
+/// Applies a shared confirmation gate before an adapter executes a capability.
+pub fn apply_safety_gate(
+    spec: &CapabilitySpec,
+    interactive: bool,
+    confirm: impl FnOnce(&SafetyDecision, &str) -> ConfirmationAnswer,
+) -> SafetyGateResult {
+    let decision = safety_decision(&spec.safety);
+    let Some(message) = decision.prompt_message(spec) else {
+        return SafetyGateResult::Accepted { events: Vec::new() };
+    };
+
+    let prompt = CapabilityEvent::Prompt {
+        id: format!("{}:safety", spec.id.as_str()),
+        message: message.clone(),
+        confirmation: decision.confirmation_policy(),
+    };
+
+    if !interactive && matches!(decision, SafetyDecision::Required { .. }) {
+        return SafetyGateResult::Blocked {
+            execution: blocked_execution(
+                spec,
+                prompt,
+                format!(
+                    "{} was not confirmed in a non-interactive adapter",
+                    spec.id.as_str()
+                ),
+            ),
+        };
+    }
+
+    if !interactive {
+        return SafetyGateResult::Accepted { events: Vec::new() };
+    }
+
+    match confirm(&decision, &message) {
+        ConfirmationAnswer::Accepted => SafetyGateResult::Accepted {
+            events: vec![prompt],
+        },
+        ConfirmationAnswer::Denied => SafetyGateResult::Blocked {
+            execution: blocked_execution(
+                spec,
+                prompt,
+                format!("{} was cancelled by the user", spec.id.as_str()),
+            ),
+        },
+    }
+}
+
+fn blocked_execution(
+    spec: &CapabilitySpec,
+    prompt: CapabilityEvent,
+    message: String,
+) -> CapabilityExecution {
+    CapabilityExecution::new(vec![
+        CapabilityEvent::Started {
+            capability_id: spec.id.clone(),
+        },
+        prompt,
+        CapabilityEvent::Failed { message },
+    ])
+}
+
+fn inferred_safety_reason(profile: &SafetyProfile) -> &'static str {
+    if profile.file_mutation == MutationLevel::Destructive {
+        "it can replace or remove files"
+    } else if profile.process_lifecycle != ProcessLifecycle::None {
+        "it changes runtime process state"
+    } else if profile.runtime_state_mutation != MutationLevel::None {
+        "it changes durable runtime state"
+    } else if profile.file_mutation != MutationLevel::None {
+        "it writes project files"
+    } else {
+        "the capability requests confirmation"
+    }
+}
+
 /// Adapter availability for a capability.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterCoverage {
@@ -1641,6 +1789,83 @@ mod tests {
                 reason: "drops durable runtime state".to_string()
             }
         );
+    }
+
+    #[test]
+    fn safety_gate_accepts_confirmed_required_action() {
+        let spec = registry().get("sandbox.restore").unwrap().clone();
+
+        let result = apply_safety_gate(&spec, true, |decision, message| {
+            assert!(matches!(decision, SafetyDecision::Required { .. }));
+            assert!(message.contains("requires confirmation"));
+            ConfirmationAnswer::Accepted
+        });
+
+        let events = result.into_events_or_blocked().unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [CapabilityEvent::Prompt { .. }]
+        ));
+    }
+
+    #[test]
+    fn safety_gate_blocks_denied_confirmation_with_failed_event() {
+        let spec = registry().get("control.sessions.kill").unwrap().clone();
+
+        let result = apply_safety_gate(&spec, true, |_decision, _message| {
+            ConfirmationAnswer::Denied
+        });
+
+        let execution = result.into_events_or_blocked().unwrap_err();
+        assert!(!execution.is_success());
+        assert!(matches!(
+            execution.events.as_slice(),
+            [
+                CapabilityEvent::Started { .. },
+                CapabilityEvent::Prompt { .. },
+                CapabilityEvent::Failed { message },
+            ] if message.contains("cancelled")
+        ));
+    }
+
+    #[test]
+    fn safety_gate_blocks_non_interactive_required_action() {
+        let spec = registry().get("sandbox.restore").unwrap().clone();
+
+        let result = apply_safety_gate(&spec, false, |_decision, _message| {
+            panic!("non-interactive gate must not ask for confirmation")
+        });
+
+        let execution = result.into_events_or_blocked().unwrap_err();
+        assert!(!execution.is_success());
+        assert!(matches!(
+            execution.events.last(),
+            Some(CapabilityEvent::Failed { message })
+                if message.contains("non-interactive")
+        ));
+    }
+
+    #[test]
+    fn safety_gate_allows_non_interactive_recommended_action_without_prompt() {
+        let spec = registry().get("control.notify").unwrap().clone();
+
+        let result = apply_safety_gate(&spec, false, |_decision, _message| {
+            panic!("non-interactive recommended action should not ask for confirmation")
+        });
+
+        assert_eq!(result.into_events_or_blocked().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn safety_gate_allows_already_safe_action_without_prompt() {
+        let spec = registry().get(CHECK_CAPABILITY_ID).unwrap().clone();
+
+        let result = apply_safety_gate(&spec, false, |_decision, _message| {
+            panic!("read-only capability should not prompt")
+        });
+
+        assert_eq!(result.into_events_or_blocked().unwrap(), Vec::new());
+        assert_eq!(safety_decision(&spec.safety), SafetyDecision::Unnecessary);
     }
 
     #[test]
