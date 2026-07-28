@@ -21,6 +21,7 @@ use cybersin_ir::QualityTier;
 use cybersin_router::RouteModel;
 use serde_json::Value;
 
+use crate::live_model_caller::MissingApiKey;
 use crate::route_executor::{Judge, ModelCallError, ModelCaller, ModelOutput};
 
 /// Fixed self-confidence per quality tier. Tuned against the compiler's own
@@ -57,6 +58,26 @@ impl ModelCaller for StubModelCaller {
             confidence: stub_confidence(model.quality),
             usage: None,
         })
+    }
+}
+
+/// A fail-closed model caller for harness-backed sessions that may never
+/// invoke a model route. This lets the harness start and checkpoint without
+/// provider credentials while preserving the same missing-key error if a
+/// model call is actually attempted.
+pub struct MissingApiKeyModelCaller;
+
+#[async_trait]
+impl ModelCaller for MissingApiKeyModelCaller {
+    async fn call(
+        &self,
+        _model: &RouteModel,
+        _prompt_name: &str,
+        _inputs: &Value,
+        _confidence_instruction: Option<&str>,
+        _grounded: bool,
+    ) -> Result<ModelOutput, ModelCallError> {
+        Err(ModelCallError::permanent(MissingApiKey.to_string()))
     }
 }
 

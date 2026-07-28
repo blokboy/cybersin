@@ -31,8 +31,8 @@ use cybersin_router::{ModelKind, RouteDecision};
 use cybersin_runtime::{
     heartbeat_liveness_at, is_terminal_session_status, materialize_artifact_bundle, stub_agent,
     ArtifactIngestOutcome, DaemonHandle, DistFixture, HeartbeatLiveness, LocalConfigFile,
-    ModelAllowlist, OpenRouterModelCaller, RuntimeSessionSummary, SessionSupervisor, Storage,
-    DEFAULT_HEARTBEAT_STALE_AFTER_MS,
+    MissingApiKeyModelCaller, ModelAllowlist, ModelCaller, OpenRouterModelCaller,
+    RuntimeSessionSummary, SessionSupervisor, Storage, DEFAULT_HEARTBEAT_STALE_AFTER_MS,
 };
 use cybersin_sandbox::WorkspaceStore;
 use tokio::process::{Child, Command};
@@ -508,8 +508,7 @@ async fn prepare_live_daemon(
             spec.project_dir.join("cybersin.local.yaml").display()
         )
     })?;
-    let model_caller = openrouter_from_local_config(dist.clone(), local_config.as_ref())
-        .context("configuring live model calling")?;
+    let model_caller = openrouter_from_local_config(dist.clone(), local_config.as_ref());
     let allowlist = local_config
         .as_ref()
         .map(LocalConfigFile::model_allowlist)
@@ -784,8 +783,7 @@ async fn run_builtin_starter(
     })?;
     retarget_scaffolded_stub_routes(&mut dist_fixture, local_config.as_ref());
     let dist = Arc::new(dist_fixture);
-    let model_caller = openrouter_from_local_config(dist.clone(), local_config.as_ref())
-        .context("configuring live model calling")?;
+    let model_caller = openrouter_from_local_config(dist.clone(), local_config.as_ref());
     let allowlist = local_config
         .as_ref()
         .map(LocalConfigFile::model_allowlist)
@@ -958,12 +956,15 @@ where
 fn openrouter_from_local_config(
     dist: Arc<DistFixture>,
     config: Option<&LocalConfigFile>,
-) -> Result<OpenRouterModelCaller, cybersin_runtime::MissingApiKey> {
-    let caller = match readiness::resolve_openrouter_api_key(config) {
-        Some(api_key) => OpenRouterModelCaller::new(dist, api_key),
-        None => OpenRouterModelCaller::from_env(dist)?,
+) -> Box<dyn ModelCaller> {
+    let caller = match readiness::resolve_openrouter_api_key(config)
+        .map(|api_key| Ok(OpenRouterModelCaller::new(dist.clone(), api_key)))
+        .unwrap_or_else(|| OpenRouterModelCaller::from_env(dist.clone()))
+    {
+        Ok(caller) => caller,
+        Err(_) => return Box::new(MissingApiKeyModelCaller),
     };
-    Ok(match readiness::openrouter_base_url(config) {
+    Box::new(match readiness::openrouter_base_url(config) {
         Some(base_url) => caller.with_base_url(base_url),
         None => caller,
     })

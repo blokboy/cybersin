@@ -50,7 +50,7 @@ pub use dist::{
 };
 pub use error::RuntimeError;
 pub use live_model_caller::{MissingApiKey, OpenRouterModelCaller};
-pub use model_caller::{StubJudge, StubModelCaller};
+pub use model_caller::{MissingApiKeyModelCaller, StubJudge, StubModelCaller};
 pub use orchestration::{
     Mail, OrchestrationError, Orchestrator, Worker, WorkerExit, DEFAULT_MAX_RESTARTS,
 };
