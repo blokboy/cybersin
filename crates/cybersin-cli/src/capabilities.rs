@@ -1026,15 +1026,38 @@ pub fn registry() -> CapabilityRegistry {
             ),
             cli(),
         ),
-        spec(
-            TRACE_LS_CAPABILITY_ID,
-            "List traces",
-            "List recorded spans from the trace store.",
-            CapabilityCategory::Inspection,
-            vec![OutputMode::Table, OutputMode::Text],
-            runtime_read(),
-            generic_tui(),
-        ),
+        CapabilitySpec {
+            id: CapabilityId::new(TRACE_LS_CAPABILITY_ID),
+            title: "List traces".to_string(),
+            summary: "List recorded spans from the trace store.".to_string(),
+            category: CapabilityCategory::Inspection,
+            components: Vec::new(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "session": {
+                        "type": ["string", "null"],
+                        "description": "Optional session id filter."
+                    },
+                    "agent": {
+                        "type": ["string", "null"],
+                        "description": "Optional agent name filter."
+                    },
+                    "model": {
+                        "type": ["string", "null"],
+                        "description": "Optional model filter."
+                    },
+                    "limit": {
+                        "type": ["string", "null"],
+                        "description": "Maximum spans to list; defaults to 25."
+                    }
+                }
+            }),
+            output_modes: vec![OutputMode::Table, OutputMode::Text],
+            safety: runtime_read(),
+            adapters: generic_tui(),
+        },
         spec(
             "inspection.trace.show",
             "Show trace",
@@ -1434,7 +1457,7 @@ fn build_spec() -> CapabilitySpec {
             NetworkRequirement::Optional,
             LongRunningBehavior::StreamsUntilComplete,
         ),
-        adapters: cli(),
+        adapters: generic_tui(),
     }
 }
 
@@ -1732,7 +1755,7 @@ mod tests {
                 AdapterSupport::Generic
                     if matches!(
                         spec.id.as_str(),
-                        CHECK_CAPABILITY_ID | TRACE_LS_CAPABILITY_ID
+                        BUILD_CAPABILITY_ID | CHECK_CAPABILITY_ID | TRACE_LS_CAPABILITY_ID
                     ) => {}
                 AdapterSupport::Custom if spec.id.as_str() == SCAFFOLD_BUILD_WORKFLOW_ID => {}
                 AdapterSupport::Unavailable { reason } => assert!(

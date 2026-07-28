@@ -20,9 +20,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use crate::capabilities::{
-    build_summary, check_output_stream, execute_check, execute_scaffold_build_with_progress,
-    execute_trace_ls, registry, AdapterSupport, CapabilityEvent, CapabilitySpec,
-    ScaffoldBuildInput, TraceLsInput, CHECK_CAPABILITY_ID, TRACE_LS_CAPABILITY_ID,
+    build_summary, check_output_stream, execute_build, execute_check,
+    execute_scaffold_build_with_progress, execute_trace_ls, registry, AdapterSupport,
+    CapabilityEvent, CapabilitySpec, ScaffoldBuildInput, TraceLsInput, BUILD_CAPABILITY_ID,
+    CHECK_CAPABILITY_ID, TRACE_LS_CAPABILITY_ID,
 };
 #[cfg(test)]
 use crate::commands::build;
@@ -48,6 +49,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -104,6 +106,7 @@ enum Focus {
     Out,
     ConvertAction,
     OpsBuildsList,
+    CapabilityForm,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +195,7 @@ struct App {
     selected_ops_build: usize,
     ops_run_status: OpsRunStatus,
     selected_capability: usize,
+    capability_form: CapabilityFormState,
     capability_status: CapabilityStatus,
     show_help: bool,
     should_quit: bool,
@@ -207,6 +211,7 @@ impl Default for App {
 impl App {
     fn new(project_start: PathBuf) -> Self {
         let project_start = resolve_tui_project_start(&project_start);
+        let capability_form = CapabilityFormState::for_current_selection(&project_start, 0);
         Self {
             project_start,
             screen: Screen::Home,
@@ -224,10 +229,197 @@ impl App {
             selected_ops_build: 0,
             ops_run_status: OpsRunStatus::Idle,
             selected_capability: 0,
+            capability_form,
             capability_status: CapabilityStatus::Idle,
             show_help: false,
             should_quit: false,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapabilityFormState {
+    capability_id: String,
+    fields: Vec<CapabilityFormField>,
+    selected_field: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapabilityFormField {
+    name: String,
+    description: String,
+    required: bool,
+    kind: CapabilityFormFieldKind,
+    value: CapabilityFormValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapabilityFormFieldKind {
+    String { nullable: bool },
+    Boolean,
+    Enum { values: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CapabilityFormValue {
+    Text(String),
+    Boolean(bool),
+    Enum(usize),
+}
+
+impl CapabilityFormState {
+    fn for_current_selection(project_start: &Path, selected_capability: usize) -> Self {
+        let registry = registry();
+        let selected = selected_capability.min(registry.specs().len().saturating_sub(1));
+        registry
+            .specs()
+            .get(selected)
+            .map(|spec| Self::from_schema(project_start, spec))
+            .unwrap_or_else(|| Self {
+                capability_id: String::new(),
+                fields: Vec::new(),
+                selected_field: 0,
+            })
+    }
+
+    fn sync_selection(&mut self, project_start: &Path, selected_capability: usize) {
+        let next = Self::for_current_selection(project_start, selected_capability);
+        if self.capability_id != next.capability_id {
+            *self = next;
+        }
+    }
+
+    fn from_schema(project_start: &Path, spec: &CapabilitySpec) -> Self {
+        let required = schema_required_fields(&spec.input_schema);
+        let mut fields = Vec::new();
+        if let Some(properties) = spec
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+        {
+            for (name, property) in properties {
+                if let Some(kind) = CapabilityFormFieldKind::from_schema(property) {
+                    let required = required.iter().any(|field| field == name);
+                    let value = default_capability_form_value(project_start, spec, name, &kind);
+                    fields.push(CapabilityFormField {
+                        name: name.clone(),
+                        description: property
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        required,
+                        kind,
+                        value,
+                    });
+                }
+            }
+        }
+        Self {
+            capability_id: spec.id.as_str().to_string(),
+            fields,
+            selected_field: 0,
+        }
+    }
+
+    fn selected_field_mut(&mut self) -> Option<&mut CapabilityFormField> {
+        let selected = self.selected_field.min(self.fields.len().saturating_sub(1));
+        self.fields.get_mut(selected)
+    }
+
+    fn move_field_up(&mut self) {
+        self.selected_field = self.selected_field.saturating_sub(1);
+    }
+
+    fn move_field_down(&mut self) {
+        self.selected_field = (self.selected_field + 1).min(self.fields.len().saturating_sub(1));
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        let Some(field) = self.selected_field_mut() else {
+            return;
+        };
+        match &mut field.value {
+            CapabilityFormValue::Text(value) => value.push(ch),
+            CapabilityFormValue::Boolean(value) => {
+                if ch == ' ' {
+                    *value = !*value;
+                }
+            }
+            CapabilityFormValue::Enum(index) => {
+                if ch == ' ' {
+                    *index = (*index + 1) % enum_value_count(&field.kind).max(1);
+                }
+            }
+        }
+    }
+
+    fn backspace(&mut self) {
+        let Some(field) = self.selected_field_mut() else {
+            return;
+        };
+        if let CapabilityFormValue::Text(value) = &mut field.value {
+            value.pop();
+        }
+    }
+
+    fn cycle_selected_value(&mut self, direction: CapabilityCycleDirection) {
+        let Some(field) = self.selected_field_mut() else {
+            return;
+        };
+        match (&field.kind, &mut field.value) {
+            (CapabilityFormFieldKind::Boolean, CapabilityFormValue::Boolean(value)) => {
+                *value = !*value;
+            }
+            (CapabilityFormFieldKind::Enum { values }, CapabilityFormValue::Enum(index))
+                if !values.is_empty() =>
+            {
+                *index = match direction {
+                    CapabilityCycleDirection::Next => (*index + 1) % values.len(),
+                    CapabilityCycleDirection::Previous => {
+                        (*index + values.len() - 1) % values.len()
+                    }
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityCycleDirection {
+    Previous,
+    Next,
+}
+
+impl CapabilityFormFieldKind {
+    fn from_schema(schema: &Value) -> Option<Self> {
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            let values = values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            if !values.is_empty() {
+                return Some(Self::Enum { values });
+            }
+        }
+        if schema_type_includes(schema, "boolean") {
+            return Some(Self::Boolean);
+        }
+        if schema_type_includes(schema, "string") {
+            return Some(Self::String {
+                nullable: schema_type_includes(schema, "null"),
+            });
+        }
+        None
+    }
+}
+
+fn enum_value_count(kind: &CapabilityFormFieldKind) -> usize {
+    match kind {
+        CapabilityFormFieldKind::Enum { values } => values.len(),
+        _ => 0,
     }
 }
 
@@ -282,6 +474,74 @@ fn should_skip_project_scan_dir(path: &Path) -> bool {
         return false;
     };
     name.starts_with('.') || matches!(name, "target" | "node_modules" | "dist")
+}
+
+fn schema_required_fields(schema: &Value) -> Vec<String> {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn schema_type_includes(schema: &Value, expected: &str) -> bool {
+    match schema.get("type") {
+        Some(Value::String(value)) => value == expected,
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(expected)),
+        _ => false,
+    }
+}
+
+fn default_capability_form_value(
+    project_start: &Path,
+    spec: &CapabilitySpec,
+    name: &str,
+    kind: &CapabilityFormFieldKind,
+) -> CapabilityFormValue {
+    match kind {
+        CapabilityFormFieldKind::Boolean => {
+            CapabilityFormValue::Boolean(default_capability_boolean(spec, name))
+        }
+        CapabilityFormFieldKind::Enum { values } => {
+            let default = default_capability_enum(spec, name);
+            let index = default
+                .and_then(|default| values.iter().position(|value| value == default))
+                .unwrap_or(0);
+            CapabilityFormValue::Enum(index)
+        }
+        CapabilityFormFieldKind::String { .. } => CapabilityFormValue::Text(
+            default_capability_string(project_start, spec, name).unwrap_or_default(),
+        ),
+    }
+}
+
+fn default_capability_string(
+    project_start: &Path,
+    spec: &CapabilitySpec,
+    name: &str,
+) -> Option<String> {
+    match (spec.id.as_str(), name) {
+        (BUILD_CAPABILITY_ID, "project_path") | (CHECK_CAPABILITY_ID, "path") => Some(
+            resolve_tui_project_start(project_start)
+                .display()
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+fn default_capability_boolean(_spec: &CapabilitySpec, _name: &str) -> bool {
+    false
+}
+
+fn default_capability_enum(spec: &CapabilitySpec, name: &str) -> Option<&'static str> {
+    match (spec.id.as_str(), name) {
+        (BUILD_CAPABILITY_ID, "profile") => Some("dev"),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -347,17 +607,49 @@ impl App {
                 AppAction::None
             }
             KeyCode::Up if self.screen == Screen::CapabilityBrowser => {
-                self.selected_capability = self.selected_capability.saturating_sub(1);
-                self.capability_status = CapabilityStatus::Idle;
+                if self.focus == Focus::CapabilityForm {
+                    self.capability_form.move_field_up();
+                } else {
+                    self.selected_capability = self.selected_capability.saturating_sub(1);
+                    self.capability_form
+                        .sync_selection(&self.project_start, self.selected_capability);
+                    self.capability_status = CapabilityStatus::Idle;
+                }
                 AppAction::None
             }
             KeyCode::Down if self.screen == Screen::CapabilityBrowser => {
-                let max_index = registry().specs().len().saturating_sub(1);
-                self.selected_capability = (self.selected_capability + 1).min(max_index);
+                if self.focus == Focus::CapabilityForm {
+                    self.capability_form.move_field_down();
+                } else {
+                    let max_index = registry().specs().len().saturating_sub(1);
+                    self.selected_capability = (self.selected_capability + 1).min(max_index);
+                    self.capability_form
+                        .sync_selection(&self.project_start, self.selected_capability);
+                    self.capability_status = CapabilityStatus::Idle;
+                }
+                AppAction::None
+            }
+            KeyCode::Left
+                if self.screen == Screen::CapabilityBrowser
+                    && self.focus == Focus::CapabilityForm =>
+            {
+                self.capability_form
+                    .cycle_selected_value(CapabilityCycleDirection::Previous);
                 self.capability_status = CapabilityStatus::Idle;
                 AppAction::None
             }
-            KeyCode::Char('q') if self.focus != Focus::Prompt => {
+            KeyCode::Right
+                if self.screen == Screen::CapabilityBrowser
+                    && self.focus == Focus::CapabilityForm =>
+            {
+                self.capability_form
+                    .cycle_selected_value(CapabilityCycleDirection::Next);
+                self.capability_status = CapabilityStatus::Idle;
+                AppAction::None
+            }
+            KeyCode::Char('q')
+                if self.focus != Focus::Prompt && self.focus != Focus::CapabilityForm =>
+            {
                 self.should_quit = true;
                 AppAction::None
             }
@@ -406,6 +698,8 @@ impl App {
     fn enter_capability_browser(&mut self) {
         self.screen = Screen::CapabilityBrowser;
         self.focus = Focus::Navigation;
+        self.capability_form
+            .sync_selection(&self.project_start, self.selected_capability);
     }
 
     fn switch_tab(&mut self, tab: WorkspaceTab) {
@@ -492,6 +786,14 @@ impl App {
     }
 
     fn focus_next(&mut self) {
+        if self.screen == Screen::CapabilityBrowser {
+            self.focus = if self.focus == Focus::CapabilityForm {
+                Focus::Navigation
+            } else {
+                Focus::CapabilityForm
+            };
+            return;
+        }
         if self.screen != Screen::Workspace {
             return;
         }
@@ -510,6 +812,10 @@ impl App {
     }
 
     fn focus_previous(&mut self) {
+        if self.screen == Screen::CapabilityBrowser {
+            self.focus_next();
+            return;
+        }
         if self.screen != Screen::Workspace {
             return;
         }
@@ -528,6 +834,11 @@ impl App {
     }
 
     fn insert_char(&mut self, ch: char) {
+        if self.screen == Screen::CapabilityBrowser && self.focus == Focus::CapabilityForm {
+            self.capability_form.insert_char(ch);
+            self.capability_status = CapabilityStatus::Idle;
+            return;
+        }
         match self.focus {
             Focus::Prompt => self.raw_prompt.push(ch),
             Focus::Model => self.model.push(ch),
@@ -538,6 +849,11 @@ impl App {
     }
 
     fn backspace(&mut self) {
+        if self.screen == Screen::CapabilityBrowser && self.focus == Focus::CapabilityForm {
+            self.capability_form.backspace();
+            self.capability_status = CapabilityStatus::Idle;
+            return;
+        }
         match self.focus {
             Focus::Prompt => {
                 self.raw_prompt.pop();
@@ -657,11 +973,16 @@ async fn run_terminal(app: &mut App) -> Result<()> {
                     app.capability_status =
                         CapabilityStatus::Running(format!("Running {}", spec.id.as_str()));
                     terminal.draw(|frame| render(frame, app))?;
-                    app.capability_status =
-                        match run_generic_capability(&app.project_start, &spec).await {
-                            Ok(output) => CapabilityStatus::Success(output),
-                            Err(error) => CapabilityStatus::Failure(error),
-                        };
+                    app.capability_status = match run_generic_capability(
+                        &app.project_start,
+                        &spec,
+                        &app.capability_form,
+                    )
+                    .await
+                    {
+                        Ok(output) => CapabilityStatus::Success(output),
+                        Err(error) => CapabilityStatus::Failure(error),
+                    };
                 }
                 AppAction::None => {}
             }
@@ -681,6 +1002,7 @@ fn selected_capability_spec(app: &App) -> Option<CapabilitySpec> {
 async fn run_generic_capability(
     project_start: &Path,
     spec: &CapabilitySpec,
+    form: &CapabilityFormState,
 ) -> Result<String, String> {
     match &spec.adapters.tui {
         AdapterSupport::Generic => {}
@@ -690,10 +1012,33 @@ async fn run_generic_capability(
         }
     }
 
+    let input = normalize_capability_input(project_start, spec, form)?;
     let events = match spec.id.as_str() {
         CHECK_CAPABILITY_ID => {
-            let project_root = resolve_project_root(project_start)?;
-            execute_check(crate::capabilities::CheckInput::new(project_root)).events
+            let path = input_path(&input, "path")?;
+            execute_check(crate::capabilities::CheckInput::new(path)).events
+        }
+        BUILD_CAPABILITY_ID => {
+            let project_path = input_path(&input, "project_path")?;
+            let profile = match input
+                .get("profile")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "profile is required".to_string())?
+            {
+                "dev" => BuildProfile::Dev,
+                "release" => BuildProfile::Release,
+                other => return Err(format!("profile must be dev or release, got {other}")),
+            };
+            let frozen = input
+                .get("frozen")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| "frozen is required".to_string())?;
+            let mut build_input =
+                crate::capabilities::BuildInput::new(project_path, profile, frozen);
+            if let Some(source) = input.get("selected_prompt_source").and_then(Value::as_str) {
+                build_input = build_input.with_selected_prompt_source(source);
+            }
+            execute_build(build_input).events
         }
         TRACE_LS_CAPABILITY_ID => {
             let project_root = resolve_project_root(project_start)?;
@@ -705,8 +1050,19 @@ async fn run_generic_capability(
             execute_trace_ls(
                 &daemon.spans(),
                 TraceLsInput {
-                    limit: Some(25),
-                    ..Default::default()
+                    session: input
+                        .get("session")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    agent: input
+                        .get("agent")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    model: input
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    limit: optional_u32(&input, "limit")?.or(Some(25)),
                 },
             )
             .await
@@ -720,6 +1076,77 @@ async fn run_generic_capability(
     };
 
     Ok(render_capability_events(&events))
+}
+
+fn normalize_capability_input(
+    project_start: &Path,
+    spec: &CapabilitySpec,
+    form: &CapabilityFormState,
+) -> Result<Value, String> {
+    if form.capability_id != spec.id.as_str() {
+        return normalize_capability_input(
+            project_start,
+            spec,
+            &CapabilityFormState::from_schema(project_start, spec),
+        );
+    }
+    let mut object = serde_json::Map::new();
+    for field in &form.fields {
+        match normalized_field_value(field) {
+            Some(value) => {
+                object.insert(field.name.clone(), value);
+            }
+            None if field.required => {
+                return Err(format!("{} is required", field.name));
+            }
+            None => {}
+        }
+    }
+    Ok(Value::Object(object))
+}
+
+fn normalized_field_value(field: &CapabilityFormField) -> Option<Value> {
+    match (&field.kind, &field.value) {
+        (CapabilityFormFieldKind::String { nullable }, CapabilityFormValue::Text(value)) => {
+            let value = value.trim();
+            if value.is_empty() {
+                if *nullable {
+                    Some(Value::Null)
+                } else {
+                    None
+                }
+            } else {
+                Some(Value::String(value.to_string()))
+            }
+        }
+        (CapabilityFormFieldKind::Boolean, CapabilityFormValue::Boolean(value)) => {
+            Some(Value::Bool(*value))
+        }
+        (CapabilityFormFieldKind::Enum { values }, CapabilityFormValue::Enum(index)) => {
+            values.get(*index).map(|value| Value::String(value.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn input_path(input: &Value, key: &str) -> Result<PathBuf, String> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{key} is required"))
+}
+
+fn optional_u32(input: &Value, key: &str) -> Result<Option<u32>, String> {
+    match input.get(key) {
+        Some(Value::String(value)) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| format!("{key} must be a non-negative integer")),
+        _ => Ok(None),
+    }
 }
 
 fn render_capability_events(events: &[CapabilityEvent]) -> String {
@@ -1240,7 +1667,7 @@ fn render_capability_browser(frame: &mut Frame, app: &App, area: Rect) {
 
     let detail = specs
         .get(selected)
-        .map(|spec| capability_detail_text(spec, &app.capability_status))
+        .map(|spec| capability_detail_text(spec, app))
         .unwrap_or_else(|| "No capabilities registered.".to_string());
     frame.render_widget(
         Paragraph::new(detail)
@@ -1250,19 +1677,16 @@ fn render_capability_browser(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn capability_detail_text(spec: &CapabilitySpec, status: &CapabilityStatus) -> String {
+fn capability_detail_text(spec: &CapabilitySpec, app: &App) -> String {
     let action = match &spec.adapters.tui {
-        AdapterSupport::Generic => match spec.id.as_str() {
-            CHECK_CAPABILITY_ID => "Enter runs check against the current project.",
-            TRACE_LS_CAPABILITY_ID => "Enter lists the most recent 25 trace spans.",
-            _ => "Generic TUI adapter is declared, but no executor is registered here.",
-        },
+        AdapterSupport::Generic => "Enter/Ctrl+R/F5 submits the form.",
         AdapterSupport::Unavailable { reason } => reason,
         AdapterSupport::Available => "This capability is CLI-available, not generic TUI-ready.",
         AdapterSupport::Custom => "This capability has a custom TUI surface.",
     };
+    let form = capability_form_text(&app.capability_form, app.focus == Focus::CapabilityForm);
     format!(
-        "{}\n{}\n\nid: {}\ncategory: {}\nsafety: {}\navailability: {}\noutputs: {}\n\n{}\n\n{}",
+        "{}\n{}\n\nid: {}\ncategory: {}\nsafety: {}\navailability: {}\noutputs: {}\n\n{}\n\nInput\n{}\n\nStatus\n{}",
         spec.title,
         spec.summary,
         spec.id.as_str(),
@@ -1275,8 +1699,63 @@ fn capability_detail_text(spec: &CapabilitySpec, status: &CapabilityStatus) -> S
             .collect::<Vec<_>>()
             .join(", "),
         action,
-        capability_status_text(status),
+        form,
+        capability_status_text(&app.capability_status),
     )
+}
+
+fn capability_form_text(form: &CapabilityFormState, focused: bool) -> String {
+    if form.fields.is_empty() {
+        return "(no input fields)".to_string();
+    }
+    form.fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let cursor = if focused && index == form.selected_field {
+                ">"
+            } else {
+                " "
+            };
+            let required = if field.required { "*" } else { " " };
+            let value = capability_form_value_text(field);
+            let hint = if field.description.is_empty() {
+                String::new()
+            } else {
+                format!(" - {}", field.description)
+            };
+            format!("{cursor} {required} {:<24} {value}{hint}", field.name)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn capability_form_value_text(field: &CapabilityFormField) -> String {
+    match (&field.kind, &field.value) {
+        (CapabilityFormFieldKind::String { nullable }, CapabilityFormValue::Text(value)) => {
+            if value.is_empty() {
+                if *nullable {
+                    "<null>".to_string()
+                } else {
+                    "<empty>".to_string()
+                }
+            } else {
+                value.clone()
+            }
+        }
+        (CapabilityFormFieldKind::Boolean, CapabilityFormValue::Boolean(value)) => {
+            if *value {
+                "[x]".to_string()
+            } else {
+                "[ ]".to_string()
+            }
+        }
+        (CapabilityFormFieldKind::Enum { values }, CapabilityFormValue::Enum(index)) => values
+            .get(*index)
+            .cloned()
+            .unwrap_or_else(|| "<empty>".to_string()),
+        _ => "<unsupported>".to_string(),
+    }
 }
 
 fn capability_status_text(status: &CapabilityStatus) -> String {
@@ -1981,7 +2460,7 @@ fn footer_text(app: &App) -> String {
     match app.screen {
         Screen::Home => "Enter convert \u{00b7} b capabilities \u{00b7} ? help \u{00b7} q quit".to_string(),
         Screen::CapabilityBrowser => {
-            "\u{2191}/\u{2193} select \u{00b7} Enter/Ctrl+R/F5 run generic \u{00b7} Esc back \u{00b7} ? help \u{00b7} q quit".to_string()
+            "Tab form/list \u{00b7} \u{2191}/\u{2193} select/field \u{00b7} \u{2190}/\u{2192} cycle \u{00b7} Enter/Ctrl+R/F5 run \u{00b7} Esc back \u{00b7} ? help".to_string()
         }
         Screen::Workspace => match app.workspace_tab {
             WorkspaceTab::Convert => {
@@ -2119,6 +2598,47 @@ mod tests {
 
         let action = app.handle_key(key(KeyCode::Enter));
         assert!(matches!(action, AppAction::ExecuteCapability));
+    }
+
+    #[test]
+    fn capability_browser_tabs_into_schema_form_and_edits_state() {
+        let project = tempfile::tempdir().unwrap();
+        crate::commands::init::run(project.path()).unwrap();
+        let mut app = App::new(project.path().to_path_buf());
+        app.enter_capability_browser();
+        app.selected_capability = registry()
+            .specs()
+            .iter()
+            .position(|spec| spec.id.as_str() == BUILD_CAPABILITY_ID)
+            .unwrap();
+        app.capability_form
+            .sync_selection(&app.project_start, app.selected_capability);
+
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::CapabilityForm);
+        assert_eq!(app.capability_form.fields[0].name, "frozen");
+
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            app.capability_form.fields[0].value,
+            CapabilityFormValue::Boolean(true)
+        );
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.capability_form.fields[1].name, "profile");
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(
+            app.capability_form.fields[1].value,
+            CapabilityFormValue::Enum(1)
+        );
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.capability_form.fields[2].name, "project_path");
+        let default_project_path = capability_form_value_text(&app.capability_form.fields[2]);
+        assert_eq!(default_project_path, project.path().display().to_string());
+
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Navigation);
     }
 
     #[test]
@@ -2609,6 +3129,95 @@ mod tests {
         assert!(rendered.contains("writes project"));
     }
 
+    #[test]
+    fn render_capability_browser_shows_compact_schema_form() {
+        let backend = TestBackend::new(180, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let project = tempfile::tempdir().unwrap();
+        crate::commands::init::run(project.path()).unwrap();
+        let mut app = App::new(project.path().to_path_buf());
+        app.enter_capability_browser();
+        app.selected_capability = registry()
+            .specs()
+            .iter()
+            .position(|spec| spec.id.as_str() == BUILD_CAPABILITY_ID)
+            .unwrap();
+        app.capability_form
+            .sync_selection(&app.project_start, app.selected_capability);
+
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+
+        let rendered = format!("{:?}", terminal.backend().buffer());
+        assert!(rendered.contains("Input"));
+        assert!(rendered.contains("* project_path"));
+        assert!(rendered.contains("* profile"));
+        assert!(rendered.contains("* frozen"));
+        assert!(rendered.contains("selected_prompt_source"));
+    }
+
+    #[test]
+    fn normalized_capability_input_matches_build_check_and_trace_shapes() {
+        let project = tempfile::tempdir().unwrap();
+        crate::commands::init::run(project.path()).unwrap();
+        let registry = registry();
+
+        let build = registry.get(BUILD_CAPABILITY_ID).unwrap();
+        let build_form = CapabilityFormState::from_schema(project.path(), build);
+        let build_input = normalize_capability_input(project.path(), build, &build_form).unwrap();
+        assert_eq!(
+            build_input,
+            json!({
+                "project_path": project.path().display().to_string(),
+                "profile": "dev",
+                "frozen": false,
+                "selected_prompt_source": null
+            })
+        );
+
+        let check = registry.get(CHECK_CAPABILITY_ID).unwrap();
+        let mut check_form = CapabilityFormState::from_schema(project.path(), check);
+        let check_input = normalize_capability_input(project.path(), check, &check_form).unwrap();
+        assert_eq!(
+            check_input,
+            json!({
+                "path": project.path().display().to_string()
+            })
+        );
+        if let CapabilityFormValue::Text(value) = &mut check_form.fields[0].value {
+            value.clear();
+        }
+        assert_eq!(
+            normalize_capability_input(project.path(), check, &check_form).unwrap_err(),
+            "path is required"
+        );
+
+        let trace = registry.get(TRACE_LS_CAPABILITY_ID).unwrap();
+        let mut trace_form = CapabilityFormState::from_schema(project.path(), trace);
+        let limit = trace_form
+            .fields
+            .iter_mut()
+            .find(|field| field.name == "limit")
+            .expect("limit field");
+        if let CapabilityFormValue::Text(value) = &mut limit.value {
+            *value = "50".to_string();
+        }
+        let trace_input = normalize_capability_input(project.path(), trace, &trace_form).unwrap();
+        assert_eq!(
+            trace_input,
+            json!({
+                "session": null,
+                "agent": null,
+                "model": null,
+                "limit": "50"
+            })
+        );
+        let invalid_limit = json!({ "limit": "many" });
+        assert_eq!(
+            optional_u32(&invalid_limit, "limit").unwrap_err(),
+            "limit must be a non-negative integer"
+        );
+    }
+
     #[tokio::test]
     async fn generic_browser_runs_check_capability_and_reports_unavailable_entries() {
         let project = tempfile::tempdir().unwrap();
@@ -2624,7 +3233,7 @@ mod tests {
             .unwrap();
 
         let check = selected_capability_spec(&app).unwrap();
-        let output = run_generic_capability(&app.project_start, &check)
+        let output = run_generic_capability(&app.project_start, &check, &app.capability_form)
             .await
             .unwrap();
 
@@ -2635,11 +3244,13 @@ mod tests {
         app.selected_capability = registry
             .specs()
             .iter()
-            .position(|spec| spec.id.as_str() == "compile.build")
+            .position(|spec| spec.id.as_str() == "compile.fmt")
             .unwrap();
+        app.capability_form
+            .sync_selection(&app.project_start, app.selected_capability);
         let build = selected_capability_spec(&app).unwrap();
 
-        let error = run_generic_capability(&app.project_start, &build)
+        let error = run_generic_capability(&app.project_start, &build, &app.capability_form)
             .await
             .unwrap_err();
 
@@ -2659,7 +3270,7 @@ mod tests {
             .unwrap();
 
         let trace_ls = selected_capability_spec(&app).unwrap();
-        let output = run_generic_capability(&app.project_start, &trace_ls)
+        let output = run_generic_capability(&app.project_start, &trace_ls, &app.capability_form)
             .await
             .unwrap();
 
